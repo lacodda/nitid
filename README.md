@@ -1,4 +1,4 @@
-<!-- Banner is added in v0.8.0 together with the brand assets. -->
+<p align="center"><img src="https://github.com/lacodda/nitid/raw/main/assets/banner.svg" alt="nitid - a fast image viewer with honest color" width="720"></p>
 
 # nitid
 

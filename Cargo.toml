@@ -11,12 +11,21 @@ readme = "README.md"
 keywords = ["image-viewer", "hdr", "color-management", "gui", "windows"]
 categories = ["multimedia::images", "graphics"]
 authors = ["Kirill Lakhtachev <lahtachev@gmail.com>"]
+# assets/icon.ico is required by build.rs on Windows; the rest of the brand
+# artwork only serves GitHub and the docs site.
 exclude = [
     "docs/",
     ".github/",
     "cliff.toml",
     "rustfmt.toml",
+    "assets/social-preview.png",
+    "assets/logo-512.png",
+    "assets/apple-touch-icon.png",
+    "assets/favicon-32.png",
 ]
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
 
 [dependencies]
 anyhow = "1"
