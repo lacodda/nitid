@@ -28,16 +28,35 @@ Speed here is not a faster decoder — it is a different order of operations:
 2. The full image decodes on a background thread and replaces it without a flicker.
 3. Neighbouring files in the folder are prefetched, so arrow keys never wait.
 
+Measured on a 24-megapixel JPEG, from process start:
+
+```
+window created at    11 ms
+gpu ready at        118 ms
+thumbnail up at     128 ms   <- the picture is on screen here
+first pixels in     146 ms
+```
+
+The full decode of that same image takes about 120 ms and lands afterwards,
+replacing the thumbnail in place. Most of what remains is the graphics driver
+starting up, not work nitid controls — which is why the order of operations
+matters more than decoder benchmarks.
+
+Run with `NITID_STARTUP_REPORT=1` to get that breakdown for your own machine.
+The numbers are held to a threshold by `tests/startup.rs`, so a change that
+puts a full decode back on the startup path fails the build rather than
+quietly costing a tenth of a second.
+
 ## Status
 
-Early development — v0.1.0 is out; the picture shows up and moves, but the
-color management and the fast start that justify the product are still ahead.
-The version map to 1.0 is fixed:
+Early development — v0.2.0 is out, and the startup promise the product exists
+for now holds. Color management, modern formats and HDR are still ahead. The
+version map to 1.0 is fixed:
 
 | Version | What lands |
 | --- | --- |
 | ✅ v0.1.0 | Window, wgpu renderer, JPEG/PNG, zoom and pan, folder navigation |
-| v0.2.0 | Instant startup — EXIF thumbnail first, background decode, prefetch |
+| ✅ v0.2.0 | Instant startup — EXIF thumbnail first, background decode, prefetch |
 | v0.3.0 | Color management: ICC via `moxcms`, sRGB and Display P3 |
 | v0.4.0 | WebP, JPEG XL, GIF, TIFF, BMP, SVG |
 | v0.5.0 | Sandboxed C decoders — HEIC and AVIF |
@@ -98,6 +117,13 @@ Opening a file opens its folder: the arrow keys walk the images beside it.
 
 "100%" means one image pixel per logical pixel, so a photo is the same size
 here as everywhere else on a scaled display.
+
+### Environment
+
+| Variable | Effect |
+| --- | --- |
+| `NITID_STARTUP_REPORT=1` | print the startup breakdown to stderr |
+| `NITID_EXIT_AFTER_FIRST_FRAME=1` | close as soon as a picture is on screen; used by the startup test |
 
 ## Design notes
 

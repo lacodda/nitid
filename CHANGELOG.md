@@ -2,7 +2,18 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.2.0] - 2026-08-10
+
+### Bug Fixes
+- Keep the argument-parsing test portable
+
+### Features
+- Install nitid for the current user and register its file types
+- Show the embedded thumbnail first and decode off the event loop
 ## [0.1.0] - 2026-08-10
+
+### CI
+- Draft a GitHub release from a version tag
 
 ### Features
 - Scaffold the project
