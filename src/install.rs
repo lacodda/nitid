@@ -42,6 +42,14 @@ const EXECUTABLES: [&str; 2] = ["nitid.exe", "nitidw.exe"];
 /// The binary the shell launches for a file association.
 const WINDOWED_EXE: &str = "nitidw.exe";
 
+/// Application keys written by earlier versions.
+///
+/// v0.2.0 registered `nitid.exe` as the handler; v0.3.0 moved that to
+/// `nitidw.exe` so the shell never creates a console. The old key is removed
+/// on install as well as on uninstall, or "Open with" lists nitid twice and
+/// one of the entries flashes a console window.
+const LEGACY_APPLICATION_KEYS: [&str; 1] = [r"Software\Classes\Applications\nitid.exe"];
+
 /// The registered-applications entry that puts nitid in Settings.
 const CAPABILITIES_KEY: &str = r"Software\lacodda\nitid\Capabilities";
 
@@ -72,6 +80,7 @@ pub fn install() -> Result<PathBuf> {
         println!("Copied nitid to {}", target_dir.display());
     }
 
+    remove_legacy_keys();
     register(&target_dir.join(WINDOWED_EXE))?;
 
     println!("Registered {} file types: {}", SUPPORTED_EXTENSIONS.len(), SUPPORTED_EXTENSIONS.join(", "));
@@ -163,6 +172,18 @@ fn same_file(a: &Path, b: &Path) -> bool {
     normalise(a) == normalise(b)
 }
 
+/// Drop application keys left by an earlier version.
+///
+/// Silent: an upgrade that already worked must not fail because a key from a
+/// previous release refuses to go.
+fn remove_legacy_keys() {
+    for key in LEGACY_APPLICATION_KEYS {
+        if CURRENT_USER.open(key).is_ok() {
+            let _ = CURRENT_USER.remove_tree(key);
+        }
+    }
+}
+
 /// Write every registry key the shell reads.
 fn register(exe: &Path) -> Result<()> {
     let exe = exe.to_string_lossy().to_string();
@@ -226,6 +247,9 @@ fn register(exe: &Path) -> Result<()> {
 /// registration is worse than a reported error, so every key is attempted.
 fn unregister() -> Result<()> {
     let mut failures = Vec::new();
+
+    // An install upgraded from an older version may still carry its keys.
+    remove_legacy_keys();
 
     for extension in SUPPORTED_EXTENSIONS {
         let path = format!(r"Software\Classes\.{extension}\OpenWithProgids");
