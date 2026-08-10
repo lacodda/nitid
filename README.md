@@ -56,6 +56,27 @@ cargo fmt --check && cargo clippy -- -D warnings && cargo test
 
 Requires Rust 1.88 or newer.
 
+## Installing
+
+Download the zip from the [latest release](https://github.com/lacodda/nitid/releases),
+unpack it anywhere, and run:
+
+```
+nitid install
+```
+
+This copies nitid to `%LOCALAPPDATA%\Programs\nitid` and registers the file
+types it can open — no administrator, nothing outside your own user account.
+Re-running it upgrades an existing install, even while the viewer is open.
+
+Windows keeps the choice of default application to itself: no program is
+allowed to seize a file type. After installing, nitid appears under **Open
+with** — right-click an image, choose *Open with* → *Choose another app*, pick
+nitid and tick *Always use this app*. It also shows up in *Settings → Apps →
+Default apps*.
+
+`nitid uninstall` removes both the files and the registration.
+
 ## Using it
 
 ```
