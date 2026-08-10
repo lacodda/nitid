@@ -1,0 +1,44 @@
+[package]
+name = "nitid"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A fast image viewer for Windows with honest color and HDR: first pixels in milliseconds, ICC on the GPU, modern formats"
+license = "MIT"
+repository = "https://github.com/lacodda/nitid"
+homepage = "https://github.com/lacodda/nitid"
+readme = "README.md"
+keywords = ["image-viewer", "hdr", "color-management", "gui", "windows"]
+categories = ["multimedia::images", "graphics"]
+authors = ["Kirill Lakhtachev <lahtachev@gmail.com>"]
+exclude = [
+    "docs/",
+    ".github/",
+    "cliff.toml",
+    "rustfmt.toml",
+]
+
+[dependencies]
+anyhow = "1"
+thiserror = "2"
+
+# Window and GPU: nitid owns the swapchain — HDR on Windows requires
+# Bt2100Pq on Rgb10a2Unorm, which a framework-managed surface cannot express.
+winit = "0.30"
+wgpu = "30"
+pollster = "0.4"
+
+# Decoders (pure Rust; C-backed HEIC/AVIF arrive in v0.5.0 behind a sandbox)
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "tiff"] }
+zune-jpeg = "0.5"
+
+# Metadata
+kamadak-exif = "0.6"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
