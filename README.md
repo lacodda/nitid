@@ -52,7 +52,29 @@ cargo run --release
 cargo fmt --check && cargo clippy -- -D warnings && cargo test
 ```
 
-Requires Rust 1.85 or newer.
+Requires Rust 1.88 or newer.
+
+## Using it
+
+```
+nitid photo.jpg
+```
+
+Opening a file opens its folder: the arrow keys walk the images beside it.
+
+| Key | Action |
+| --- | --- |
+| `←` `→` | previous / next image in the folder |
+| `Home` `End` | first / last image |
+| Wheel | zoom around the cursor |
+| Drag | pan |
+| Middle click | toggle fit and 100% |
+| `0` `1` | fit to window / actual size |
+| `F11` | fullscreen |
+| `Esc` | quit |
+
+"100%" means one image pixel per logical pixel, so a photo is the same size
+here as everywhere else on a scaled display.
 
 ## Design notes
 
