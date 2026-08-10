@@ -2,6 +2,10 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.3.0] - 2026-08-10
+
+### Features
+- Convert images to the display's colour profile on the GPU
 ## [0.2.0] - 2026-08-10
 
 ### Bug Fixes
