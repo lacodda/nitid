@@ -16,7 +16,9 @@ use winit::window::{Window, WindowId};
 
 use crate::folder::Folder;
 use crate::gpu::Renderer;
-use crate::image_source::{self, LoadedImage, Orientation};
+use crate::image_source::{self, Fidelity, LoadedImage, Orientation};
+use crate::loader::{Decoded, Loader, Request};
+use crate::startup;
 use crate::view::{FitMode, View};
 
 /// A wheel notch is 120 units of a high-resolution scroll device; a trackpad
@@ -28,11 +30,19 @@ const DEFAULT_WINDOW: (u32, u32) = (1280, 800);
 
 /// Run the viewer, optionally opening a file straight away.
 pub fn run(path: Option<PathBuf>) -> Result<()> {
-    let event_loop = EventLoop::new().context("creating the event loop")?;
+    // A user event carries a finished background decode back to this thread.
+    let event_loop = EventLoop::<Decoded>::with_user_event().build().context("creating the event loop")?;
     // Wait for input rather than spinning: nothing moves unless the user acts.
     event_loop.set_control_flow(ControlFlow::Wait);
 
-    let mut app = App::new(path);
+    let proxy = event_loop.create_proxy();
+    let loader = Loader::new(move |decoded| {
+        // The loop may already be gone if the window was closed mid-decode;
+        // there is nobody left to tell, and that is fine.
+        let _ = proxy.send_event(decoded);
+    });
+
+    let mut app = App::new(path, loader);
     event_loop.run_app(&mut app).context("running the viewer")?;
 
     app.into_result()
@@ -42,6 +52,8 @@ pub fn run(path: Option<PathBuf>) -> Result<()> {
 struct Shown {
     orientation: Orientation,
     view: View,
+    /// Whether this is the real image or the thumbnail standing in for it.
+    fidelity: Fidelity,
 }
 
 struct App {
@@ -51,6 +63,7 @@ struct App {
     renderer: Option<Renderer>,
     folder: Option<Folder>,
     shown: Option<Shown>,
+    loader: Loader,
     cursor: PhysicalPosition<f64>,
     dragging: bool,
     /// A failure that must end the run; reported after the loop exits, since
@@ -59,13 +72,14 @@ struct App {
 }
 
 impl App {
-    fn new(initial: Option<PathBuf>) -> Self {
+    fn new(initial: Option<PathBuf>, loader: Loader) -> Self {
         Self {
             initial,
             window: None,
             renderer: None,
             folder: None,
             shown: None,
+            loader,
             cursor: PhysicalPosition::new(0.0, 0.0),
             dragging: false,
             failure: None,
@@ -79,21 +93,38 @@ impl App {
         }
     }
 
-    /// Decode a file, upload it, and frame it in the current window.
+    /// Show a file: the quick frame now, the real one as soon as it is ready.
+    ///
+    /// This is the order of operations the product is built around. Nothing
+    /// here blocks on a full decode, so the window keeps answering the user
+    /// while a 60-megapixel photo is still being unpacked.
     fn show(&mut self, path: &Path) {
-        let loaded = match image_source::load(path) {
-            Ok(loaded) => loaded,
-            Err(error) => {
-                // A file that will not open is a fact about the file, not a
-                // reason to close the viewer: report it and keep the window.
-                eprintln!("nitid: {error:#}");
-                return;
-            }
-        };
+        match self.loader.request(path) {
+            // Prefetched: the neighbour the arrow key asked for is already in
+            // memory, so it goes up in this frame with no intermediate.
+            Request::Ready(image) => self.upload(&image),
+            Request::Pending => self.show_quick_frame(path),
+        }
 
-        self.upload(&loaded);
         self.set_title();
         self.request_redraw();
+        self.prefetch_neighbours();
+    }
+
+    /// Put the embedded thumbnail on screen while the full decode runs.
+    ///
+    /// Decoding it inline is deliberate: it costs single-digit milliseconds
+    /// and handing it to a worker would trade that for a scheduling round trip
+    /// — the very delay this exists to avoid.
+    fn show_quick_frame(&mut self, path: &Path) {
+        let Some(thumbnail) = std::fs::read(path).ok().as_deref().and_then(image_source::decode_thumbnail) else {
+            // No thumbnail: the window stays on the previous image, or on the
+            // background if this is the first. Both beat a flash of white.
+            return;
+        };
+
+        self.upload(&thumbnail);
+        startup::milestone("thumbnail up");
     }
 
     fn upload(&mut self, loaded: &LoadedImage) {
@@ -102,9 +133,23 @@ impl App {
             return;
         };
         renderer.set_image(&loaded.image);
+
+        // Replacing a thumbnail with the image it stood in for must not move
+        // the picture: the framing carries over, rebased onto the resolution
+        // that just arrived, so the swap reads as the picture sharpening.
+        let view = match &self.shown {
+            Some(shown) if shown.fidelity == Fidelity::Thumbnail => {
+                let mut view = shown.view;
+                view.rebase(loaded.display_size());
+                view
+            }
+            _ => View::new(loaded.display_size(), renderer.size(), scale_factor),
+        };
+
         self.shown = Some(Shown {
             orientation: loaded.orientation,
-            view: View::new(loaded.display_size(), renderer.size(), scale_factor),
+            view,
+            fidelity: loaded.fidelity,
         });
     }
 
@@ -139,6 +184,41 @@ impl App {
         title.push_str(" — nitid");
 
         window.set_title(&title);
+    }
+
+    /// Decode the images either side of the current one, ahead of the request.
+    ///
+    /// This is what makes a held arrow key smooth: by the time the user asks
+    /// for the next image, it is already in memory.
+    fn prefetch_neighbours(&self) {
+        let Some(folder) = &self.folder else {
+            return;
+        };
+        self.loader.prefetch(&folder.neighbourhood(Loader::radius()));
+    }
+
+    /// A background decode came back.
+    fn decoded(&mut self, decoded: Decoded) {
+        // A reply for an image the user has already left is not an error, just
+        // work that finished too late to matter.
+        if !self.loader.is_current(decoded.generation) {
+            return;
+        }
+
+        let Decoded { path, result, .. } = decoded;
+        match result {
+            Ok(image) => {
+                startup::milestone("full image up");
+                self.upload(&image);
+                self.set_title();
+                self.request_redraw();
+            }
+            Err(error) => {
+                // A file that will not open is a fact about the file, not a
+                // reason to close the viewer: name it and keep the window.
+                eprintln!("nitid: {}: {error}", path.display());
+            }
+        }
     }
 
     /// Physical pixels per logical pixel on the monitor showing the window.
@@ -248,10 +328,21 @@ impl App {
         // With no image open the pass still runs and clears to the background,
         // so the window is never a hole showing whatever was behind it.
         let shown = self.shown.as_ref().map(|shown| (&shown.view, shown.orientation));
+        let carries_image = shown.is_some();
 
         if let Err(error) = renderer.render(shown) {
             self.failure = Some(error);
             event_loop.exit();
+            return;
+        }
+
+        // The frame is on screen now, and it has a picture in it. An empty
+        // window reaching the screen is not what the promise is about.
+        if carries_image {
+            startup::first_pixels();
+            if startup::exit_after_first_frame() {
+                event_loop.exit();
+            }
         }
     }
 }
@@ -269,7 +360,11 @@ enum Reframe {
     Toggle,
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<Decoded> for App {
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: Decoded) {
+        self.decoded(event);
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -291,6 +386,8 @@ impl ApplicationHandler for App {
             }
         };
 
+        startup::milestone("window created");
+
         let size = window.inner_size();
         let renderer = match Renderer::new(window.clone(), (size.width, size.height)) {
             Ok(renderer) => renderer,
@@ -300,6 +397,8 @@ impl ApplicationHandler for App {
                 return;
             }
         };
+
+        startup::milestone("gpu ready");
 
         self.window = Some(window.clone());
         self.renderer = Some(renderer);

@@ -52,6 +52,23 @@ impl Folder {
         self.current
     }
 
+    /// The current image and `radius` neighbours either side of it.
+    ///
+    /// Wraps like the navigation does, so the last image of a folder counts
+    /// the first as its neighbour — an arrow key there is instant too. Never
+    /// repeats a path, however small the folder.
+    pub fn neighbourhood(&self, radius: usize) -> Vec<PathBuf> {
+        let len = self.entries.len();
+        let span = (radius * 2 + 1).min(len);
+
+        (0..span)
+            .map(|step| {
+                let offset = self.current + len + step - radius.min(len);
+                self.entries[offset % len].clone()
+            })
+            .collect()
+    }
+
     /// Move to the next image, wrapping at the end of the folder.
     ///
     /// Returns `None` when the folder holds a single image, so the caller can

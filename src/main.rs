@@ -18,6 +18,8 @@ mod gpu;
 mod image_source;
 #[cfg(windows)]
 mod install;
+mod loader;
+mod startup;
 mod view;
 
 use std::ffi::OsString;
@@ -35,6 +37,9 @@ enum Command {
 }
 
 fn main() -> ExitCode {
+    // Before anything else: the measurement is of startup, so it starts here.
+    startup::begin();
+
     let command = parse(std::env::args_os().skip(1));
 
     let result = match command {

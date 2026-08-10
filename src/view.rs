@@ -93,6 +93,31 @@ impl View {
         (self.image.0 * self.scale, self.image.1 * self.scale)
     }
 
+    /// Swap in an image of the same picture at a different resolution,
+    /// keeping the framing the user is looking at.
+    ///
+    /// This is the thumbnail-to-full-image handover. The two differ in pixel
+    /// count but show the same thing, so the scale is rebased to keep the
+    /// picture the same size on screen: a thumbnail at 8x becomes a full image
+    /// at 1x without anything appearing to move.
+    pub fn rebase(&mut self, image: (u32, u32)) {
+        let width = image.0.max(1) as f32;
+        let height = image.1.max(1) as f32;
+        let ratio = self.image.0 / width;
+
+        self.image = (width, height);
+        // `Fit` and `Actual` are recomputed from the new size; only a framing
+        // the user chose has to be carried across by hand.
+        match self.mode {
+            FitMode::Fit => self.fit(),
+            FitMode::Actual => self.set_actual(),
+            FitMode::Free => {
+                self.scale = (self.scale * ratio).clamp(MIN_SCALE, MAX_SCALE);
+                self.clamp_offset();
+            }
+        }
+    }
+
     /// React to a resized window, preserving whatever framing is in force.
     ///
     /// A window dragged to another monitor changes both size and scale factor

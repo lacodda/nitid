@@ -95,7 +95,13 @@ pub struct Renderer {
 impl Renderer {
     /// Bring up a device on `window` and configure the swapchain.
     pub fn new(window: Arc<winit::window::Window>, size: (u32, u32)) -> Result<Self> {
-        let instance = wgpu::Instance::default();
+        // Enumerating every backend costs over a hundred milliseconds of
+        // startup, because each one loads its driver before being rejected.
+        // On Windows only DX12 matters: it is the backend HDR output requires
+        // (ADR 0001), so the others are work that can never pay off.
+        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        descriptor.backends = if cfg!(windows) { wgpu::Backends::DX12 } else { wgpu::Backends::PRIMARY };
+        let instance = wgpu::Instance::new(descriptor);
         let surface = instance.create_surface(window).context("creating a drawing surface for the window")?;
 
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -106,6 +112,8 @@ impl Renderer {
         }))
         .context("no graphics adapter can draw to this window")?;
 
+        crate::startup::milestone("adapter chosen");
+
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("nitid device"),
             // Downlevel limits keep integrated and older GPUs in scope; nothing
@@ -114,6 +122,8 @@ impl Renderer {
             ..Default::default()
         }))
         .context("requesting a graphics device")?;
+
+        crate::startup::milestone("device created");
 
         let capabilities = surface.get_capabilities(&adapter);
         let config = configure(&capabilities, size);
@@ -161,6 +171,8 @@ impl Renderer {
             bind_group_layouts: &[Some(&layout)],
             immediate_size: 0,
         });
+
+        crate::startup::milestone("shader compiled");
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("nitid image pipeline"),

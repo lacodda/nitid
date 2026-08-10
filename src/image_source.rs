@@ -67,10 +67,20 @@ impl Orientation {
     }
 }
 
+/// Whether an image is the real thing or the placeholder shown while it loads.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Fidelity {
+    /// The camera's embedded thumbnail: right shape, wrong detail.
+    Thumbnail,
+    /// The image as the file actually stores it.
+    Full,
+}
+
 /// A file loaded and decoded, with the orientation its metadata asks for.
 pub struct LoadedImage {
     pub image: DecodedImage,
     pub orientation: Orientation,
+    pub fidelity: Fidelity,
 }
 
 impl LoadedImage {
@@ -115,7 +125,53 @@ pub fn decode(bytes: &[u8]) -> Result<LoadedImage> {
         decode_via_image_crate(bytes)?
     };
 
-    Ok(LoadedImage { image, orientation })
+    Ok(LoadedImage {
+        image,
+        orientation,
+        fidelity: Fidelity::Full,
+    })
+}
+
+/// Decode the thumbnail a camera embedded in the file, if there is one.
+///
+/// This is the first frame the viewer shows. A JPEG thumbnail is a few
+/// kilobytes against tens of megabytes for the full image, so it decodes in
+/// single-digit milliseconds — the difference between a window that appears
+/// with a picture in it and one that appears empty and fills in later.
+///
+/// Returns `None` whenever there is no usable thumbnail, which is not an
+/// error: most PNGs and every screenshot lack one, and the full decode covers
+/// that case on its own.
+pub fn decode_thumbnail(bytes: &[u8]) -> Option<LoadedImage> {
+    let exif = read_exif(bytes)?;
+
+    // The thumbnail lives at an offset inside the EXIF block, described by two
+    // tags in the thumbnail IFD.
+    let offset = exif
+        .get_field(exif::Tag::JPEGInterchangeFormat, exif::In::THUMBNAIL)
+        .and_then(|field| field.value.get_uint(0))? as usize;
+    let length = exif
+        .get_field(exif::Tag::JPEGInterchangeFormatLength, exif::In::THUMBNAIL)
+        .and_then(|field| field.value.get_uint(0))? as usize;
+
+    let buffer = exif.buf();
+    let end = offset.checked_add(length)?;
+    if length == 0 || end > buffer.len() {
+        // A truncated or lying descriptor: fall through to the full decode
+        // rather than handing the decoder a slice of something else.
+        return None;
+    }
+
+    let thumbnail = decode_jpeg(&buffer[offset..end]).ok()?;
+
+    Some(LoadedImage {
+        image: thumbnail,
+        // The orientation tag lives in the primary IFD and applies to both the
+        // full image and its thumbnail, so the quick frame is not shown
+        // sideways for the moment before the real one replaces it.
+        orientation: orientation_from(&exif),
+        fidelity: Fidelity::Thumbnail,
+    })
 }
 
 fn is_jpeg(bytes: &[u8]) -> bool {
@@ -163,16 +219,24 @@ fn decode_via_image_crate(bytes: &[u8]) -> Result<DecodedImage> {
     })
 }
 
+/// Parse the EXIF block, if the file carries one.
+///
+/// A file without EXIF is the common case, not an error: most PNGs and every
+/// screenshot lack one.
+fn read_exif(bytes: &[u8]) -> Option<exif::Exif> {
+    let mut cursor = Cursor::new(bytes);
+    exif::Reader::new().read_from_container(&mut cursor).ok()
+}
+
 /// Read the EXIF orientation tag, defaulting to upright when absent.
 ///
-/// A file without EXIF is the common case, not an error, so failures here are
-/// silent: an image shown upright is a better outcome than a refusal to open.
+/// Failures here are silent: an image shown upright is a better outcome than a
+/// refusal to open.
 fn read_orientation(bytes: &[u8]) -> Orientation {
-    let mut cursor = Cursor::new(bytes);
-    let Ok(exif) = exif::Reader::new().read_from_container(&mut cursor) else {
-        return Orientation::default();
-    };
+    read_exif(bytes).as_ref().map(orientation_from).unwrap_or_default()
+}
 
+fn orientation_from(exif: &exif::Exif) -> Orientation {
     exif.get_field(exif::Tag::Orientation, exif::In::PRIMARY)
         .and_then(|field| field.value.get_uint(0))
         .map(|value| Orientation::from_exif(value as u16))
@@ -249,6 +313,7 @@ mod tests {
                 pixels: Vec::new(),
             },
             orientation: Orientation::Rotate90,
+            fidelity: Fidelity::Full,
         };
         assert_eq!(loaded.display_size(), (50, 100));
     }
