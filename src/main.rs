@@ -150,13 +150,14 @@ mod tests {
         assert!(matches!(parse_args(&["-V"]), Command::Version));
     }
 
-    /// A file really can be called `install`; the shell passes a full path in
-    /// that case, which is what keeps the two apart.
+    /// A file really can be called `install`; the shell passes a qualified
+    /// path in that case, which is what keeps the two apart.
     #[test]
     fn a_path_ending_in_a_command_name_still_opens() {
-        let Command::View(Some(path)) = parse_args(&[r"C:\pictures\install"]) else {
+        let qualified = PathBuf::from("pictures").join("install");
+        let Command::View(Some(path)) = parse_args(&[&qualified.to_string_lossy()]) else {
             panic!("a qualified path should open the viewer");
         };
-        assert!(path.is_absolute());
+        assert_eq!(path, qualified);
     }
 }
