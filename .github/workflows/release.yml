@@ -1,0 +1,66 @@
+name: Release
+
+# A tag is the only trigger: pushing `vX.Y.Z` builds the binary and drafts a
+# release. Publishing to the registries waits for v1.0.0, when the surface
+# and the configuration are stable enough to be depended on.
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Build and draft
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # git-cliff reads the whole history to write the changelog section.
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Verify the tag matches the manifest
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          manifest=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[0].version')
+          if [ "$tag" != "$manifest" ]; then
+            echo "tag $tag does not match Cargo.toml $manifest" >&2
+            exit 1
+          fi
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package
+        shell: bash
+        run: |
+          mkdir dist
+          cp target/release/nitid.exe dist/
+          cp README.md LICENSE dist/
+          7z a "nitid-${GITHUB_REF_NAME}-x86_64-pc-windows-msvc.zip" ./dist/*
+
+      - name: Write the release notes
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          args: --latest --strip header
+        env:
+          OUTPUT: RELEASE_NOTES.md
+
+      - name: Draft the release
+        uses: softprops/action-gh-release@v3
+        with:
+          # Drafted rather than published: the binary is checked on a real
+          # machine before anyone can download it.
+          draft: true
+          body_path: RELEASE_NOTES.md
+          files: nitid-*.zip

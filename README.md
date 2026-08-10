@@ -30,11 +30,13 @@ Speed here is not a faster decoder — it is a different order of operations:
 
 ## Status
 
-Early development. The version map to 1.0 is fixed:
+Early development — v0.1.0 is out; the picture shows up and moves, but the
+color management and the fast start that justify the product are still ahead.
+The version map to 1.0 is fixed:
 
 | Version | What lands |
 | --- | --- |
-| v0.1.0 | Window, wgpu renderer, JPEG/PNG, zoom and pan, folder navigation |
+| ✅ v0.1.0 | Window, wgpu renderer, JPEG/PNG, zoom and pan, folder navigation |
 | v0.2.0 | Instant startup — EXIF thumbnail first, background decode, prefetch |
 | v0.3.0 | Color management: ICC via `moxcms`, sRGB and Display P3 |
 | v0.4.0 | WebP, JPEG XL, GIF, TIFF, BMP, SVG |
