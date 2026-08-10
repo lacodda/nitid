@@ -4,14 +4,14 @@
 //! framework: HDR output on Windows is only reachable through `Bt2100Pq` on
 //! `Rgb10a2Unorm`, which a framework-managed surface cannot express. See
 //! `docs/adr/0001-own-the-swapchain.md`.
-
-// nitid is a console application that hides its console when it opens a
-// window. Linking it as a GUI application instead would silence `install`,
-// `--version` and every error message: such a process starts with no standard
-// handles, and Rust binds them before `main` runs, so they cannot be restored
-// afterwards — see `console.rs`.
+//!
+//! This crate is the whole viewer; the two binaries over it differ only in
+//! which Windows subsystem they are linked for. See
+//! `docs/adr/0004-two-binaries-console-and-windowed.md`.
 
 mod app;
+mod color;
+mod config;
 mod console;
 mod folder;
 mod gpu;
@@ -21,6 +21,16 @@ mod install;
 mod loader;
 mod startup;
 mod view;
+
+/// The pieces the integration tests reach into.
+///
+/// Exposed for `tests/`, which drives the colour path end to end against files
+/// it writes itself. Nothing outside this crate's own tests should depend on
+/// it: the viewer is a program, not a library anyone else builds on.
+#[doc(hidden)]
+pub mod testing {
+    pub use crate::color::{ColorTransform, profile_from};
+}
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -36,17 +46,31 @@ enum Command {
     Version,
 }
 
-fn main() -> ExitCode {
+/// Run the viewer, whichever binary was launched.
+///
+/// `windowed` says which one: the GUI-subsystem `nitidw.exe` has no console to
+/// print to, so a command that only prints has nothing to do there.
+pub fn run(windowed: bool) -> ExitCode {
     // Before anything else: the measurement is of startup, so it starts here.
     startup::begin();
 
     let command = parse(std::env::args_os().skip(1));
 
+    // `nitidw.exe install` would do its work and report it to nobody, so the
+    // printing commands are handed to the binary that has somewhere to print.
+    // This is a safety net rather than a path anyone takes: the windowed
+    // binary exists to be launched by the shell with a file.
+    if windowed && !matches!(command, Command::View(_)) {
+        return delegate_to_console_binary();
+    }
+
     let result = match command {
         Command::View(path) => {
-            // The window is the interface from here on; a console left on
-            // screen behind it is noise.
-            console::hide_if_ours();
+            // The console binary hides the console it was given; the windowed
+            // one never had one.
+            if !windowed {
+                console::hide_if_ours();
+            }
             app::run(path)
         }
         Command::Help => {
@@ -71,6 +95,24 @@ fn main() -> ExitCode {
             eprintln!("nitid: {error:#}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Re-run this command as `nitid.exe`, which has a console.
+///
+/// The two binaries sit in the same directory by construction: they are built
+/// together and installed together.
+fn delegate_to_console_binary() -> ExitCode {
+    let Ok(mut exe) = std::env::current_exe() else {
+        return ExitCode::FAILURE;
+    };
+    exe.set_file_name(if cfg!(windows) { "nitid.exe" } else { "nitid" });
+
+    let status = std::process::Command::new(exe).args(std::env::args_os().skip(1)).status();
+
+    match status {
+        Ok(status) if status.success() => ExitCode::SUCCESS,
+        _ => ExitCode::FAILURE,
     }
 }
 

@@ -227,16 +227,11 @@ fn remember(cache: &Cache, path: &Path, image: Arc<LoadedImage>) {
 }
 
 /// Move the image out of its `Arc`, cloning only if the cache still holds it.
+///
+/// The prefetched case keeps its copy, so the pixels are duplicated; the
+/// foreground case usually holds the only reference and moves for free.
 fn unwrap_or_clone(image: Arc<LoadedImage>) -> LoadedImage {
-    Arc::try_unwrap(image).unwrap_or_else(|shared| LoadedImage {
-        image: image_source::DecodedImage {
-            width: shared.image.width,
-            height: shared.image.height,
-            pixels: shared.image.pixels.clone(),
-        },
-        orientation: shared.orientation,
-        fidelity: shared.fidelity,
-    })
+    Arc::try_unwrap(image).unwrap_or_else(|shared| (*shared).clone())
 }
 
 #[cfg(test)]

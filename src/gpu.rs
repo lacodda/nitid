@@ -11,6 +11,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use wgpu::util::DeviceExt;
 
+use crate::color::{CURVE_SAMPLES, ColorTransform};
 use crate::image_source::{DecodedImage, Orientation};
 use crate::view::View;
 
@@ -74,6 +75,41 @@ fn orientation_matrix(orientation: Orientation) -> [[f32; 2]; 2] {
     }
 }
 
+/// Colour conversion state, laid out to match `Colour` in `shader.wgsl`.
+///
+/// WGSL aligns each column of a `mat3x3<f32>` to 16 bytes, so the matrix is
+/// stored as three padded rows rather than nine tight floats.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct ColourUniform {
+    matrix: [[f32; 4]; 3],
+    /// Non-zero when a conversion is needed. Named to match the shader, where
+    /// `active` turned out to be a reserved WGSL keyword.
+    convert: u32,
+    encode_srgb: u32,
+    _padding: [u32; 2],
+}
+
+impl ColourUniform {
+    fn new(transform: &ColorTransform, surface_is_srgb: bool) -> Self {
+        let mut matrix = [[0.0; 4]; 3];
+        for (row, values) in transform.matrix.iter().enumerate() {
+            matrix[row][..3].copy_from_slice(values);
+        }
+
+        Self {
+            matrix,
+            convert: u32::from(!transform.is_identity),
+            // An sRGB surface encodes for us on write. Anything else — the
+            // 10-bit HDR surface of v0.6.0, for instance — expects the shader
+            // to have done it, but only when the shader produced linear light
+            // in the first place.
+            encode_srgb: u32::from(!transform.is_identity && !surface_is_srgb),
+            _padding: [0; 2],
+        }
+    }
+}
+
 /// The image currently resident on the GPU.
 struct Upload {
     bind_group: wgpu::BindGroup,
@@ -89,6 +125,11 @@ pub struct Renderer {
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     uniforms: wgpu::Buffer,
+    /// Tone curves sampled to linear light: three rows, one per channel.
+    curves: wgpu::Texture,
+    curves_view: wgpu::TextureView,
+    curve_sampler: wgpu::Sampler,
+    colour: wgpu::Buffer,
     upload: Option<Upload>,
 }
 
@@ -151,6 +192,32 @@ impl Renderer {
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
                     visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -226,6 +293,45 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
+        // One row per channel. `R16Float` rather than `R32Float` because only
+        // 16-bit floats are guaranteed filterable — a 32-bit curve texture is
+        // rejected on hardware that cannot interpolate it, and interpolation
+        // between entries is the whole point. Half precision holds a 0..1
+        // curve to about eleven bits, well past what an 8-bit image needs.
+        let curves = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("nitid tone curves"),
+            size: wgpu::Extent3d {
+                width: CURVE_SAMPLES as u32,
+                height: 3,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let curves_view = curves.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let curve_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("nitid curve sampler"),
+            // Linear so values between curve entries interpolate. The shader
+            // samples each row at its centre, so no filtering happens across
+            // channels even though the mode allows it.
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            ..Default::default()
+        });
+
+        let colour = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("nitid colour"),
+            contents: bytemuck::bytes_of(&ColourUniform::new(&ColorTransform::identity(), config.format.is_srgb())),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
         Ok(Self {
             surface,
             device,
@@ -235,6 +341,10 @@ impl Renderer {
             layout,
             sampler,
             uniforms,
+            curves,
+            curves_view,
+            curve_sampler,
+            colour,
             upload: None,
         })
     }
@@ -255,7 +365,13 @@ impl Renderer {
     }
 
     /// Upload a decoded image, replacing whatever was shown before.
-    pub fn set_image(&mut self, image: &DecodedImage) {
+    ///
+    /// `transform` says how the image's colours reach the display. When it is
+    /// the identity the texture is created as sRGB and the hardware does the
+    /// decoding for free; when a real conversion is needed the raw values are
+    /// uploaded instead, because the shader has to apply the image's own tone
+    /// curves rather than assume sRGB.
+    pub fn set_image(&mut self, image: &DecodedImage, transform: &ColorTransform) {
         let extent = wgpu::Extent3d {
             width: image.width.max(1),
             height: image.height.max(1),
@@ -268,9 +384,15 @@ impl Renderer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            // The decoded pixels are sRGB-encoded, so the sampler is told to
-            // linearise them; without this every image renders too dark.
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            format: if transform.is_identity {
+                // The hardware linearises sRGB on sampling, which is both free
+                // and filtered correctly.
+                wgpu::TextureFormat::Rgba8UnormSrgb
+            } else {
+                // The shader needs the stored values untouched so it can push
+                // them through the profile's curves.
+                wgpu::TextureFormat::Rgba8Unorm
+            },
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -284,6 +406,13 @@ impl Renderer {
                 rows_per_image: Some(extent.height),
             },
             extent,
+        );
+
+        self.write_curves(transform);
+        self.queue.write_buffer(
+            &self.colour,
+            0,
+            bytemuck::bytes_of(&ColourUniform::new(transform, self.config.format.is_srgb())),
         );
 
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -303,10 +432,42 @@ impl Renderer {
                     binding: 2,
                     resource: self.uniforms.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&self.curves_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(&self.curve_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: self.colour.as_entire_binding(),
+                },
             ],
         });
 
         self.upload = Some(Upload { bind_group });
+    }
+
+    /// Upload the sampled tone curves the shader reads.
+    fn write_curves(&self, transform: &ColorTransform) {
+        let halves: Vec<half::f16> = transform.decode.iter().map(|value| half::f16::from_f32(*value)).collect();
+
+        self.queue.write_texture(
+            self.curves.as_image_copy(),
+            bytemuck::cast_slice(&halves),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some((CURVE_SAMPLES * 2) as u32),
+                rows_per_image: Some(3),
+            },
+            wgpu::Extent3d {
+                width: CURVE_SAMPLES as u32,
+                height: 3,
+                depth_or_array_layers: 1,
+            },
+        );
     }
 
     /// Draw one frame.
@@ -406,6 +567,54 @@ fn configure(capabilities: &wgpu::SurfaceCapabilities, size: (u32, u32)) -> wgpu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shader is compiled by the driver at startup, so a mistake in it is
+    /// a crash on launch rather than a build failure. Parsing it here turns
+    /// that back into a test — it has already caught a reserved keyword and a
+    /// byte-order mark left by an editor.
+    #[test]
+    fn the_shader_compiles() {
+        let source = include_str!("gpu/shader.wgsl");
+        assert!(!source.starts_with('\u{feff}'), "the shader begins with a byte-order mark, which WGSL rejects");
+
+        let module = naga::front::wgsl::parse_str(source).expect("the shader should parse");
+        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty())
+            .validate(&module)
+            .expect("the shader should validate");
+    }
+
+    #[test]
+    fn the_colour_uniform_matches_the_shader_layout() {
+        // mat3x3 with 16-byte aligned columns, then two u32 and padding.
+        assert_eq!(std::mem::size_of::<ColourUniform>(), 64);
+    }
+
+    #[test]
+    fn an_identity_transform_asks_the_shader_to_do_nothing() {
+        let uniform = ColourUniform::new(&ColorTransform::identity(), true);
+        assert_eq!(uniform.convert, 0);
+        assert_eq!(uniform.encode_srgb, 0);
+    }
+
+    #[test]
+    fn a_conversion_onto_an_srgb_surface_leaves_encoding_to_the_hardware() {
+        let transform = ColorTransform::new(&moxcms::ColorProfile::new_display_p3(), &moxcms::ColorProfile::new_srgb());
+        let uniform = ColourUniform::new(&transform, true);
+
+        assert_eq!(uniform.convert, 1);
+        // An sRGB surface encodes on write; doing it in the shader too would
+        // apply the curve twice and wash the image out.
+        assert_eq!(uniform.encode_srgb, 0);
+    }
+
+    #[test]
+    fn a_conversion_onto_a_linear_surface_encodes_in_the_shader() {
+        let transform = ColorTransform::new(&moxcms::ColorProfile::new_display_p3(), &moxcms::ColorProfile::new_srgb());
+        let uniform = ColourUniform::new(&transform, false);
+
+        assert_eq!(uniform.convert, 1);
+        assert_eq!(uniform.encode_srgb, 1);
+    }
 
     #[test]
     fn placement_is_thirty_two_bytes() {

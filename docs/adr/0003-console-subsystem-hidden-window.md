@@ -1,7 +1,13 @@
 # 0003 — nitid links as a console application and hides the console
 
 Date: 2026-08-10
-Status: accepted
+Status: superseded in part by [0004](0004-two-binaries-console-and-windowed.md)
+
+> The reasoning below still holds for `nitid.exe`, which is why that binary is
+> still a console application that hides its console. What changed is the shell
+> association: it now uses a second, windowed binary, because the console this
+> ADR accepted as "cheap but not free" turned out to be visible as a flash on a
+> cold start — exactly the risk its own Consequences section recorded.
 
 ## Context
 

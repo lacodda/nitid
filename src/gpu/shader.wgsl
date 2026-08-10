@@ -15,9 +15,30 @@ struct Placement {
     orientation: mat2x2<f32>,
 }
 
+// How the image's colours become the display's.
+//
+// The stored pixels are decoded to linear light through the source profile's
+// tone curves, moved between primaries by a 3x3 matrix, and re-encoded for the
+// surface. Doing it here rather than at decode time costs nothing per frame
+// and leaves the decoded pixels as the file stored them.
+struct Colour {
+    // Linear source RGB to linear display RGB. mat3x3 columns are 16-byte
+    // aligned in WGSL, which the Rust side pads to match.
+    matrix: mat3x3<f32>,
+    // 0 when the image and the display agree and the conversion is skipped.
+    convert: u32,
+    // Whether the surface expects sRGB-encoded values written by this shader.
+    encode_srgb: u32,
+}
+
 @group(0) @binding(0) var image_texture: texture_2d<f32>;
 @group(0) @binding(1) var image_sampler: sampler;
 @group(0) @binding(2) var<uniform> placement: Placement;
+// Tone curves sampled to linear light: one row per channel, so a profile with
+// an arbitrary curve costs the same as a simple gamma.
+@group(0) @binding(3) var decode_curves: texture_2d<f32>;
+@group(0) @binding(4) var curve_sampler: sampler;
+@group(0) @binding(5) var<uniform> colour: Colour;
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
@@ -41,11 +62,55 @@ fn vs_main(@builtin(vertex_index) index: u32) -> VertexOutput {
     return out;
 }
 
+// Look one channel up in its sampled tone curve.
+//
+// The three curves are stacked as rows, sampled linearly, so a value between
+// two entries interpolates rather than stepping.
+fn to_linear(value: f32, channel: i32) -> f32 {
+    let row = (f32(channel) + 0.5) / 3.0;
+    return textureSample(decode_curves, curve_sampler, vec2<f32>(value, row)).r;
+}
+
+// The sRGB transfer function, linear light to stored value.
+fn encode_srgb_channel(value: f32) -> f32 {
+    let clamped = clamp(value, 0.0, 1.0);
+    if clamped <= 0.0031308 {
+        return clamped * 12.92;
+    }
+    return 1.055 * pow(clamped, 1.0 / 2.4) - 0.055;
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    let colour = textureSample(image_texture, image_sampler, in.uv);
-    // The surface is sRGB-encoded by the swapchain; alpha is composited against
-    // the neutral background so a transparent PNG does not show window content.
+    let sampled = textureSample(image_texture, image_sampler, in.uv);
+
+    var rgb = sampled.rgb;
+    if colour.convert != 0u {
+        // Stored values to linear light, through the image's own curves.
+        let linear = vec3<f32>(
+            to_linear(rgb.r, 0),
+            to_linear(rgb.g, 1),
+            to_linear(rgb.b, 2),
+        );
+        // Between primaries. A colour outside the display's gamut lands
+        // outside 0..1 and is clipped by the encode below, which is the
+        // simplest sensible rendering intent for a viewer.
+        rgb = colour.matrix * linear;
+    }
+
+    // Alpha is composited against the neutral background so a transparent PNG
+    // shows the viewer's own backdrop rather than whatever is behind the
+    // window. The background is specified in the same space as the output.
     let background = vec3<f32>(0.09, 0.09, 0.10);
-    return vec4<f32>(mix(background, colour.rgb, colour.a), 1.0);
+
+    if colour.encode_srgb != 0u {
+        let encoded = vec3<f32>(
+            encode_srgb_channel(rgb.r),
+            encode_srgb_channel(rgb.g),
+            encode_srgb_channel(rgb.b),
+        );
+        return vec4<f32>(mix(background, encoded, sampled.a), 1.0);
+    }
+
+    return vec4<f32>(mix(background, clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0)), sampled.a), 1.0);
 }

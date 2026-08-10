@@ -27,7 +27,20 @@ use crate::image_source::SUPPORTED_EXTENSIONS;
 const PROGID: &str = "lacodda.nitid.image";
 
 /// Where `Open with` and the default-apps page read the application from.
-const APPLICATION_KEY: &str = r"Software\Classes\Applications\nitid.exe";
+///
+/// Named after the windowed binary, because that is what the shell launches:
+/// `nitid.exe` would flash a console before hiding it.
+const APPLICATION_KEY: &str = r"Software\Classes\Applications\nitidw.exe";
+
+/// The executables an install puts in place.
+///
+/// `nitid.exe` is the one to run from a terminal; `nitidw.exe` is what the
+/// shell opens files with. See
+/// `docs/adr/0004-two-binaries-console-and-windowed.md`.
+const EXECUTABLES: [&str; 2] = ["nitid.exe", "nitidw.exe"];
+
+/// The binary the shell launches for a file association.
+const WINDOWED_EXE: &str = "nitidw.exe";
 
 /// The registered-applications entry that puts nitid in Settings.
 const CAPABILITIES_KEY: &str = r"Software\lacodda\nitid\Capabilities";
@@ -37,21 +50,29 @@ const CAPABILITIES_KEY: &str = r"Software\lacodda\nitid\Capabilities";
 /// Returns the directory it was installed into.
 pub fn install() -> Result<PathBuf> {
     let source = env::current_exe().context("locating the running executable")?;
+    let source_dir = source.parent().context("the running executable has no directory")?;
     let target_dir = install_dir()?;
-    let target = target_dir.join("nitid.exe");
 
     fs::create_dir_all(&target_dir).with_context(|| format!("creating {}", target_dir.display()))?;
 
-    if same_file(&source, &target) {
+    if same_file(source_dir, &target_dir) {
         // Installing from the installed copy: the registry work below still
         // runs, which is how a re-register repairs a broken association.
-        println!("nitid is already running from {}", target_dir.display());
+        println!("nitid is already installed in {}", target_dir.display());
     } else {
-        copy_over(&source, &target)?;
-        println!("Copied nitid to {}", target.display());
+        for name in EXECUTABLES {
+            let from = source_dir.join(name);
+            if !from.exists() {
+                // A zip that carries only one of the pair is not something to
+                // half-install: the association would point at a missing file.
+                bail!("{} is missing from {}; both executables must be installed together", name, source_dir.display());
+            }
+            copy_over(&from, &target_dir.join(name))?;
+        }
+        println!("Copied nitid to {}", target_dir.display());
     }
 
-    register(&target)?;
+    register(&target_dir.join(WINDOWED_EXE))?;
 
     println!("Registered {} file types: {}", SUPPORTED_EXTENSIONS.len(), SUPPORTED_EXTENSIONS.join(", "));
     println!();
@@ -69,28 +90,42 @@ pub fn uninstall() -> Result<()> {
     println!("Removed the file type registration");
 
     let dir = install_dir()?;
-    let target = dir.join("nitid.exe");
+    let running = env::current_exe().unwrap_or_default();
+    let mut removed = false;
+    let mut deferred = false;
 
-    if !target.exists() {
+    for name in EXECUTABLES {
+        let target = dir.join(name);
+        if !target.exists() {
+            continue;
+        }
+
+        if same_file(&running, &target) {
+            // A running executable cannot delete itself; renaming it out of
+            // the way lets the next install write a clean copy, and Windows
+            // removes the stale name once the process exits.
+            let stale = target.with_extension("exe.old");
+            let _ = fs::remove_file(&stale);
+            fs::rename(&target, &stale).with_context(|| format!("retiring {}", target.display()))?;
+            deferred = true;
+        } else {
+            fs::remove_file(&target).with_context(|| format!("removing {}", target.display()))?;
+            let _ = fs::remove_file(target.with_extension("exe.old"));
+            removed = true;
+        }
+    }
+
+    if !removed && !deferred {
         println!("Nothing installed in {}", dir.display());
         return Ok(());
     }
 
-    let running = env::current_exe().unwrap_or_default();
-    if same_file(&running, &target) {
-        // A running executable cannot delete itself; renaming it out of the
-        // way lets the next install write a clean copy, and Windows removes
-        // the stale name once the process exits.
-        let stale = dir.join("nitid.exe.old");
-        let _ = fs::remove_file(&stale);
-        fs::rename(&target, &stale).with_context(|| format!("retiring {}", target.display()))?;
-        println!("Marked {} for removal on exit", target.display());
-    } else {
-        fs::remove_file(&target).with_context(|| format!("removing {}", target.display()))?;
-        let _ = fs::remove_file(dir.join("nitid.exe.old"));
-        let _ = fs::remove_dir(&dir);
-        println!("Removed {}", target.display());
+    if deferred {
+        println!("Marked the running executable for removal on exit");
     }
+    // Only succeeds once the directory is empty, which is the point.
+    let _ = fs::remove_dir(&dir);
+    println!("Removed {}", dir.display());
 
     Ok(())
 }

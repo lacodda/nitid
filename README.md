@@ -47,17 +47,40 @@ The numbers are held to a threshold by `tests/startup.rs`, so a change that
 puts a full decode back on the startup path fails the build rather than
 quietly costing a tenth of a second.
 
+## Honest color
+
+An image carries a colour profile saying what its numbers mean; a display has
+one saying what it can show. Most viewers ignore both and send the numbers
+straight to the screen, which is why the same photo looks oversaturated in one
+program and right in another.
+
+nitid reads the profile out of the file, asks Windows what the display is, and
+converts between them **in the shader** — the decoded pixels stay as the file
+stored them, the conversion costs nothing per frame, and changing your display
+profile costs a redraw rather than a reload.
+
+- An untagged file means sRGB, the convention every viewer follows.
+- A wide-gamut file (Display P3, Adobe RGB) is brought into what the display
+  can actually show, rather than clipped.
+- An sRGB file on a wide-gamut display is converted too — without that, every
+  ordinary photo comes out oversaturated on a modern monitor.
+- Arbitrary tone curves are handled by sampling them, so a scanner or camera
+  profile costs the same as a simple gamma.
+
+When the image and the display already agree, no conversion happens at all and
+the hardware does the sRGB decoding for free.
+
 ## Status
 
-Early development — v0.2.0 is out, and the startup promise the product exists
-for now holds. Color management, modern formats and HDR are still ahead. The
+Early development — v0.3.0 is out. Startup and colour, the two things the
+product exists for, both hold. Modern formats and HDR are still ahead. The
 version map to 1.0 is fixed:
 
 | Version | What lands |
 | --- | --- |
 | ✅ v0.1.0 | Window, wgpu renderer, JPEG/PNG, zoom and pan, folder navigation |
 | ✅ v0.2.0 | Instant startup — EXIF thumbnail first, background decode, prefetch |
-| v0.3.0 | Color management: ICC via `moxcms`, sRGB and Display P3 |
+| ✅ v0.3.0 | Color management: ICC via `moxcms`, sRGB and Display P3 |
 | v0.4.0 | WebP, JPEG XL, GIF, TIFF, BMP, SVG |
 | v0.5.0 | Sandboxed C decoders — HEIC and AVIF |
 | v0.6.0 | HDR output on Windows (`Bt2100Pq` on `Rgb10a2Unorm`) |
@@ -87,6 +110,11 @@ nitid install
 This copies nitid to `%LOCALAPPDATA%\Programs\nitid` and registers the file
 types it can open — no administrator, nothing outside your own user account.
 Re-running it upgrades an existing install, even while the viewer is open.
+
+The zip carries two executables and both are installed: `nitid.exe` is the one
+to run from a terminal, and `nitidw.exe` is what the shell opens files with.
+The second exists so that double-clicking an image never flashes a console
+window — see [ADR 0004](docs/adr/0004-two-binaries-console-and-windowed.md).
 
 Windows keeps the choice of default application to itself: no program is
 allowed to seize a file type. After installing, nitid appears under **Open

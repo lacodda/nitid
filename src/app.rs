@@ -8,12 +8,16 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalSize, PhysicalPosition};
+use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
+use moxcms::ColorProfile;
+
+use crate::color::{self, ColorTransform};
+use crate::config::Config;
 use crate::folder::Folder;
 use crate::gpu::Renderer;
 use crate::image_source::{self, Fidelity, LoadedImage, Orientation};
@@ -64,6 +68,11 @@ struct App {
     folder: Option<Folder>,
     shown: Option<Shown>,
     loader: Loader,
+    config: Config,
+    /// The profile Windows has assigned to the display.
+    display_profile: ColorProfile,
+    /// Kept to hand for untagged files, which mean sRGB by convention.
+    srgb: ColorProfile,
     cursor: PhysicalPosition<f64>,
     dragging: bool,
     /// A failure that must end the run; reported after the loop exits, since
@@ -80,6 +89,9 @@ impl App {
             folder: None,
             shown: None,
             loader,
+            config: Config::load(),
+            display_profile: color::display_profile(),
+            srgb: ColorProfile::new_srgb(),
             cursor: PhysicalPosition::new(0.0, 0.0),
             dragging: false,
             failure: None,
@@ -132,7 +144,16 @@ impl App {
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
-        renderer.set_image(&loaded.image);
+        // An untagged file means sRGB by convention — which still needs
+        // converting when the display is not an sRGB one.
+        let source = loaded.profile.as_ref().unwrap_or(&self.srgb);
+        let transform = ColorTransform::new(source, &self.display_profile);
+        startup::milestone(if transform.is_identity {
+            "colour: no conversion needed"
+        } else {
+            "colour: converted to the display profile"
+        });
+        renderer.set_image(&loaded.image, &transform);
 
         // Replacing a thumbnail with the image it stood in for must not move
         // the picture: the framing carries over, rebased onto the resolution
@@ -218,6 +239,32 @@ impl App {
                 // reason to close the viewer: name it and keep the window.
                 eprintln!("nitid: {}: {error}", path.display());
             }
+        }
+    }
+
+    /// Note the window's placement so the next run opens in the same spot.
+    ///
+    /// A maximised window keeps the size it had before being maximised: the
+    /// maximised flag restores the state, and storing the full-screen size
+    /// would leave the window stuck at that size once it is restored.
+    fn remember_placement(&mut self) {
+        let Some(window) = &self.window else {
+            return;
+        };
+
+        let maximised = window.is_maximized();
+        self.config.placement.maximised = maximised;
+
+        if maximised {
+            return;
+        }
+
+        if let Ok(position) = window.outer_position() {
+            self.config.placement.position = Some((position.x, position.y));
+        }
+        let size = window.inner_size();
+        if size.width > 0 && size.height > 0 {
+            self.config.placement.size = Some((size.width, size.height));
         }
     }
 
@@ -365,17 +412,38 @@ impl ApplicationHandler<Decoded> for App {
         self.decoded(event);
     }
 
+    /// The loop is finishing: write down where the window ended up.
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.remember_placement();
+        self.config.save();
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
         }
 
-        let attributes = Window::default_attributes()
+        let mut attributes = Window::default_attributes()
             .with_title("nitid")
-            .with_inner_size(LogicalSize::new(DEFAULT_WINDOW.0, DEFAULT_WINDOW.1))
             // The window stays hidden until the first frame is ready: showing
             // it earlier is the white flash every other viewer opens with.
             .with_visible(false);
+
+        // Reopen where the viewer was last closed. Without an explicit
+        // position Windows cascades each new window a little further down and
+        // right, so opening a folder file by file walks the window across the
+        // screen — every image lands somewhere new.
+        let stored = self.config.placement;
+        attributes = match stored.size {
+            Some((width, height)) => attributes.with_inner_size(PhysicalSize::new(width, height)),
+            None => attributes.with_inner_size(LogicalSize::new(DEFAULT_WINDOW.0, DEFAULT_WINDOW.1)),
+        };
+        if let Some((x, y)) = stored.position {
+            attributes = attributes.with_position(PhysicalPosition::new(x, y));
+        }
+        if stored.maximised {
+            attributes = attributes.with_maximized(true);
+        }
 
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Arc::new(window),

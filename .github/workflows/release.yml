@@ -44,7 +44,10 @@ jobs:
         shell: bash
         run: |
           mkdir dist
-          cp target/release/nitid.exe dist/
+          # Both binaries: nitid.exe prints, nitidw.exe is what the shell
+          # opens files with. Installing one without the other leaves a file
+          # association pointing at nothing (ADR 0004).
+          cp target/release/nitid.exe target/release/nitidw.exe dist/
           cp README.md LICENSE dist/
           7z a "nitid-${GITHUB_REF_NAME}-x86_64-pc-windows-msvc.zip" ./dist/*
 

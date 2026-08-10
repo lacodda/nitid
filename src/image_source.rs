@@ -9,6 +9,9 @@ use std::io::Cursor;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use moxcms::ColorProfile;
+
+use crate::color;
 
 /// Extensions this build can open, lowercase and without the dot.
 ///
@@ -16,6 +19,7 @@ use anyhow::{Context, Result, bail};
 pub const SUPPORTED_EXTENSIONS: &[&str] = &["jpg", "jpeg", "jpe", "jfif", "png", "gif", "bmp", "tif", "tiff"];
 
 /// A decoded image: tightly packed RGBA8 rows, ready for a GPU upload.
+#[derive(Clone)]
 pub struct DecodedImage {
     pub width: u32,
     pub height: u32,
@@ -77,10 +81,16 @@ pub enum Fidelity {
 }
 
 /// A file loaded and decoded, with the orientation its metadata asks for.
+#[derive(Clone)]
 pub struct LoadedImage {
     pub image: DecodedImage,
     pub orientation: Orientation,
     pub fidelity: Fidelity,
+    /// The ICC profile the file carries, if any.
+    ///
+    /// `None` means untagged, which by convention means sRGB — the assumption
+    /// every viewer makes and the one that is nearly always right.
+    pub profile: Option<ColorProfile>,
 }
 
 impl LoadedImage {
@@ -129,6 +139,7 @@ pub fn decode(bytes: &[u8]) -> Result<LoadedImage> {
         image,
         orientation,
         fidelity: Fidelity::Full,
+        profile: color::profile_from(bytes),
     })
 }
 
@@ -171,6 +182,9 @@ pub fn decode_thumbnail(bytes: &[u8]) -> Option<LoadedImage> {
         // sideways for the moment before the real one replaces it.
         orientation: orientation_from(&exif),
         fidelity: Fidelity::Thumbnail,
+        // The profile describes the file, so it covers the thumbnail too: the
+        // quick frame and the image replacing it are the same colour.
+        profile: color::profile_from(bytes),
     })
 }
 
@@ -314,6 +328,7 @@ mod tests {
             },
             orientation: Orientation::Rotate90,
             fidelity: Fidelity::Full,
+            profile: None,
         };
         assert_eq!(loaded.display_size(), (50, 100));
     }

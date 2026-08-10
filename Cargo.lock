@@ -609,6 +609,7 @@ version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ea2d84b969582b4b1864a92dc5d27cd2b77b622a8d79306834f1be5ba20d84b"
 dependencies = [
+ "bytemuck",
  "cfg-if",
  "crunchy",
  "num-traits",
@@ -956,8 +957,12 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "bytemuck",
+ "flate2",
+ "half",
  "image",
  "kamadak-exif",
+ "moxcms",
+ "naga",
  "pollster",
  "tempfile",
  "thiserror 2.0.20",

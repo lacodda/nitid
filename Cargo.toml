@@ -28,7 +28,7 @@ exclude = [
 winresource = "0.1"
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.62", features = ["Win32_System_Console", "Win32_UI_Shell", "Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Security", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.62", features = ["Win32_System_Console", "Win32_UI_Shell", "Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Security", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_UI_ColorSystem"] }
 windows-registry = "0.6"
 
 [dependencies]
@@ -48,8 +48,17 @@ zune-jpeg = "0.5"
 # Metadata
 kamadak-exif = "0.6"
 bytemuck = { version = "1.25.2", features = ["derive"] }
+moxcms = "0.8"
+flate2 = "1.1.9"
+half = { version = "2.7.1", features = ["bytemuck"] }
 
 [dev-dependencies]
+flate2 = "1.1.9"
+# The same narrow feature set as the main dependency: the default brings in
+# every decoder the crate knows, which the tests have no use for.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+moxcms = "0.8"
+naga = { version = "30", features = ["wgsl-in"] }
 tempfile = "3"
 
 [profile.release]
