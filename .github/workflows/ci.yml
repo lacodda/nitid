@@ -32,6 +32,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Format
         run: cargo fmt --check
+      # The release build passes --locked, so a version bump that forgets to
+      # update Cargo.lock only fails after the tag is pushed — when the
+      # publication is already irreversible. Catch it here instead.
+      - name: Lockfile is in step with the manifest
+        run: cargo metadata --locked --format-version 1 > /dev/null
+        shell: bash
       - name: Lint
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
