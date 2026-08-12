@@ -2,10 +2,22 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.0] - 2026-08-12
+
+### Breaking Changes
+- The minimum supported Rust version is now 1.89, raised from 1.88 by the
+  `moxcms` 0.9 upgrade. Building with an older toolchain fails to resolve.
+
+### CI
+- Hold the build to the declared MSRV
+
+### Features
+- Open WebP, and name every format in one place
 ## [0.3.1] - 2026-08-10
 
 ### Bug Fixes
 - Remove the application key left by v0.2.0
+- Keep Cargo.lock in step with the manifest
 ## [0.3.0] - 2026-08-10
 
 ### Features

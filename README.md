@@ -70,18 +70,36 @@ profile costs a redraw rather than a reload.
 When the image and the display already agree, no conversion happens at all and
 the hardware does the sRGB decoding for free.
 
+## Formats
+
+Everything below decodes in pure Rust, in this process: a malformed file costs
+an error, never code execution.
+
+| Format | Extensions | Embedded ICC profile |
+| --- | --- | --- |
+| JPEG | `.jpg` `.jpeg` `.jpe` `.jfif` | yes |
+| PNG | `.png` | yes |
+| WebP | `.webp` | yes |
+| GIF | `.gif` | sRGB by definition |
+| BMP | `.bmp` | no |
+| TIFF | `.tif` `.tiff` | no |
+
+The format is decided by the bytes, not the extension: a `.png` that is really
+a JPEG opens rather than erroring. HEIC and AVIF need C libraries and arrive in
+v0.5.0 behind a sandbox; JPEG XL and SVG follow in v0.4.1.
+
 ## Status
 
-Early development — v0.3.0 is out. Startup and colour, the two things the
-product exists for, both hold. Modern formats and HDR are still ahead. The
-version map to 1.0 is fixed:
+Early development — v0.4.0 is out. Startup, colour and pure-Rust format
+coverage all hold. HDR is still ahead. The version map to 1.0 is fixed:
 
 | Version | What lands |
 | --- | --- |
 | ✅ v0.1.0 | Window, wgpu renderer, JPEG/PNG, zoom and pan, folder navigation |
 | ✅ v0.2.0 | Instant startup — EXIF thumbnail first, background decode, prefetch |
 | ✅ v0.3.0 | Color management: ICC via `moxcms`, sRGB and Display P3 |
-| v0.4.0 | WebP, JPEG XL, GIF, TIFF, BMP, SVG |
+| ✅ v0.4.0 | WebP, and one place that names every format |
+| v0.4.1 | JPEG XL, SVG |
 | v0.5.0 | Sandboxed C decoders — HEIC and AVIF |
 | v0.6.0 | HDR output on Windows (`Bt2100Pq` on `Rgb10a2Unorm`) |
 | v0.7.0 | Toolbar, thumbnail strip, settings |
