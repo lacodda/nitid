@@ -59,11 +59,13 @@ converts between them **in the shader** — the decoded pixels stay as the file
 stored them, the conversion costs nothing per frame, and changing your display
 profile costs a redraw rather than a reload.
 
-- An untagged file means sRGB, the convention every viewer follows.
 - A wide-gamut file (Display P3, Adobe RGB) is brought into what the display
   can actually show, rather than clipped.
-- An sRGB file on a wide-gamut display is converted too — without that, every
-  ordinary photo comes out oversaturated on a modern monitor.
+- A file with **no** profile is shown exactly as it is, the way Windows, the
+  shell preview and every browser show it. It looks the same here as it does
+  everywhere else — including in whatever tool made it. Guessing sRGB and
+  converting from it would visibly wash the picture out on a wide-gamut
+  display; see [ADR 0005](docs/adr/0005-untagged-images-pass-through.md).
 - Arbitrary tone curves are handled by sampling them, so a scanner or camera
   profile costs the same as a simple gamma.
 
@@ -86,11 +88,11 @@ an error, never code execution.
 
 The format is decided by the bytes, not the extension: a `.png` that is really
 a JPEG opens rather than erroring. HEIC and AVIF need C libraries and arrive in
-v0.5.0 behind a sandbox; JPEG XL and SVG follow in v0.4.1.
+v0.5.0 behind a sandbox; JPEG XL and SVG follow in v0.4.2.
 
 ## Status
 
-Early development — v0.4.0 is out. Startup, colour and pure-Rust format
+Early development — v0.4.1 is out. Startup, colour and pure-Rust format
 coverage all hold. HDR is still ahead. The version map to 1.0 is fixed:
 
 | Version | What lands |
@@ -99,7 +101,8 @@ coverage all hold. HDR is still ahead. The version map to 1.0 is fixed:
 | ✅ v0.2.0 | Instant startup — EXIF thumbnail first, background decode, prefetch |
 | ✅ v0.3.0 | Color management: ICC via `moxcms`, sRGB and Display P3 |
 | ✅ v0.4.0 | WebP, and one place that names every format |
-| v0.4.1 | JPEG XL, SVG |
+| ✅ v0.4.1 | Untagged images pass through unconverted |
+| v0.4.2 | JPEG XL, SVG |
 | v0.5.0 | Sandboxed C decoders — HEIC and AVIF |
 | v0.6.0 | HDR output on Windows (`Bt2100Pq` on `Rgb10a2Unorm`) |
 | v0.7.0 | Toolbar, thumbnail strip, settings |

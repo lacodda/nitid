@@ -1,9 +1,8 @@
 //! Turning an image's colour profile into something a shader can apply.
 //!
-//! An untagged image is assumed to be sRGB, which is what every other viewer
-//! assumes and what the overwhelming majority of untagged files actually are.
-//! A tagged one is converted from its own primaries to the display's, on the
-//! GPU, per frame.
+//! A tagged image is converted from its own primaries to the display's, on the
+//! GPU, per frame. An untagged one is passed through untouched, the way every
+//! other viewer on Windows shows it — see `ColorTransform::for_image`.
 //!
 //! Doing this in the shader rather than at decode time is deliberate: the
 //! conversion is then free (it rides along with sampling that happens anyway),
@@ -37,6 +36,28 @@ pub struct ColorTransform {
 }
 
 impl ColorTransform {
+    /// Choose the transform for a file, given what profile it carries.
+    ///
+    /// A file with a profile states what its numbers mean, so it is converted
+    /// to what the display can show — that is colour management, and it is the
+    /// reason this module exists.
+    ///
+    /// A file *without* one states nothing, and gets passed through untouched.
+    /// Assuming sRGB and converting from it sounds more principled and is
+    /// worse: on a wide-gamut display it visibly desaturates every untagged
+    /// image, and it disagrees with Windows, the shell preview and every
+    /// browser, all of which send untagged pixels straight to the screen. An
+    /// image would then look one way here and another way everywhere else,
+    /// including in whatever program its author used to make it.
+    ///
+    /// See `docs/adr/0005-untagged-images-pass-through.md`.
+    pub fn for_image(profile: Option<&ColorProfile>, display: &ColorProfile) -> Self {
+        match profile {
+            Some(profile) => Self::new(profile, display),
+            None => Self::identity(),
+        }
+    }
+
     /// The transform that changes nothing.
     ///
     /// Used when the image and the display agree, which is the common case and
@@ -117,8 +138,8 @@ fn windows_display_profile() -> Option<ColorProfile> {
 
 /// Read the ICC profile a file carries, if it carries one.
 ///
-/// Returns `None` for an untagged file, which is not an error: it means sRGB
-/// by convention, and that is what the caller falls back to.
+/// Returns `None` for an untagged file, which is not an error: such a file
+/// states nothing about its colour and is shown as it is.
 pub fn profile_from(bytes: &[u8]) -> Option<ColorProfile> {
     let raw = raw_profile(bytes)?;
     // A malformed profile is treated as no profile. Refusing to show an image

@@ -77,8 +77,55 @@ fn an_untagged_png_needs_no_conversion() {
         .write_to(&mut png, image::ImageFormat::Png)
         .expect("encoding a PNG");
 
+    assert!(profile_from(&png.into_inner()).is_none(), "an untagged file must report no profile");
+}
+
+/// The regression this release fixes.
+///
+/// v0.3.0 assumed sRGB for an untagged file and converted from it, which on a
+/// wide-gamut display desaturates every such image: a neon green of
+/// (0.1, 1.0, 0.2) came out as (0.32, 0.96, 0.26), with three times the red
+/// mixed in. Reported from daily use against the same files shown correctly by
+/// other viewers.
+///
+/// The earlier test only checked that no profile was *found*, never that the
+/// file was then left alone — which is exactly how this got through.
+#[test]
+fn an_untagged_image_is_never_converted_even_on_a_wide_display() {
+    // Display P3 stands in for a wide-gamut display: markedly wider than sRGB,
+    // the way the OLED this was reported on is.
+    let wide = moxcms::ColorProfile::new_display_p3();
+    let transform = ColorTransform::for_image(None, &wide);
+
     assert!(
-        profile_from(&png.into_inner()).is_none(),
-        "an untagged file must report no profile, so the viewer assumes sRGB"
+        transform.is_identity,
+        "an untagged image must reach the screen untouched, got matrix {:?}",
+        transform.matrix
     );
+
+    // Stated as pixels too, since `is_identity` is the flag the renderer reads
+    // but the matrix is what would actually discolour the picture.
+    for (row, values) in transform.matrix.iter().enumerate() {
+        for (column, value) in values.iter().enumerate() {
+            let expected = if row == column { 1.0 } else { 0.0 };
+            assert!(
+                (value - expected).abs() < 1e-6,
+                "untagged pixels must pass through unchanged: {:?}",
+                transform.matrix
+            );
+        }
+    }
+}
+
+/// The other half of the promise: a file that *does* state its colour space is
+/// still converted. Passing untagged files through must not turn into passing
+/// everything through.
+#[test]
+fn a_tagged_image_is_still_converted_on_a_wide_display() {
+    let p3 = moxcms::ColorProfile::new_display_p3();
+    let encoded = p3.encode().expect("serialising Display P3");
+    let profile = profile_from(&tagged_png(&encoded)).expect("the iCCP chunk should be found");
+
+    let transform = ColorTransform::for_image(Some(&profile), &moxcms::ColorProfile::new_srgb());
+    assert!(!transform.is_identity, "a tagged image must still be colour managed");
 }

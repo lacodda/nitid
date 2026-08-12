@@ -71,8 +71,6 @@ struct App {
     config: Config,
     /// The profile Windows has assigned to the display.
     display_profile: ColorProfile,
-    /// Kept to hand for untagged files, which mean sRGB by convention.
-    srgb: ColorProfile,
     cursor: PhysicalPosition<f64>,
     dragging: bool,
     /// A failure that must end the run; reported after the loop exits, since
@@ -91,7 +89,6 @@ impl App {
             loader,
             config: Config::load(),
             display_profile: color::display_profile(),
-            srgb: ColorProfile::new_srgb(),
             cursor: PhysicalPosition::new(0.0, 0.0),
             dragging: false,
             failure: None,
@@ -144,10 +141,7 @@ impl App {
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
-        // An untagged file means sRGB by convention — which still needs
-        // converting when the display is not an sRGB one.
-        let source = loaded.profile.as_ref().unwrap_or(&self.srgb);
-        let transform = ColorTransform::new(source, &self.display_profile);
+        let transform = ColorTransform::for_image(loaded.profile.as_ref(), &self.display_profile);
         startup::milestone(if transform.is_identity {
             "colour: no conversion needed"
         } else {
