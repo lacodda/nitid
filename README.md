@@ -96,7 +96,7 @@ cargo run --release
 cargo fmt --check && cargo clippy -- -D warnings && cargo test
 ```
 
-Requires Rust 1.88 or newer.
+Requires Rust 1.89 or newer.
 
 ## Installing
 

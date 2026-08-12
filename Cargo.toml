@@ -2,7 +2,7 @@
 name = "nitid"
 version = "0.3.1"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 description = "A fast image viewer for Windows with honest color and HDR: first pixels in milliseconds, ICC on the GPU, modern formats"
 license = "MIT"
 repository = "https://github.com/lacodda/nitid"
@@ -48,7 +48,7 @@ zune-jpeg = "0.5"
 # Metadata
 kamadak-exif = "0.6"
 bytemuck = { version = "1.25.2", features = ["derive"] }
-moxcms = "0.8"
+moxcms = "0.9"
 flate2 = "1.1.9"
 half = { version = "2.7.1", features = ["bytemuck"] }
 
@@ -57,7 +57,7 @@ flate2 = "1.1.9"
 # The same narrow feature set as the main dependency: the default brings in
 # every decoder the crate knows, which the tests have no use for.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
-moxcms = "0.8"
+moxcms = "0.9"
 naga = { version = "30", features = ["wgsl-in"] }
 tempfile = "3"
 
