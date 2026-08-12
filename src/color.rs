@@ -13,6 +13,8 @@
 
 use moxcms::{ColorProfile, ToneReprCurve};
 
+use crate::format::Format;
+
 /// How many entries the tone curves are sampled into.
 ///
 /// 1024 is past the point where banding is visible in an 8-bit image, and the
@@ -124,17 +126,26 @@ pub fn profile_from(bytes: &[u8]) -> Option<ColorProfile> {
     ColorProfile::new_from_slice(&raw).ok()
 }
 
-/// Extract the raw ICC bytes from a JPEG or a PNG.
+/// Extract the raw ICC bytes a container carries.
+///
+/// Every format the viewer opens is asked here. A format left out of this match
+/// would still decode and still display — just in the wrong colours, silently,
+/// which is the failure this module exists to prevent.
 fn raw_profile(bytes: &[u8]) -> Option<Vec<u8>> {
-    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
-        // zune-jpeg already walks the APP segments while decoding headers, so
-        // no second parser is needed for the format the viewer opens most.
-        let mut decoder = zune_jpeg::JpegDecoder::new(std::io::Cursor::new(bytes));
-        decoder.decode_headers().ok()?;
-        return decoder.icc_profile();
+    match Format::detect(bytes)? {
+        Format::Jpeg => {
+            // zune-jpeg already walks the APP segments while decoding headers,
+            // so no second parser is needed for the format opened most.
+            let mut decoder = zune_jpeg::JpegDecoder::new(std::io::Cursor::new(bytes));
+            decoder.decode_headers().ok()?;
+            decoder.icc_profile()
+        }
+        Format::Png => png_profile(bytes),
+        Format::WebP => image_webp::WebPDecoder::new(std::io::Cursor::new(bytes)).ok()?.icc_profile().ok()?,
+        // GIF is sRGB by definition. BMP and TIFF can carry a profile, but
+        // neither appears tagged in practice often enough to justify a parser.
+        Format::Gif | Format::Bmp | Format::Tiff => None,
     }
-
-    png_profile(bytes)
 }
 
 /// Pull an `iCCP` chunk out of a PNG.

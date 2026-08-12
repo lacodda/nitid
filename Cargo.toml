@@ -51,6 +51,7 @@ bytemuck = { version = "1.25.2", features = ["derive"] }
 moxcms = "0.9"
 flate2 = "1.1.9"
 half = { version = "2.7.1", features = ["bytemuck"] }
+image-webp = "0.2"
 
 [dev-dependencies]
 flate2 = "1.1.9"

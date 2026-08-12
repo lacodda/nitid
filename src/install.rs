@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use windows_registry::CURRENT_USER;
 
-use crate::image_source::SUPPORTED_EXTENSIONS;
+use crate::image_source::supported_extensions;
 
 /// The ProgID under which nitid registers its file types.
 ///
@@ -83,7 +83,8 @@ pub fn install() -> Result<PathBuf> {
     remove_legacy_keys();
     register(&target_dir.join(WINDOWED_EXE))?;
 
-    println!("Registered {} file types: {}", SUPPORTED_EXTENSIONS.len(), SUPPORTED_EXTENSIONS.join(", "));
+    let extensions = supported_extensions();
+    println!("Registered {} file types: {}", extensions.len(), extensions.join(", "));
     println!();
     println!("nitid is now offered in \"Open with\". Windows reserves the choice");
     println!("of default application for you: right-click an image, choose");
@@ -215,7 +216,7 @@ fn register(exe: &Path) -> Result<()> {
     let associations = CURRENT_USER.create(format!(r"{CAPABILITIES_KEY}\FileAssociations"))?;
     let supported = CURRENT_USER.create(format!(r"{APPLICATION_KEY}\SupportedTypes"))?;
 
-    for extension in SUPPORTED_EXTENSIONS {
+    for extension in supported_extensions() {
         let dotted = format!(".{extension}");
 
         // Offer nitid for the type without seizing it: `OpenWithProgids` adds
@@ -251,7 +252,7 @@ fn unregister() -> Result<()> {
     // An install upgraded from an older version may still carry its keys.
     remove_legacy_keys();
 
-    for extension in SUPPORTED_EXTENSIONS {
+    for extension in supported_extensions() {
         let path = format!(r"Software\Classes\.{extension}\OpenWithProgids");
         // Removing a value needs write access; the plain `open` is read-only,
         // and asking for less than the operation needs fails with a bare
@@ -321,9 +322,9 @@ mod tests {
     /// that adds a decoder registers it without anyone editing a second list.
     #[test]
     fn every_supported_extension_is_lowercase_and_undotted() {
-        for extension in SUPPORTED_EXTENSIONS {
+        for extension in supported_extensions() {
             assert!(!extension.starts_with('.'), "{extension} carries a dot");
-            assert_eq!(*extension, extension.to_lowercase(), "{extension} is not lowercase");
+            assert_eq!(extension, extension.to_lowercase(), "{extension} is not lowercase");
         }
     }
 }

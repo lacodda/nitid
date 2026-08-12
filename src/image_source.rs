@@ -12,11 +12,16 @@ use anyhow::{Context, Result, bail};
 use moxcms::ColorProfile;
 
 use crate::color;
+use crate::format::Format;
 
 /// Extensions this build can open, lowercase and without the dot.
 ///
-/// Used both to filter a folder listing and to pick a decoder.
-pub const SUPPORTED_EXTENSIONS: &[&str] = &["jpg", "jpeg", "jpe", "jfif", "png", "gif", "bmp", "tif", "tiff"];
+/// Derived from the formats rather than written out, so a new decoder reaches
+/// the folder listing and the file associations without a second list to keep
+/// in step.
+pub fn supported_extensions() -> Vec<&'static str> {
+    Format::ALL.iter().flat_map(|format| format.extensions().iter().copied()).collect()
+}
 
 /// A decoded image: tightly packed RGBA8 rows, ready for a GPU upload.
 #[derive(Clone)]
@@ -109,7 +114,7 @@ pub fn is_supported(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
         .map(|ext| ext.to_ascii_lowercase())
-        .is_some_and(|ext| SUPPORTED_EXTENSIONS.contains(&ext.as_str()))
+        .is_some_and(|ext| supported_extensions().contains(&ext.as_str()))
 }
 
 /// Read a file from disk and decode it.
@@ -128,16 +133,21 @@ pub fn decode(bytes: &[u8]) -> Result<LoadedImage> {
         bail!("the file is empty");
     }
 
-    let orientation = read_orientation(bytes);
-    let image = if is_jpeg(bytes) {
-        decode_jpeg(bytes)?
-    } else {
-        decode_via_image_crate(bytes)?
+    let Some(format) = Format::detect(bytes) else {
+        bail!("the format is not one nitid can open");
     };
+
+    let image = match format {
+        Format::Jpeg => decode_jpeg(bytes),
+        Format::WebP => decode_webp(bytes),
+        // PNG, GIF, BMP and TIFF share one pure-Rust decoder.
+        Format::Png | Format::Gif | Format::Bmp | Format::Tiff => decode_via_image_crate(bytes),
+    }
+    .with_context(|| format!("the {} data is malformed", format.name()))?;
 
     Ok(LoadedImage {
         image,
-        orientation,
+        orientation: read_orientation(bytes),
         fidelity: Fidelity::Full,
         profile: color::profile_from(bytes),
     })
@@ -188,10 +198,6 @@ pub fn decode_thumbnail(bytes: &[u8]) -> Option<LoadedImage> {
     })
 }
 
-fn is_jpeg(bytes: &[u8]) -> bool {
-    bytes.starts_with(&[0xFF, 0xD8, 0xFF])
-}
-
 /// JPEG goes through `zune-jpeg` rather than the `image` crate: it is the
 /// faster decoder, and JPEG is the format the viewer opens most.
 fn decode_jpeg(bytes: &[u8]) -> Result<DecodedImage> {
@@ -231,6 +237,51 @@ fn decode_via_image_crate(bytes: &[u8]) -> Result<DecodedImage> {
         height,
         pixels: rgba.into_raw(),
     })
+}
+
+/// WebP goes through `image-webp` directly rather than through the `image`
+/// crate wrapping it, because only the crate itself exposes the ICC profile —
+/// and an untagged wide-gamut WebP shown as sRGB is exactly the silent colour
+/// error this viewer exists to avoid.
+fn decode_webp(bytes: &[u8]) -> Result<DecodedImage> {
+    let mut decoder = image_webp::WebPDecoder::new(Cursor::new(bytes)).context("the WebP header is unreadable")?;
+    let (width, height) = decoder.dimensions();
+
+    let expected = pixel_count(width, height)?;
+    let mut pixels = vec![0u8; expected];
+
+    if decoder.has_alpha() {
+        decoder.read_image(&mut pixels).context("the WebP pixels are unreadable")?;
+    } else {
+        // Without alpha the decoder writes three bytes per pixel, so it reads
+        // into its own buffer and the opaque alpha is filled in here.
+        let mut rgb = vec![0u8; width as usize * height as usize * 3];
+        decoder.read_image(&mut rgb).context("the WebP pixels are unreadable")?;
+        pixels = rgb_to_rgba8(&rgb, expected);
+    }
+
+    Ok(DecodedImage { width, height, pixels })
+}
+
+/// Bytes needed for a `width` by `height` RGBA8 image.
+///
+/// Checked rather than multiplied: the dimensions come from a file that may be
+/// lying, and a 32-bit overflow here would size the buffer far too small.
+fn pixel_count(width: u32, height: u32) -> Result<usize> {
+    (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .filter(|bytes| *bytes > 0)
+        .with_context(|| format!("{width}x{height} is not an image this build can hold"))
+}
+
+/// Widen opaque RGB samples to the RGBA8 the renderer uploads.
+fn rgb_to_rgba8(rgb: &[u8], expected: usize) -> Vec<u8> {
+    let mut pixels = vec![0xFFu8; expected];
+    for (target, source) in pixels.chunks_exact_mut(4).zip(rgb.chunks_exact(3)) {
+        target[..3].copy_from_slice(source);
+    }
+    pixels
 }
 
 /// Parse the EXIF block, if the file carries one.
@@ -297,6 +348,66 @@ mod tests {
     fn rejects_empty_and_garbage_input() {
         assert!(decode(&[]).is_err());
         assert!(decode(b"this is not an image at all").is_err());
+    }
+
+    /// Encode a solid-colour WebP, optionally tagged with a profile.
+    fn encode_webp(width: u32, height: u32, profile: Option<Vec<u8>>) -> Vec<u8> {
+        let mut out = Cursor::new(Vec::new());
+        let mut encoder = image_webp::WebPEncoder::new(&mut out);
+        if let Some(profile) = profile {
+            encoder.set_icc_profile(profile);
+        }
+        let pixels: Vec<u8> = (0..width * height).flat_map(|_| [10u8, 200, 90]).collect();
+        encoder
+            .encode(&pixels, width, height, image_webp::ColorType::Rgb8)
+            .expect("encoding a synthetic WebP");
+        out.into_inner()
+    }
+
+    #[test]
+    fn decodes_webp_to_rgba() {
+        let loaded = decode(&encode_webp(6, 4, None)).unwrap();
+        assert_eq!((loaded.image.width, loaded.image.height), (6, 4));
+        assert_eq!(loaded.image.pixels.len(), 6 * 4 * 4);
+    }
+
+    /// A WebP without alpha decodes three bytes per pixel; the fourth has to be
+    /// filled in, or the image is uploaded fully transparent.
+    #[test]
+    fn an_opaque_webp_comes_back_opaque() {
+        let loaded = decode(&encode_webp(3, 3, None)).unwrap();
+        for pixel in loaded.image.pixels.chunks_exact(4) {
+            assert_eq!(pixel[3], 0xFF, "an opaque WebP decoded to a transparent pixel");
+        }
+    }
+
+    /// The colour promise applies to every format, not just the two the viewer
+    /// started with: a tagged WebP shown as sRGB is wrong on a wide display.
+    #[test]
+    fn a_tagged_webp_carries_its_profile_through() {
+        let profile = moxcms::ColorProfile::new_display_p3().encode().expect("encoding a P3 profile");
+        let loaded = decode(&encode_webp(4, 4, Some(profile))).unwrap();
+        assert!(loaded.profile.is_some(), "the WebP profile was dropped");
+    }
+
+    #[test]
+    fn an_untagged_webp_has_no_profile() {
+        assert!(decode(&encode_webp(4, 4, None)).unwrap().profile.is_none());
+    }
+
+    #[test]
+    fn widening_rgb_samples_adds_opaque_alpha() {
+        assert_eq!(rgb_to_rgba8(&[10, 20, 30], 4), vec![10, 20, 30, 0xFF]);
+        assert_eq!(rgb_to_rgba8(&[1, 2, 3, 4, 5, 6], 8), vec![1, 2, 3, 0xFF, 4, 5, 6, 0xFF]);
+    }
+
+    /// Dimensions come from the file and may be a lie; the multiplication that
+    /// sizes the buffer must not wrap.
+    #[test]
+    fn absurd_dimensions_are_refused_rather_than_overflowing() {
+        assert!(pixel_count(u32::MAX, u32::MAX).is_err());
+        assert!(pixel_count(0, 0).is_err());
+        assert_eq!(pixel_count(2, 3).unwrap(), 24);
     }
 
     #[test]

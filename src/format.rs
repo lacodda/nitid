@@ -1,0 +1,140 @@
+//! Recognising an image format from the bytes that begin the file.
+//!
+//! The name on disk is a hint, not a fact: a `.png` that is really a JPEG is
+//! common enough that trusting the extension would refuse a file the user can
+//! plainly see open elsewhere. So the extension only decides what appears in a
+//! folder listing, and the content decides what actually decodes it.
+//!
+//! This is the one place a format is named. A new decoder adds a variant here,
+//! its signature to `Format::detect`, and its extensions to `EXTENSIONS`; the
+//! decoder, the file associations `nitid install` registers, and the ICC lookup
+//! all follow from that single entry.
+
+/// An image format this build knows how to open.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Format {
+    Jpeg,
+    Png,
+    WebP,
+    Gif,
+    Bmp,
+    Tiff,
+}
+
+impl Format {
+    /// Every format, in the order they appear above.
+    ///
+    /// Exists so the extension list and the tests cannot silently fall behind a
+    /// newly added variant.
+    pub const ALL: &'static [Format] = &[Format::Jpeg, Format::Png, Format::WebP, Format::Gif, Format::Bmp, Format::Tiff];
+
+    /// Identify the format from the start of the file.
+    ///
+    /// Returns `None` for anything unrecognised, which the caller reports as a
+    /// file nitid cannot open.
+    pub fn detect(bytes: &[u8]) -> Option<Self> {
+        if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+            return Some(Format::Jpeg);
+        }
+        if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+            return Some(Format::Png);
+        }
+        // RIFF....WEBP: the size sits between the two tags, so both halves are
+        // checked and the four bytes carrying the length are skipped.
+        if bytes.starts_with(b"RIFF") && bytes.len() >= 12 && &bytes[8..12] == b"WEBP" {
+            return Some(Format::WebP);
+        }
+        if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+            return Some(Format::Gif);
+        }
+        if bytes.starts_with(b"BM") {
+            return Some(Format::Bmp);
+        }
+        // TIFF is either endianness, each with its own magic number.
+        if bytes.starts_with(&[0x49, 0x49, 0x2A, 0x00]) || bytes.starts_with(&[0x4D, 0x4D, 0x00, 0x2A]) {
+            return Some(Format::Tiff);
+        }
+
+        None
+    }
+
+    /// The extensions this format is normally stored under, lowercase and
+    /// without the dot.
+    pub fn extensions(self) -> &'static [&'static str] {
+        match self {
+            Format::Jpeg => &["jpg", "jpeg", "jpe", "jfif"],
+            Format::Png => &["png"],
+            Format::WebP => &["webp"],
+            Format::Gif => &["gif"],
+            Format::Bmp => &["bmp"],
+            Format::Tiff => &["tif", "tiff"],
+        }
+    }
+
+    /// The name shown to a person, as the format is usually written.
+    pub fn name(self) -> &'static str {
+        match self {
+            Format::Jpeg => "JPEG",
+            Format::Png => "PNG",
+            Format::WebP => "WebP",
+            Format::Gif => "GIF",
+            Format::Bmp => "BMP",
+            Format::Tiff => "TIFF",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_each_format_from_its_signature() {
+        assert_eq!(Format::detect(&[0xFF, 0xD8, 0xFF, 0xE0]), Some(Format::Jpeg));
+        assert_eq!(Format::detect(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]), Some(Format::Png));
+        assert_eq!(Format::detect(b"RIFF\0\0\0\0WEBPVP8 "), Some(Format::WebP));
+        assert_eq!(Format::detect(b"GIF89a..."), Some(Format::Gif));
+        assert_eq!(Format::detect(b"BM......"), Some(Format::Bmp));
+        assert_eq!(Format::detect(&[0x49, 0x49, 0x2A, 0x00]), Some(Format::Tiff));
+        assert_eq!(Format::detect(&[0x4D, 0x4D, 0x00, 0x2A]), Some(Format::Tiff));
+    }
+
+    #[test]
+    fn rejects_what_it_does_not_know() {
+        assert_eq!(Format::detect(b""), None);
+        assert_eq!(Format::detect(b"this is not an image"), None);
+        // RIFF alone is not enough: WAV audio starts the same way.
+        assert_eq!(Format::detect(b"RIFF\0\0\0\0WAVEfmt "), None);
+    }
+
+    /// A truncated file must be reported as unknown rather than reaching into
+    /// bytes that are not there.
+    #[test]
+    fn a_signature_cut_short_does_not_panic() {
+        for length in 0..12 {
+            let _ = Format::detect(&[0x00, 0x00, 0x00, 0x0C, b'J', b'X', b'L', 0x20, 0x0D, 0x0A, 0x87, 0x0A][..length]);
+            let _ = Format::detect(&b"RIFF\0\0\0\0WEBP"[..length]);
+        }
+    }
+
+    #[test]
+    fn every_format_has_an_extension_and_a_name() {
+        for format in Format::ALL {
+            assert!(!format.extensions().is_empty(), "{format:?} has no extension");
+            assert!(!format.name().is_empty(), "{format:?} has no name");
+        }
+    }
+
+    /// Two formats claiming the same extension would make the folder listing
+    /// ambiguous and the install registration order-dependent.
+    #[test]
+    fn no_extension_is_claimed_twice() {
+        let mut seen = Vec::new();
+        for format in Format::ALL {
+            for extension in format.extensions() {
+                assert!(!seen.contains(extension), "{extension} is claimed twice");
+                seen.push(extension);
+            }
+        }
+    }
+}

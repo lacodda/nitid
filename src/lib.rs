@@ -14,6 +14,7 @@ mod color;
 mod config;
 mod console;
 mod folder;
+mod format;
 mod gpu;
 mod image_source;
 #[cfg(windows)]
