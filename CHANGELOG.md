@@ -2,6 +2,10 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.1] - 2026-08-12
+
+### Bug Fixes
+- Show an untagged image as it is, without assuming sRGB
 ## [0.4.0] - 2026-08-12
 
 ### Breaking Changes
