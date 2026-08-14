@@ -15,7 +15,16 @@ Two formats have no viable Rust decoder: HEIC (`libheif-rs`) and AVIF (`libavif`
 
 Pure-Rust decoders run in the main process.
 
-C-backed decoders run in a separate process with a restricted token: a job object, low integrity level, no network access, and access to the single file being decoded. Decoded pixels are returned over IPC. A crash in that process surfaces as "could not open this file" while the viewer stays alive.
+C-backed decoders run in a separate process with a restricted token: a job object, low integrity level, and no path to the file at all — the bytes are handed over on a pipe. Decoded pixels are returned the same way. A crash in that process surfaces as "could not open this file" while the viewer stays alive.
+
+## Addendum, 2026-08-14 (v0.6.0, when the boundary was built)
+
+Two corrections to the above, both found while implementing it:
+
+- **"No network access" was wrong as written.** A low integrity process can still open a socket; the belief that integrity level closes the network is common and false. Shutting it needs an AppContainer with no capabilities, or a firewall rule naming the executable. Neither is in v0.6.0: every decoder behind the boundary today is pure Rust and none opens a socket, so the gap costs nothing yet — but it is a gap, and it is recorded rather than papered over. It must be closed before HEIC and AVIF arrive in v0.7.0, since those are the C libraries the boundary exists for.
+- **The child is confined by mutating its own token, not by being given one.** `CreateProcessAsUser` needs privileges an ordinary desktop process does not hold. Creating the process suspended, stripping the token it already has, assigning the job, and only then resuming achieves the same confinement without elevation — and closes the race where a process runs before its limits apply.
+
+The boundary was built one stage before the decoders that need it, so adding HEIC is adding a decoder rather than a decoder and an architecture at once. `Format::needs_sandbox` is the switch; nothing answers true yet.
 
 ## Consequences
 

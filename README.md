@@ -74,8 +74,8 @@ the hardware does the sRGB decoding for free.
 
 ## Formats
 
-Everything below decodes in pure Rust, in this process: a malformed file costs
-an error, never code execution.
+Everything below decodes in pure Rust: a malformed file costs an error, never
+code execution.
 
 | Format | Extensions | Embedded ICC profile |
 | --- | --- | --- |
@@ -89,8 +89,16 @@ an error, never code execution.
 | TIFF | `.tif` `.tiff` | no |
 
 The format is decided by the bytes, not the extension: a `.png` that is really
-a JPEG opens rather than erroring. HEIC and AVIF need C libraries and arrive in
-v0.7.0 behind a sandbox.
+a JPEG opens rather than erroring.
+
+HEIC and AVIF need C libraries, where a malformed file is a memory-safety bug
+rather than an error, so they will not decode in this process. The boundary
+they will run behind is already built: a child process created suspended,
+stripped of every privilege, dropped to low integrity, held in a job object
+that caps its memory and kills it with the viewer. It is handed the file's
+bytes on a pipe and never its path, so a decoder that is taken over cannot ask
+for a different file. A crash there is a message on screen, not a lost viewer.
+The decoders arrive in v0.7.0.
 
 SVG is drawn for the size it is shown at, and drawn again when that changes, so
 zooming in sharpens the picture instead of enlarging pixels. A document that
@@ -101,7 +109,7 @@ has no size limit to hide behind.
 
 ## Status
 
-Early development — v0.5.0 is out. Startup, colour and pure-Rust format
+Early development — v0.6.0 is out. Startup, colour and pure-Rust format
 coverage all hold. HDR is still ahead. Development runs in small versions, each
 one theme; the road to 1.0 is fixed:
 
@@ -114,7 +122,7 @@ one theme; the road to 1.0 is fixed:
 | ✅ v0.4.1 | Untagged images pass through unconverted |
 | ✅ v0.4.2 | JPEG XL |
 | ✅ v0.5.0 | SVG, redrawn at the size it is shown |
-| v0.6.0 | Sandboxed decoder process |
+| ✅ v0.6.0 | Sandboxed decoder process |
 | v0.7.0 | HEIC and AVIF, behind that sandbox |
 | v0.8.0 | Background decode — no format can block the UI |
 | v0.9.0 | Animation: GIF, WebP, APNG |

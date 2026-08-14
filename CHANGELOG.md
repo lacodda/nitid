@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.6.0] - 2026-08-14
+
+### Features
+- Define the protocol between the viewer and a decoder process
+- Decode in a process that can do nothing else
+
 ## [0.5.0] - 2026-08-14
 
 ### Bug Fixes
