@@ -83,17 +83,25 @@ an error, never code execution.
 | PNG | `.png` | yes |
 | WebP | `.webp` | yes |
 | JPEG XL | `.jxl` | yes |
+| SVG | `.svg` | drawn in sRGB |
 | GIF | `.gif` | sRGB by definition |
 | BMP | `.bmp` | no |
 | TIFF | `.tif` `.tiff` | no |
 
 The format is decided by the bytes, not the extension: a `.png` that is really
-a JPEG opens rather than erroring. SVG follows in v0.5.0; HEIC and AVIF need C
-libraries and arrive in v0.7.0 behind a sandbox.
+a JPEG opens rather than erroring. HEIC and AVIF need C libraries and arrive in
+v0.7.0 behind a sandbox.
+
+SVG is drawn for the size it is shown at, and drawn again when that changes, so
+zooming in sharpens the picture instead of enlarging pixels. A document that
+references another file does not get one: nitid refuses every href that is not
+embedded, because an image is untrusted input and must not choose what the
+viewer reads off the disk. Compressed `.svgz` is not opened — decompressing it
+has no size limit to hide behind.
 
 ## Status
 
-Early development — v0.4.2 is out. Startup, colour and pure-Rust format
+Early development — v0.5.0 is out. Startup, colour and pure-Rust format
 coverage all hold. HDR is still ahead. Development runs in small versions, each
 one theme; the road to 1.0 is fixed:
 
@@ -105,7 +113,7 @@ one theme; the road to 1.0 is fixed:
 | ✅ v0.4.0 | WebP, and one place that names every format |
 | ✅ v0.4.1 | Untagged images pass through unconverted |
 | ✅ v0.4.2 | JPEG XL |
-| v0.5.0 | SVG, rasterised at the current zoom |
+| ✅ v0.5.0 | SVG, redrawn at the size it is shown |
 | v0.6.0 | Sandboxed decoder process |
 | v0.7.0 | HEIC and AVIF, behind that sandbox |
 | v0.8.0 | Background decode — no format can block the UI |

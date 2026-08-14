@@ -54,10 +54,13 @@ Three parts implement it in `cliff.toml`:
   was rendered under Breaking Changes with the footer text, while ordinary
   `chore` commits stayed absent.
 
-**Regeneration uses `--prepend`, not `-o`.** `git-cliff --tag vX.Y.Z --prepend
-CHANGELOG.md` writes only the new version on top and leaves every earlier entry
-untouched. The whole-file rewrite is what made hand edits perishable, so it is
-no longer part of the release ritual.
+**Regeneration uses `--prepend`, not `-o`.** `git-cliff --tag vX.Y.Z
+--unreleased --strip header --prepend CHANGELOG.md` writes only the new version
+on top and leaves every earlier entry untouched. The whole-file rewrite is what
+made hand edits perishable, so it is no longer part of the release ritual.
+
+`--strip header` matters: without it the file's title block is prepended along
+with the new section, leaving two of them.
 
 The release workflow is unaffected: it runs `--latest --strip header` into
 `RELEASE_NOTES.md`, which never touches `CHANGELOG.md`.

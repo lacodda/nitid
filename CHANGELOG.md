@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.5.0] - 2026-08-14
+
+### Bug Fixes
+- Redraw a vector image when it is first fitted to the window
+
+### Features
+- Open SVG and redraw it when the zoom changes
+
 ## [0.4.2] - 2026-08-14
 
 ### Bug Fixes
