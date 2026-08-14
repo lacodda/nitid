@@ -20,6 +20,7 @@ mod image_source;
 #[cfg(windows)]
 mod install;
 mod loader;
+mod sandbox;
 mod startup;
 mod vector;
 mod view;
