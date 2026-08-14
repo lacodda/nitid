@@ -1,6 +1,6 @@
 [package]
 name = "nitid"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
 rust-version = "1.89"
 description = "A fast image viewer for Windows with honest color and HDR: first pixels in milliseconds, ICC on the GPU, modern formats"

@@ -313,14 +313,19 @@ fn decode_jxl(bytes: &[u8]) -> Result<(DecodedImage, Option<ColorProfile>)> {
     let mut samples = vec![0u8; expected / 4 * channels];
     stream.write_to_buffer(&mut samples);
 
+    // The stream carries as many channels as the image has: four for RGBA,
+    // three for opaque colour, two for grey with alpha, one for plain grey.
+    // All of them are widened to the RGBA the renderer uploads, because a
+    // format is either supported or it is not — a greyscale scan refusing to
+    // open would be exactly the half-support `format.rs` exists to prevent.
     let pixels = match channels {
         4 => samples,
-        // An opaque JXL streams three samples per pixel; without the opaque
-        // alpha filled in, the upload would be fully transparent.
         3 => rgb_to_rgba8(&samples, expected),
-        // Greyscale and CMYK reach the same stream with a different channel
-        // count. Neither is refused here for lack of a decoder — the viewer
-        // simply has no path to lay them out as RGBA yet.
+        2 => grey_to_rgba8(samples.chunks_exact(2).map(|pair| (pair[0], pair[1])), expected),
+        1 => grey_to_rgba8(samples.iter().map(|grey| (*grey, 0xFF)), expected),
+        // CMYK reaches the same stream with five channels or more. Left
+        // unhandled rather than guessed at: converting it needs the profile,
+        // and no such file has been seen in the wild here.
         other => bail!("a JPEG XL with {other} channels per pixel is not one this build can show"),
     };
 
@@ -337,6 +342,21 @@ fn pixel_count(width: u32, height: u32) -> Result<usize> {
         .and_then(|pixels| pixels.checked_mul(4))
         .filter(|bytes| *bytes > 0)
         .with_context(|| format!("{width}x{height} is not an image this build can hold"))
+}
+
+/// Widen grey samples to RGBA8, repeating the one value across all three
+/// colour channels.
+///
+/// Greyscale images arrive this way from JPEG XL, where a scan or a black and
+/// white photograph is stored with a single channel rather than three equal
+/// ones.
+fn grey_to_rgba8(samples: impl Iterator<Item = (u8, u8)>, expected: usize) -> Vec<u8> {
+    let mut pixels = vec![0xFFu8; expected];
+    for (target, (grey, alpha)) in pixels.chunks_exact_mut(4).zip(samples) {
+        target[..3].fill(grey);
+        target[3] = alpha;
+    }
+    pixels
 }
 
 /// Widen opaque RGB samples to the RGBA8 the renderer uploads.
@@ -465,6 +485,15 @@ mod tests {
     /// `jxl-oxide` decoder under test: a decoder fed its own encoder's output
     /// mostly proves the two agree. Lossless, so a round-trip is exact and the
     /// pixels can be asserted rather than approximated.
+    ///
+    /// The fixtures are deliberately small, and that is a limit worth knowing:
+    /// above 256x256 a JPEG XL is split into several groups, and `jxl-oxide`
+    /// rejects the multi-group files this encoder writes — while reading
+    /// multi-group files from libjxl, including 2400x1600 with alpha, without
+    /// complaint. Real files therefore open; the disagreement is between these
+    /// two crates. Coverage at real sizes comes from files encoded by libjxl,
+    /// which cannot be generated here, so it is checked by hand before a
+    /// release rather than asserted in this module.
     fn encode_jxl(width: u32, height: u32, profile: Option<&[u8]>) -> Vec<u8> {
         use jxl_encoder::{ImageMetadata, LosslessConfig, PixelLayout};
 
@@ -517,6 +546,30 @@ mod tests {
     #[test]
     fn an_untagged_jpeg_xl_has_no_profile() {
         assert!(decode(&encode_jxl(4, 4, None)).unwrap().profile.is_none());
+    }
+
+    /// A greyscale JPEG XL streams one sample per pixel, not three. Refusing
+    /// it would be the half-support `format.rs` exists to prevent — scans and
+    /// black and white photographs are stored this way.
+    #[test]
+    fn a_greyscale_jpeg_xl_opens_as_grey_rgba() {
+        let pixels: Vec<u8> = (0..4u32 * 4).map(|i| (i * 7) as u8).collect();
+        let jxl = jxl_encoder::LosslessConfig::new()
+            .encode(&pixels, 4, 4, jxl_encoder::PixelLayout::Gray8)
+            .expect("encoding a synthetic greyscale JPEG XL");
+
+        let loaded = decode(&jxl).unwrap();
+        assert_eq!((loaded.image.width, loaded.image.height), (4, 4));
+        for (pixel, grey) in loaded.image.pixels.chunks_exact(4).zip(&pixels) {
+            assert_eq!(pixel, [*grey, *grey, *grey, 0xFF], "a grey sample was not spread across the colour channels");
+        }
+    }
+
+    #[test]
+    fn widening_grey_samples_fills_all_three_colour_channels() {
+        assert_eq!(grey_to_rgba8([(40u8, 0xFF)].into_iter(), 4), vec![40, 40, 40, 0xFF]);
+        // Grey with alpha keeps the alpha it was given.
+        assert_eq!(grey_to_rgba8([(10u8, 20u8), (30, 40)].into_iter(), 8), vec![10, 10, 10, 20, 30, 30, 30, 40]);
     }
 
     /// jxl-oxide applies the header orientation itself. The viewer must not

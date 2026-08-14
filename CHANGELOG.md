@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.2] - 2026-08-14
+
+### Documentation
+- Render breaking changes from the commit that makes them
+
+### Features
+- Open JPEG XL
 ## [0.4.1] - 2026-08-12
 
 ### Bug Fixes
