@@ -4,6 +4,9 @@ All notable changes to this project are documented in this file.
 
 ## [0.4.2] - 2026-08-14
 
+### Bug Fixes
+- Open greyscale JPEG XL instead of refusing it
+
 ### Documentation
 - Render breaking changes from the commit that makes them
 
