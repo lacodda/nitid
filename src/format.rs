@@ -125,6 +125,18 @@ impl Format {
         matches!(self, Format::JpegXl)
     }
 
+    /// Whether this format's decoder must run in a sandboxed process.
+    ///
+    /// True for formats decoded by a C library, where a malformed file is a
+    /// memory-safety bug rather than a panic — see
+    /// `docs/adr/0002-sandbox-c-decoders.md`. Nothing answers true yet: every
+    /// decoder in this build is pure Rust, and HEIC and AVIF arrive in v0.7.0.
+    /// The boundary is built first so that adding them is adding a decoder,
+    /// not adding a decoder and an architecture at once.
+    pub fn needs_sandbox(self) -> bool {
+        false
+    }
+
     /// Whether the file describes shapes rather than a grid of pixels.
     ///
     /// A vector image has no resolution of its own: it is rasterised for the

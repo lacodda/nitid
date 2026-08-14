@@ -33,6 +33,7 @@ mod view;
 #[doc(hidden)]
 pub mod testing {
     pub use crate::color::{ColorTransform, profile_from};
+    pub use crate::sandbox::decode as decode_sandboxed;
 }
 
 use std::ffi::OsString;
@@ -47,6 +48,12 @@ enum Command {
     Uninstall,
     Help,
     Version,
+    /// Be the sandboxed decoder: read a file on stdin, write pixels on stdout.
+    ///
+    /// Not a command anyone types. The viewer launches its own executable this
+    /// way so a C decoder runs somewhere it can do no harm — see
+    /// `docs/adr/0002-sandbox-c-decoders.md`.
+    Decode,
 }
 
 /// Run the viewer, whichever binary was launched.
@@ -63,7 +70,7 @@ pub fn run(windowed: bool) -> ExitCode {
     // printing commands are handed to the binary that has somewhere to print.
     // This is a safety net rather than a path anyone takes: the windowed
     // binary exists to be launched by the shell with a file.
-    if windowed && !matches!(command, Command::View(_)) {
+    if windowed && !matches!(command, Command::View(_) | Command::Decode) {
         return delegate_to_console_binary();
     }
 
@@ -84,6 +91,7 @@ pub fn run(windowed: bool) -> ExitCode {
             println!("nitid {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
+        Command::Decode => sandbox::run_as_decoder(),
         #[cfg(windows)]
         Command::Install => install::install().map(|_| ()),
         #[cfg(windows)]
@@ -130,6 +138,9 @@ fn parse(args: impl Iterator<Item = OsString>) -> Command {
         Some("-V" | "--version") => Command::Version,
         Some("install") => Command::Install,
         Some("uninstall") => Command::Uninstall,
+        // Leading dashes, so it cannot be mistaken for a file: every other
+        // unrecognised argument is treated as a path.
+        Some(sandbox::DECODE_ARGUMENT) => Command::Decode,
         // Anything else is a path — including one that looks like a flag,
         // since a file may legitimately be named `--version`.
         _ => Command::View(Some(PathBuf::from(first))),
@@ -198,6 +209,14 @@ mod tests {
         assert!(matches!(parse_args(&["uninstall"]), Command::Uninstall));
         assert!(matches!(parse_args(&["--help"]), Command::Help));
         assert!(matches!(parse_args(&["-V"]), Command::Version));
+    }
+
+    /// The decoder argument is spelled with dashes precisely so a file cannot
+    /// take its place: an unrecognised bare word is opened as a path.
+    #[test]
+    fn the_decoder_argument_is_not_a_path() {
+        assert!(matches!(parse_args(&[sandbox::DECODE_ARGUMENT]), Command::Decode));
+        assert!(matches!(parse_args(&["decode-stdin"]), Command::View(Some(_))));
     }
 
     /// A file really can be called `install`; the shell passes a qualified

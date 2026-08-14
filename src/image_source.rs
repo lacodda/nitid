@@ -138,6 +138,25 @@ pub fn load(path: &Path) -> Result<LoadedImage> {
 /// that is really a JPEG is common enough that trusting the name would produce
 /// a spurious error on a file the user can plainly see elsewhere.
 pub fn decode(bytes: &[u8]) -> Result<LoadedImage> {
+    decode_with(bytes, Confinement::Sandboxed)
+}
+
+/// Decode without handing anything to a sandbox, whatever the format asks for.
+///
+/// This is what the decoder process itself calls. Without it a format needing
+/// the sandbox would launch a sandbox from inside the sandbox, for ever.
+pub fn decode_here(bytes: &[u8]) -> Result<LoadedImage> {
+    decode_with(bytes, Confinement::InThisProcess)
+}
+
+/// Whether a decoder that asks for a sandbox is given one.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Confinement {
+    Sandboxed,
+    InThisProcess,
+}
+
+fn decode_with(bytes: &[u8], confinement: Confinement) -> Result<LoadedImage> {
     if bytes.is_empty() {
         bail!("the file is empty");
     }
@@ -145,6 +164,24 @@ pub fn decode(bytes: &[u8]) -> Result<LoadedImage> {
     let Some(format) = Format::detect(bytes) else {
         bail!("the format is not one nitid can open");
     };
+
+    // A format decoded by a C library is decoded somewhere it can do no harm.
+    // The pixels come back over a pipe; everything else about the file — its
+    // profile, its orientation — is read here, in Rust, from the same bytes.
+    if format.needs_sandbox() && confinement == Confinement::Sandboxed {
+        let image = crate::sandbox::decode(bytes).with_context(|| format!("decoding the {}", format.name()))?;
+        return Ok(LoadedImage {
+            image,
+            orientation: if format.orients_itself() {
+                Orientation::Normal
+            } else {
+                read_orientation(bytes)
+            },
+            fidelity: Fidelity::Full,
+            profile: color::profile_from(bytes),
+            vector: None,
+        });
+    }
 
     let malformed = || format!("the {} data is malformed", format.name());
 
