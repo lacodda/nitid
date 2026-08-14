@@ -21,6 +21,7 @@ mod image_source;
 mod install;
 mod loader;
 mod startup;
+mod vector;
 mod view;
 
 /// The pieces the integration tests reach into.

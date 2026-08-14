@@ -55,6 +55,7 @@ moxcms = "0.9"
 flate2 = "1.1.9"
 half = { version = "2.7.1", features = ["bytemuck"] }
 image-webp = "0.2"
+resvg = { version = "0.48.1", default-features = false, features = ["text", "system-fonts"] }
 
 [dev-dependencies]
 flate2 = "1.1.9"

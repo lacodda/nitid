@@ -13,6 +13,7 @@ use moxcms::ColorProfile;
 
 use crate::color;
 use crate::format::Format;
+use crate::vector::VectorImage;
 
 /// Extensions this build can open, lowercase and without the dot.
 ///
@@ -96,6 +97,14 @@ pub struct LoadedImage {
     /// `None` means untagged, which by convention means sRGB — the assumption
     /// every viewer makes and the one that is nearly always right.
     pub profile: Option<ColorProfile>,
+    /// The document this image was drawn from, for formats that describe
+    /// shapes rather than pixels.
+    ///
+    /// `None` for every raster format, where the decoded pixels *are* the
+    /// image. When present, the viewer can draw the picture again at another
+    /// size instead of scaling what it already has — which is the whole reason
+    /// to open a vector format at all.
+    pub vector: Option<VectorImage>,
 }
 
 impl LoadedImage {
@@ -139,6 +148,24 @@ pub fn decode(bytes: &[u8]) -> Result<LoadedImage> {
 
     let malformed = || format!("the {} data is malformed", format.name());
 
+    // A vector image is parsed rather than decoded, and the result is kept:
+    // the pixels here are only the first rasterisation, at the size the
+    // document declares, and the viewer draws it again whenever the size on
+    // screen changes.
+    if format.is_vector() {
+        let vector = VectorImage::parse(bytes).with_context(malformed)?;
+        let (width, height) = vector.intrinsic_size();
+        let image = vector.rasterise(width, height).with_context(malformed)?;
+
+        return Ok(LoadedImage {
+            image,
+            orientation: Orientation::Normal,
+            fidelity: Fidelity::Full,
+            profile: None,
+            vector: Some(vector),
+        });
+    }
+
     // JPEG XL comes back with its profile attached: one pass over the file
     // yields both, where reading the profile separately — as the other formats
     // do — would mean decoding the image twice.
@@ -163,6 +190,8 @@ pub fn decode(bytes: &[u8]) -> Result<LoadedImage> {
         orientation,
         fidelity: Fidelity::Full,
         profile,
+        // A raster format is its pixels; there is nothing to redraw from.
+        vector: None,
     })
 }
 
@@ -208,6 +237,8 @@ pub fn decode_thumbnail(bytes: &[u8]) -> Option<LoadedImage> {
         // The profile describes the file, so it covers the thumbnail too: the
         // quick frame and the image replacing it are the same colour.
         profile: color::profile_from(bytes),
+        // Thumbnails come from EXIF, which only raster formats carry.
+        vector: None,
     })
 }
 
@@ -565,6 +596,44 @@ mod tests {
         }
     }
 
+    const SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="30" height="20">
+        <rect width="30" height="20" fill="#3FA9D9"/>
+    </svg>"##;
+
+    /// An SVG opens at the size it declares, like a raster file of that size.
+    #[test]
+    fn decodes_svg_at_its_declared_size() {
+        let loaded = decode(SVG).unwrap();
+        assert_eq!((loaded.image.width, loaded.image.height), (30, 20));
+        assert_eq!(loaded.image.pixels.len(), 30 * 20 * 4);
+    }
+
+    /// The difference that makes a vector format worth opening: the document
+    /// is kept, so the viewer can draw it again instead of scaling a raster.
+    #[test]
+    fn an_svg_keeps_the_document_it_was_drawn_from() {
+        let loaded = decode(SVG).unwrap();
+        let vector = loaded.vector.expect("an SVG should carry its document");
+
+        let larger = vector.rasterise(300, 200).unwrap();
+        assert_eq!((larger.width, larger.height), (300, 200));
+    }
+
+    /// A raster format has nothing to redraw from, and must not pretend it
+    /// does — the viewer decides what to do by asking.
+    #[test]
+    fn a_raster_image_carries_no_document() {
+        assert!(decode(&encode(image::ImageFormat::Png, 4, 4)).unwrap().vector.is_none());
+        assert!(decode(&encode(image::ImageFormat::Jpeg, 4, 4)).unwrap().vector.is_none());
+    }
+
+    /// SVG states its colours in the markup and carries no ICC profile, so it
+    /// must arrive untagged rather than with one invented for it.
+    #[test]
+    fn an_svg_has_no_colour_profile() {
+        assert!(decode(SVG).unwrap().profile.is_none());
+    }
+
     #[test]
     fn widening_grey_samples_fills_all_three_colour_channels() {
         assert_eq!(grey_to_rgba8([(40u8, 0xFF)].into_iter(), 4), vec![40, 40, 40, 0xFF]);
@@ -626,6 +695,7 @@ mod tests {
             orientation: Orientation::Rotate90,
             fidelity: Fidelity::Full,
             profile: None,
+            vector: None,
         };
         assert_eq!(loaded.display_size(), (50, 100));
     }

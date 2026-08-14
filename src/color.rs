@@ -168,6 +168,9 @@ fn raw_profile(bytes: &[u8]) -> Option<Vec<u8>> {
         // codestream again here to answer the same question would double the
         // cost of opening the format. See `image_source::decode_jxl`.
         Format::JpegXl => None,
+        // SVG states colours as sRGB values in the markup itself; there is no
+        // profile to read, and none to attach.
+        Format::Svg => None,
         // GIF is sRGB by definition. BMP and TIFF can carry a profile, but
         // neither appears tagged in practice often enough to justify a parser.
         Format::Gif | Format::Bmp | Format::Tiff => None,

@@ -17,6 +17,7 @@ pub enum Format {
     Png,
     WebP,
     JpegXl,
+    Svg,
     Gif,
     Bmp,
     Tiff,
@@ -27,7 +28,16 @@ impl Format {
     ///
     /// Exists so the extension list and the tests cannot silently fall behind a
     /// newly added variant.
-    pub const ALL: &'static [Format] = &[Format::Jpeg, Format::Png, Format::WebP, Format::JpegXl, Format::Gif, Format::Bmp, Format::Tiff];
+    pub const ALL: &'static [Format] = &[
+        Format::Jpeg,
+        Format::Png,
+        Format::WebP,
+        Format::JpegXl,
+        Format::Svg,
+        Format::Gif,
+        Format::Bmp,
+        Format::Tiff,
+    ];
 
     /// Identify the format from the start of the file.
     ///
@@ -61,6 +71,14 @@ impl Format {
         if bytes.starts_with(&[0x49, 0x49, 0x2A, 0x00]) || bytes.starts_with(&[0x4D, 0x4D, 0x00, 0x2A]) {
             return Some(Format::Tiff);
         }
+        // SVG is the one format here with no signature to match: it is XML, and
+        // the `<svg` element may sit behind a declaration, a doctype, comments
+        // or whitespace. So the opening of the file is searched for the tag
+        // instead — bounded, because scanning a large binary for text would
+        // cost more than every other check combined.
+        if looks_like_svg(bytes) {
+            return Some(Format::Svg);
+        }
 
         None
     }
@@ -73,6 +91,7 @@ impl Format {
             Format::Png => &["png"],
             Format::WebP => &["webp"],
             Format::JpegXl => &["jxl"],
+            Format::Svg => &["svg"],
             Format::Gif => &["gif"],
             Format::Bmp => &["bmp"],
             Format::Tiff => &["tif", "tiff"],
@@ -86,6 +105,7 @@ impl Format {
             Format::Png => "PNG",
             Format::WebP => "WebP",
             Format::JpegXl => "JPEG XL",
+            Format::Svg => "SVG",
             Format::Gif => "GIF",
             Format::Bmp => "BMP",
             Format::Tiff => "TIFF",
@@ -104,6 +124,35 @@ impl Format {
     pub fn orients_itself(self) -> bool {
         matches!(self, Format::JpegXl)
     }
+
+    /// Whether the file describes shapes rather than a grid of pixels.
+    ///
+    /// A vector image has no resolution of its own: it is rasterised for the
+    /// size it is shown at, and rasterised again when that size changes. The
+    /// viewer keeps the source for such a format instead of treating the first
+    /// rasterisation as the image itself.
+    pub fn is_vector(self) -> bool {
+        matches!(self, Format::Svg)
+    }
+}
+
+/// Whether the start of the file reads as an SVG document.
+///
+/// SVG is the one format here with nothing to match at a fixed offset — it is
+/// XML, and the root element may sit behind a declaration, a doctype, comments
+/// or blank lines. Only the opening of the file is searched, and only for the
+/// element name: a binary that happens to contain `<svg` a megabyte in is not
+/// an SVG, and reading that far to find out would cost more than every other
+/// signature check combined.
+fn looks_like_svg(bytes: &[u8]) -> bool {
+    /// Room for an XML declaration, a doctype and a comment or two ahead of the
+    /// root element — as much preamble as files in the wild carry.
+    const SEARCH_LIMIT: usize = 1024;
+
+    let head = &bytes[..bytes.len().min(SEARCH_LIMIT)];
+    // Matched case-insensitively: XML element names are case-sensitive, but
+    // `<SVG` appears in the wild and refusing to open it helps nobody.
+    head.windows(4).any(|window| window.eq_ignore_ascii_case(b"<svg"))
 }
 
 #[cfg(test)]
@@ -144,6 +193,37 @@ mod tests {
         assert_eq!(Format::detect(&[0xFF, 0x0A, 0x00, 0x00]), Some(Format::JpegXl));
         // 0xFF followed by neither is not an image this build knows.
         assert_eq!(Format::detect(&[0xFF, 0x00, 0x00, 0x00]), None);
+    }
+
+    /// SVG has no signature at a fixed offset, so it is recognised by its root
+    /// element — which real files put behind a declaration, a doctype, or
+    /// nothing at all.
+    #[test]
+    fn detects_svg_behind_whatever_precedes_the_root_element() {
+        assert_eq!(Format::detect(b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>"), Some(Format::Svg));
+        assert_eq!(Format::detect(b"<?xml version=\"1.0\"?>\n<svg/>"), Some(Format::Svg));
+        assert_eq!(Format::detect(b"<!-- drawn by hand -->\n<svg/>"), Some(Format::Svg));
+        // Case-insensitive: `<SVG` appears in the wild.
+        assert_eq!(Format::detect(b"<SVG/>"), Some(Format::Svg));
+    }
+
+    /// The search is bounded, so a file that merely mentions the element far
+    /// in is not mistaken for one — and scanning a large binary end to end
+    /// never happens.
+    #[test]
+    fn a_mention_of_svg_past_the_opening_is_not_a_document() {
+        let mut file = vec![b' '; 4096];
+        file.extend_from_slice(b"<svg/>");
+        assert_eq!(Format::detect(&file), None);
+    }
+
+    /// Only formats without a fixed resolution may claim to be vector: the
+    /// viewer keeps the source for those and rasterises again on zoom.
+    #[test]
+    fn only_svg_is_a_vector_format() {
+        for format in Format::ALL {
+            assert_eq!(format.is_vector(), *format == Format::Svg, "{format:?} answers is_vector wrongly");
+        }
     }
 
     /// Only the formats whose decoder applies the orientation itself may say

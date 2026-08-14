@@ -23,6 +23,7 @@ use crate::gpu::Renderer;
 use crate::image_source::{self, Fidelity, LoadedImage, Orientation};
 use crate::loader::{Decoded, Loader, Request};
 use crate::startup;
+use crate::vector::VectorImage;
 use crate::view::{FitMode, View};
 
 /// A wheel notch is 120 units of a high-resolution scroll device; a trackpad
@@ -58,6 +59,14 @@ struct Shown {
     view: View,
     /// Whether this is the real image or the thumbnail standing in for it.
     fidelity: Fidelity,
+    /// The document a vector image was drawn from, kept so the picture can be
+    /// drawn again when the zoom moves. `None` for raster images.
+    vector: Option<VectorImage>,
+    /// The size the vector image was last drawn at, in physical pixels.
+    ///
+    /// Compared against the size the current zoom asks for, so a redraw only
+    /// happens when it would actually show more detail.
+    rasterised_at: (u32, u32),
 }
 
 struct App {
@@ -165,7 +174,67 @@ impl App {
             orientation: loaded.orientation,
             view,
             fidelity: loaded.fidelity,
+            vector: loaded.vector.clone(),
+            rasterised_at: (loaded.image.width, loaded.image.height),
         });
+    }
+
+    /// Draw a vector image again for the size it now occupies on screen.
+    ///
+    /// A raster image is scaled by the GPU when the zoom changes, which is
+    /// right: there is no more detail to be had. A vector image has as much
+    /// detail as the size it is drawn at, so zooming into a picture rasterised
+    /// for a smaller window shows a blur where the format promises a clean
+    /// edge.
+    ///
+    /// The redraw is deliberately not done on every notch of the wheel: it
+    /// costs a full rasterisation, and at a smooth zoom that would land on
+    /// every frame. It happens when the size on screen has moved far enough
+    /// from what was drawn that the difference is visible.
+    fn rerasterise_if_needed(&mut self) {
+        /// How far the size on screen may drift from what was drawn before it
+        /// is worth drawing again. A quarter is under one wheel notch, so a
+        /// deliberate zoom redraws while a nudge does not.
+        const TOLERANCE: f32 = 1.25;
+
+        let Some(shown) = self.shown.as_mut() else {
+            return;
+        };
+        let Some(vector) = shown.vector.clone() else {
+            return;
+        };
+
+        let (wanted_width, wanted_height) = shown.view.scaled_size();
+        let (wanted_width, wanted_height) = (wanted_width.round().max(1.0) as u32, wanted_height.round().max(1.0) as u32);
+        // Width alone decides: the aspect ratio is fixed by the document, so
+        // height moves with it and testing both would say the same thing twice.
+        let drawn_width = shown.rasterised_at.0;
+
+        let grew = wanted_width as f32 > drawn_width as f32 * TOLERANCE;
+        let shrank = (wanted_width as f32) < drawn_width as f32 / TOLERANCE;
+        if !(grew || shrank) {
+            return;
+        }
+
+        let Ok(raster) = vector.rasterise(wanted_width, wanted_height) else {
+            // A rasterisation that fails leaves the previous one on screen,
+            // which is a blurrier picture rather than no picture.
+            return;
+        };
+
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        // A vector image carries no profile, so the transform is the identity
+        // one every untagged image gets.
+        renderer.set_image(&raster, &ColorTransform::identity());
+
+        // The framing is kept: the picture is the same size on screen, drawn
+        // from more pixels. Rebasing tells the view that the source resolution
+        // changed underneath it.
+        let (raster_width, raster_height) = (raster.width, raster.height);
+        shown.view.rebase((raster_width, raster_height));
+        shown.rasterised_at = (raster_width, raster_height);
     }
 
     /// Rewrite the title bar: file name, position in the folder, and the zoom
@@ -267,8 +336,10 @@ impl App {
         self.window.as_ref().map(|window| window.scale_factor() as f32).unwrap_or(1.0)
     }
 
-    /// The framing changed: repaint and let the title follow the zoom.
-    fn refresh(&self) {
+    /// The framing changed: redraw a vector image for its new size, repaint,
+    /// and let the title follow the zoom.
+    fn refresh(&mut self) {
+        self.rerasterise_if_needed();
         self.set_title();
         self.request_redraw();
     }
