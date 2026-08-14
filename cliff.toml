@@ -13,7 +13,17 @@ body = """
 {% else %}\
 ## [Unreleased]
 {% endif %}\
-{% for group, commits in commits | group_by(attribute="group") %}
+{# A breaking change is announced from the commit's own footer, so the section
+   survives regeneration. Written by hand it did not: `git-cliff` rewrites the
+   whole file every release, and 0.4.0's MSRV note was erased twice. A commit
+   marked `!` is listed here and nowhere else, rather than twice. #}\
+{% if commits | filter(attribute="breaking", value=true) | length > 0 %}
+### Breaking Changes
+{% for commit in commits | filter(attribute="breaking", value=true) %}\
+- {{ commit.breaking_description | default(value=commit.message) | upper_first }}
+{% endfor %}\
+{% endif %}\
+{% for group, commits in commits | filter(attribute="breaking", value=false) | group_by(attribute="group") %}
 ### {{ group }}
 {% for commit in commits %}\
 - {{ commit.message | upper_first }}
@@ -37,5 +47,9 @@ commit_parsers = [
   { message = "^test", group = "Testing" },
   { message = "^build", group = "Build" },
   { message = "^ci", group = "CI" },
+  # `protect_breaking_commits` keeps a `chore!` from being skipped here, so a
+  # breaking dependency bump still reaches the template. The MSRV bump in 0.4.0
+  # arrived as `chore(deps)` and was written into the changelog by hand, which
+  # regeneration then erased — twice.
   { message = "^chore", skip = true },
 ]
