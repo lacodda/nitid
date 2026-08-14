@@ -15,6 +15,11 @@
 //! child is never told a path, so a compromised decoder cannot ask for a
 //! different file than the one the user opened.
 
+// The protocol is written and tested everywhere, but only the Windows build
+// has a process on the other end of it: elsewhere `decode` runs in-process, so
+// the halves that speak to a child go unused. That is a real statement about
+// the platform rather than something to silence one function at a time.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub mod protocol;
 
 #[cfg(windows)]
@@ -69,6 +74,7 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedImage> {
 ///
 /// Overridable through `NITID_DECODER` so the tests can point at a binary that
 /// answers the protocol; nothing in normal use sets it.
+#[cfg(windows)]
 fn decoder_executable() -> Result<std::path::PathBuf> {
     if let Some(path) = std::env::var_os("NITID_DECODER") {
         return Ok(path.into());
