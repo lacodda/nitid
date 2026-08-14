@@ -124,8 +124,12 @@ impl App {
             Request::Pending => self.show_quick_frame(path),
         }
 
-        self.set_title();
-        self.request_redraw();
+        // `refresh` rather than a redraw on its own: a vector image is first
+        // drawn at the size its document declares, which is rarely the size it
+        // is then fitted to. Drawing it again for the framing it landed in is
+        // what makes a 32-pixel icon filling the window look drawn rather than
+        // enlarged.
+        self.refresh();
         self.prefetch_neighbours();
     }
 
@@ -192,11 +196,6 @@ impl App {
     /// every frame. It happens when the size on screen has moved far enough
     /// from what was drawn that the difference is visible.
     fn rerasterise_if_needed(&mut self) {
-        /// How far the size on screen may drift from what was drawn before it
-        /// is worth drawing again. A quarter is under one wheel notch, so a
-        /// deliberate zoom redraws while a nudge does not.
-        const TOLERANCE: f32 = 1.25;
-
         let Some(shown) = self.shown.as_mut() else {
             return;
         };
@@ -206,13 +205,7 @@ impl App {
 
         let (wanted_width, wanted_height) = shown.view.scaled_size();
         let (wanted_width, wanted_height) = (wanted_width.round().max(1.0) as u32, wanted_height.round().max(1.0) as u32);
-        // Width alone decides: the aspect ratio is fixed by the document, so
-        // height moves with it and testing both would say the same thing twice.
-        let drawn_width = shown.rasterised_at.0;
-
-        let grew = wanted_width as f32 > drawn_width as f32 * TOLERANCE;
-        let shrank = (wanted_width as f32) < drawn_width as f32 / TOLERANCE;
-        if !(grew || shrank) {
+        if !worth_redrawing(shown.rasterised_at.0, wanted_width) {
             return;
         }
 
@@ -235,6 +228,7 @@ impl App {
         let (raster_width, raster_height) = (raster.width, raster.height);
         shown.view.rebase((raster_width, raster_height));
         shown.rasterised_at = (raster_width, raster_height);
+        startup::milestone(&format!("vector redrawn at {raster_width}x{raster_height}"));
     }
 
     /// Rewrite the title bar: file name, position in the folder, and the zoom
@@ -294,8 +288,10 @@ impl App {
             Ok(image) => {
                 startup::milestone("full image up");
                 self.upload(&image);
-                self.set_title();
-                self.request_redraw();
+                // `refresh` rather than a redraw on its own: a vector image
+                // arrives drawn at its document size and has to be drawn again
+                // for the framing it is fitted into.
+                self.refresh();
             }
             Err(error) => {
                 // A file that will not open is a fact about the file, not a
@@ -472,6 +468,20 @@ enum Reframe {
     Toggle,
 }
 
+/// Whether a vector image shown at `wanted` pixels wide is far enough from the
+/// `drawn` rasterisation to be worth drawing again.
+///
+/// Rasterising is not free, and a smooth zoom passes through every size on the
+/// way; redrawing at each one would spend the whole gesture in the rasteriser.
+/// A quarter either way is under one notch of the wheel, so a deliberate zoom
+/// redraws promptly while a nudge or a rounding wobble does not.
+fn worth_redrawing(drawn: u32, wanted: u32) -> bool {
+    const TOLERANCE: f32 = 1.25;
+
+    let (drawn, wanted) = (drawn.max(1) as f32, wanted as f32);
+    wanted > drawn * TOLERANCE || wanted < drawn / TOLERANCE
+}
+
 impl ApplicationHandler<Decoded> for App {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: Decoded) {
         self.decoded(event);
@@ -621,5 +631,36 @@ impl ApplicationHandler<Decoded> for App {
 
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The redraw has to be worth its cost: a wheel gesture passes through
+    /// many sizes, and rasterising at each one would spend the whole zoom in
+    /// the rasteriser rather than showing the picture.
+    #[test]
+    fn a_small_change_in_size_does_not_redraw_a_vector_image() {
+        assert!(!worth_redrawing(400, 400), "the same size asked for a redraw");
+        assert!(!worth_redrawing(400, 420), "a nudge asked for a redraw");
+        assert!(!worth_redrawing(400, 380), "a nudge asked for a redraw");
+    }
+
+    /// A deliberate zoom must redraw, or the format's whole advantage is lost:
+    /// the picture would blur exactly where it promises a clean edge.
+    #[test]
+    fn a_real_zoom_redraws_a_vector_image() {
+        assert!(worth_redrawing(400, 800), "doubling the size did not redraw");
+        assert!(worth_redrawing(400, 200), "halving the size did not redraw");
+    }
+
+    /// The first rasterisation may be tiny, and dividing by it must not blow
+    /// up on a degenerate size.
+    #[test]
+    fn a_degenerate_size_is_handled_rather_than_dividing_by_zero() {
+        assert!(worth_redrawing(0, 100));
+        assert!(!worth_redrawing(1, 1));
     }
 }
