@@ -163,6 +163,11 @@ fn raw_profile(bytes: &[u8]) -> Option<Vec<u8>> {
         }
         Format::Png => png_profile(bytes),
         Format::WebP => image_webp::WebPDecoder::new(std::io::Cursor::new(bytes)).ok()?.icc_profile().ok()?,
+        // JPEG XL does carry a profile, and it is read — but by the decoder,
+        // which reaches it in the pass that produces the pixels. Parsing the
+        // codestream again here to answer the same question would double the
+        // cost of opening the format. See `image_source::decode_jxl`.
+        Format::JpegXl => None,
         // GIF is sRGB by definition. BMP and TIFF can carry a profile, but
         // neither appears tagged in practice often enough to justify a parser.
         Format::Gif | Format::Bmp | Format::Tiff => None,

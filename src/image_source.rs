@@ -2,7 +2,7 @@
 //!
 //! Every decoder in this module is pure Rust: a malformed file costs a panic or
 //! an error, never code execution. C-backed formats (HEIC, AVIF) arrive in
-//! v0.5.0 behind a separate process — see `docs/adr/0002-sandbox-c-decoders.md`.
+//! v0.7.0 behind a separate process — see `docs/adr/0002-sandbox-c-decoders.md`.
 
 use std::fs;
 use std::io::Cursor;
@@ -137,19 +137,32 @@ pub fn decode(bytes: &[u8]) -> Result<LoadedImage> {
         bail!("the format is not one nitid can open");
     };
 
-    let image = match format {
-        Format::Jpeg => decode_jpeg(bytes),
-        Format::WebP => decode_webp(bytes),
+    let malformed = || format!("the {} data is malformed", format.name());
+
+    // JPEG XL comes back with its profile attached: one pass over the file
+    // yields both, where reading the profile separately — as the other formats
+    // do — would mean decoding the image twice.
+    let (image, profile) = match format {
+        Format::JpegXl => decode_jxl(bytes).with_context(malformed)?,
+        Format::Jpeg => (decode_jpeg(bytes).with_context(malformed)?, color::profile_from(bytes)),
+        Format::WebP => (decode_webp(bytes).with_context(malformed)?, color::profile_from(bytes)),
         // PNG, GIF, BMP and TIFF share one pure-Rust decoder.
-        Format::Png | Format::Gif | Format::Bmp | Format::Tiff => decode_via_image_crate(bytes),
-    }
-    .with_context(|| format!("the {} data is malformed", format.name()))?;
+        _ => (decode_via_image_crate(bytes).with_context(malformed)?, color::profile_from(bytes)),
+    };
+
+    // A format that turns its own pixels the right way up has already done so;
+    // applying the EXIF tag as well would rotate the image twice.
+    let orientation = if format.orients_itself() {
+        Orientation::Normal
+    } else {
+        read_orientation(bytes)
+    };
 
     Ok(LoadedImage {
         image,
-        orientation: read_orientation(bytes),
+        orientation,
         fidelity: Fidelity::Full,
-        profile: color::profile_from(bytes),
+        profile,
     })
 }
 
@@ -261,6 +274,57 @@ fn decode_webp(bytes: &[u8]) -> Result<DecodedImage> {
     }
 
     Ok(DecodedImage { width, height, pixels })
+}
+
+/// Decode a JPEG XL, returning the pixels together with the profile the file
+/// carries.
+///
+/// The two come back together because `jxl-oxide` reaches both in the same
+/// pass: asking for the profile separately would mean parsing the codestream a
+/// second time, and JXL is not a format where that is cheap.
+///
+/// The renderer is given the first keyframe. An animated JXL therefore shows
+/// its opening frame, which is what every other still viewer does and what the
+/// animation stage (v0.9.0) will replace.
+fn decode_jxl(bytes: &[u8]) -> Result<(DecodedImage, Option<ColorProfile>)> {
+    let image = jxl_oxide::JxlImage::builder()
+        .read(bytes)
+        .map_err(|error| anyhow::anyhow!("{error}"))
+        .context("the JPEG XL header is unreadable")?;
+
+    // A profile the file states outright is preferred over the one jxl-oxide
+    // synthesises from an enumerated colour space: an untagged image must stay
+    // untagged, or it would be converted against the rule ADR 0005 sets out.
+    let profile = image.original_icc().and_then(|raw| ColorProfile::new_from_slice(raw).ok());
+
+    let render = image
+        .render_frame(0)
+        .map_err(|error| anyhow::anyhow!("{error}"))
+        .context("the JPEG XL pixels are unreadable")?;
+
+    // The renderer applies the header's orientation to both the pixels and the
+    // dimensions, so the two agree here — see `Format::orients_itself`.
+    let mut stream = render.stream();
+    let width = stream.width();
+    let height = stream.height();
+    let channels = stream.channels() as usize;
+
+    let expected = pixel_count(width, height)?;
+    let mut samples = vec![0u8; expected / 4 * channels];
+    stream.write_to_buffer(&mut samples);
+
+    let pixels = match channels {
+        4 => samples,
+        // An opaque JXL streams three samples per pixel; without the opaque
+        // alpha filled in, the upload would be fully transparent.
+        3 => rgb_to_rgba8(&samples, expected),
+        // Greyscale and CMYK reach the same stream with a different channel
+        // count. Neither is refused here for lack of a decoder — the viewer
+        // simply has no path to lay them out as RGBA yet.
+        other => bail!("a JPEG XL with {other} channels per pixel is not one this build can show"),
+    };
+
+    Ok((DecodedImage { width, height, pixels }, profile))
 }
 
 /// Bytes needed for a `width` by `height` RGBA8 image.
@@ -393,6 +457,75 @@ mod tests {
     #[test]
     fn an_untagged_webp_has_no_profile() {
         assert!(decode(&encode_webp(4, 4, None)).unwrap().profile.is_none());
+    }
+
+    /// Encode a solid-colour JPEG XL, optionally tagged with a profile.
+    ///
+    /// The fixtures come from `jxl-encoder`, a separate implementation from the
+    /// `jxl-oxide` decoder under test: a decoder fed its own encoder's output
+    /// mostly proves the two agree. Lossless, so a round-trip is exact and the
+    /// pixels can be asserted rather than approximated.
+    fn encode_jxl(width: u32, height: u32, profile: Option<&[u8]>) -> Vec<u8> {
+        use jxl_encoder::{ImageMetadata, LosslessConfig, PixelLayout};
+
+        let pixels: Vec<u8> = (0..width * height).flat_map(|_| [10u8, 200, 90]).collect();
+        let config = LosslessConfig::new();
+
+        match profile {
+            Some(profile) => {
+                let metadata = ImageMetadata::default().with_icc_profile(profile);
+                config
+                    .encode_request(width, height, PixelLayout::Rgb8)
+                    .with_metadata(&metadata)
+                    .encode(&pixels)
+                    .expect("encoding a synthetic JPEG XL")
+            }
+            None => config.encode(&pixels, width, height, PixelLayout::Rgb8).expect("encoding a synthetic JPEG XL"),
+        }
+    }
+
+    #[test]
+    fn decodes_jpeg_xl_to_rgba() {
+        let loaded = decode(&encode_jxl(6, 4, None)).unwrap();
+        assert_eq!((loaded.image.width, loaded.image.height), (6, 4));
+        assert_eq!(loaded.image.pixels.len(), 6 * 4 * 4);
+    }
+
+    /// Lossless in, lossless out: the samples the encoder was given are the
+    /// samples the viewer uploads. A decoder that quietly shifted colour would
+    /// fail here rather than on the author's display.
+    #[test]
+    fn a_lossless_jpeg_xl_round_trips_exactly() {
+        let loaded = decode(&encode_jxl(3, 2, None)).unwrap();
+        for pixel in loaded.image.pixels.chunks_exact(4) {
+            assert_eq!(pixel, [10, 200, 90, 0xFF], "a lossless JPEG XL came back with different pixels");
+        }
+    }
+
+    /// The colour promise reaches JPEG XL too: a tagged file states its space
+    /// and must be converted, not shown as if it were sRGB.
+    #[test]
+    fn a_tagged_jpeg_xl_carries_its_profile_through() {
+        let profile = moxcms::ColorProfile::new_display_p3().encode().expect("encoding a P3 profile");
+        let loaded = decode(&encode_jxl(4, 4, Some(&profile))).unwrap();
+        assert!(loaded.profile.is_some(), "the JPEG XL profile was dropped");
+    }
+
+    /// An untagged file must stay untagged, or ADR 0005 is broken for this
+    /// format: jxl-oxide can synthesise a profile from an enumerated colour
+    /// space, and taking that one would convert an image that states nothing.
+    #[test]
+    fn an_untagged_jpeg_xl_has_no_profile() {
+        assert!(decode(&encode_jxl(4, 4, None)).unwrap().profile.is_none());
+    }
+
+    /// jxl-oxide applies the header orientation itself. The viewer must not
+    /// apply the EXIF tag as well, or such an image is turned twice.
+    #[test]
+    fn a_jpeg_xl_is_not_rotated_a_second_time() {
+        let loaded = decode(&encode_jxl(6, 4, None)).unwrap();
+        assert_eq!(loaded.orientation, Orientation::Normal);
+        assert_eq!(loaded.display_size(), (6, 4));
     }
 
     #[test]

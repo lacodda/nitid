@@ -16,6 +16,7 @@ pub enum Format {
     Jpeg,
     Png,
     WebP,
+    JpegXl,
     Gif,
     Bmp,
     Tiff,
@@ -26,7 +27,7 @@ impl Format {
     ///
     /// Exists so the extension list and the tests cannot silently fall behind a
     /// newly added variant.
-    pub const ALL: &'static [Format] = &[Format::Jpeg, Format::Png, Format::WebP, Format::Gif, Format::Bmp, Format::Tiff];
+    pub const ALL: &'static [Format] = &[Format::Jpeg, Format::Png, Format::WebP, Format::JpegXl, Format::Gif, Format::Bmp, Format::Tiff];
 
     /// Identify the format from the start of the file.
     ///
@@ -43,6 +44,12 @@ impl Format {
         // checked and the four bytes carrying the length are skipped.
         if bytes.starts_with(b"RIFF") && bytes.len() >= 12 && &bytes[8..12] == b"WEBP" {
             return Some(Format::WebP);
+        }
+        // JPEG XL is stored two ways: a bare codestream, and the same
+        // codestream wrapped in an ISOBMFF container. Both are ordinary `.jxl`
+        // files in the wild, so both signatures are recognised.
+        if bytes.starts_with(&[0xFF, 0x0A]) || bytes.starts_with(&[0x00, 0x00, 0x00, 0x0C, b'J', b'X', b'L', 0x20, 0x0D, 0x0A, 0x87, 0x0A]) {
+            return Some(Format::JpegXl);
         }
         if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
             return Some(Format::Gif);
@@ -65,6 +72,7 @@ impl Format {
             Format::Jpeg => &["jpg", "jpeg", "jpe", "jfif"],
             Format::Png => &["png"],
             Format::WebP => &["webp"],
+            Format::JpegXl => &["jxl"],
             Format::Gif => &["gif"],
             Format::Bmp => &["bmp"],
             Format::Tiff => &["tif", "tiff"],
@@ -77,10 +85,24 @@ impl Format {
             Format::Jpeg => "JPEG",
             Format::Png => "PNG",
             Format::WebP => "WebP",
+            Format::JpegXl => "JPEG XL",
             Format::Gif => "GIF",
             Format::Bmp => "BMP",
             Format::Tiff => "TIFF",
         }
+    }
+
+    /// Whether the decoder returns pixels already turned the right way up.
+    ///
+    /// Most formats store the orientation as EXIF metadata and hand back the
+    /// pixels as encoded, leaving the rotation to the viewer. JPEG XL carries
+    /// orientation in its own header, and `jxl-oxide` applies it while
+    /// rendering — both to the pixels and to the dimensions it reports.
+    ///
+    /// Applying the EXIF tag on top of that would rotate such an image twice,
+    /// so the viewer asks here instead of assuming.
+    pub fn orients_itself(self) -> bool {
+        matches!(self, Format::JpegXl)
     }
 }
 
@@ -93,6 +115,12 @@ mod tests {
         assert_eq!(Format::detect(&[0xFF, 0xD8, 0xFF, 0xE0]), Some(Format::Jpeg));
         assert_eq!(Format::detect(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]), Some(Format::Png));
         assert_eq!(Format::detect(b"RIFF\0\0\0\0WEBPVP8 "), Some(Format::WebP));
+        // JPEG XL, bare codestream and ISOBMFF container alike.
+        assert_eq!(Format::detect(&[0xFF, 0x0A, 0x00]), Some(Format::JpegXl));
+        assert_eq!(
+            Format::detect(&[0x00, 0x00, 0x00, 0x0C, b'J', b'X', b'L', 0x20, 0x0D, 0x0A, 0x87, 0x0A]),
+            Some(Format::JpegXl)
+        );
         assert_eq!(Format::detect(b"GIF89a..."), Some(Format::Gif));
         assert_eq!(Format::detect(b"BM......"), Some(Format::Bmp));
         assert_eq!(Format::detect(&[0x49, 0x49, 0x2A, 0x00]), Some(Format::Tiff));
@@ -105,6 +133,26 @@ mod tests {
         assert_eq!(Format::detect(b"this is not an image"), None);
         // RIFF alone is not enough: WAV audio starts the same way.
         assert_eq!(Format::detect(b"RIFF\0\0\0\0WAVEfmt "), None);
+    }
+
+    /// Both formats begin with 0xFF, and the byte after it is the whole
+    /// difference. Reading a JPEG as JPEG XL would refuse the format the
+    /// viewer opens most.
+    #[test]
+    fn jpeg_and_jpeg_xl_are_not_confused_for_each_other() {
+        assert_eq!(Format::detect(&[0xFF, 0xD8, 0xFF, 0xE0]), Some(Format::Jpeg));
+        assert_eq!(Format::detect(&[0xFF, 0x0A, 0x00, 0x00]), Some(Format::JpegXl));
+        // 0xFF followed by neither is not an image this build knows.
+        assert_eq!(Format::detect(&[0xFF, 0x00, 0x00, 0x00]), None);
+    }
+
+    /// Only the formats whose decoder applies the orientation itself may say
+    /// so: claiming it wrongly leaves a rotated photograph on its side.
+    #[test]
+    fn only_jpeg_xl_orients_itself() {
+        for format in Format::ALL {
+            assert_eq!(format.orients_itself(), *format == Format::JpegXl, "{format:?} answers orients_itself wrongly");
+        }
     }
 
     /// A truncated file must be reported as unknown rather than reaching into

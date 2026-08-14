@@ -44,6 +44,9 @@ pollster = "1"
 # Decoders (pure Rust; C-backed HEIC/AVIF arrive in v0.5.0 behind a sandbox)
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "tiff"] }
 zune-jpeg = "0.5"
+# `moxcms` so jxl-oxide manages colour with the same engine as the rest of the
+# viewer rather than pulling in a second one.
+jxl-oxide = { version = "0.12.6", features = ["moxcms"] }
 
 # Metadata
 kamadak-exif = "0.6"
@@ -58,6 +61,10 @@ flate2 = "1.1.9"
 # The same narrow feature set as the main dependency: the default brings in
 # every decoder the crate knows, which the tests have no use for.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# Fixtures for the JPEG XL tests, from an implementation independent of the
+# decoder they exercise. AGPL, and a test-only dependency for that reason: it
+# is never linked into the viewer and never reaches anyone installing it.
+jxl-encoder = { version = "0.3.1", default-features = false, features = ["std"] }
 moxcms = "0.9"
 naga = { version = "30", features = ["wgsl-in"] }
 tempfile = "3"

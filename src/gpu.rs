@@ -3,7 +3,7 @@
 //! nitid configures its own surface rather than delegating to a GUI framework,
 //! because HDR output on Windows is only reachable through `Bt2100Pq` on
 //! `Rgb10a2Unorm` — a configuration a framework-managed surface cannot express.
-//! See `docs/adr/0001-own-the-swapchain.md`. HDR itself lands in v0.6.0; what
+//! See `docs/adr/0001-own-the-swapchain.md`. HDR itself lands in v0.10.0; what
 //! matters here is that the choice of format stays ours.
 
 use std::sync::Arc;
@@ -101,7 +101,7 @@ impl ColourUniform {
             matrix,
             convert: u32::from(!transform.is_identity),
             // An sRGB surface encodes for us on write. Anything else — the
-            // 10-bit HDR surface of v0.6.0, for instance — expects the shader
+            // 10-bit HDR surface of v0.10.0, for instance — expects the shader
             // to have done it, but only when the shader produced linear light
             // in the first place.
             encode_srgb: u32::from(!transform.is_identity && !surface_is_srgb),
@@ -536,7 +536,7 @@ impl Renderer {
 /// Choose a swapchain configuration.
 ///
 /// An sRGB surface format is preferred so the shader can write linear values
-/// and let the display hardware encode them. v0.6.0 replaces this choice with
+/// and let the display hardware encode them. v0.10.0 replaces this choice with
 /// an HDR-aware one; keeping the selection here is what makes that possible.
 fn configure(capabilities: &wgpu::SurfaceCapabilities, size: (u32, u32)) -> wgpu::SurfaceConfiguration {
     let format = capabilities
@@ -550,7 +550,7 @@ fn configure(capabilities: &wgpu::SurfaceCapabilities, size: (u32, u32)) -> wgpu
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
         format,
         // This field is the whole reason nitid configures its own surface:
-        // v0.6.0 replaces `Auto` with `Bt2100Pq` on `Rgb10a2Unorm` after
+        // v0.10.0 replaces `Auto` with `Bt2100Pq` on `Rgb10a2Unorm` after
         // querying `SurfaceCapabilities::format_capabilities`.
         color_space: wgpu::SurfaceColorSpace::Auto,
         width: size.0.max(1),

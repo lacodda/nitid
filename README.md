@@ -82,18 +82,20 @@ an error, never code execution.
 | JPEG | `.jpg` `.jpeg` `.jpe` `.jfif` | yes |
 | PNG | `.png` | yes |
 | WebP | `.webp` | yes |
+| JPEG XL | `.jxl` | yes |
 | GIF | `.gif` | sRGB by definition |
 | BMP | `.bmp` | no |
 | TIFF | `.tif` `.tiff` | no |
 
 The format is decided by the bytes, not the extension: a `.png` that is really
-a JPEG opens rather than erroring. HEIC and AVIF need C libraries and arrive in
-v0.5.0 behind a sandbox; JPEG XL and SVG follow in v0.4.2.
+a JPEG opens rather than erroring. SVG follows in v0.5.0; HEIC and AVIF need C
+libraries and arrive in v0.7.0 behind a sandbox.
 
 ## Status
 
-Early development — v0.4.1 is out. Startup, colour and pure-Rust format
-coverage all hold. HDR is still ahead. The version map to 1.0 is fixed:
+Early development — v0.4.2 is out. Startup, colour and pure-Rust format
+coverage all hold. HDR is still ahead. Development runs in small versions, each
+one theme; the road to 1.0 is fixed:
 
 | Version | What lands |
 | --- | --- |
@@ -102,13 +104,22 @@ coverage all hold. HDR is still ahead. The version map to 1.0 is fixed:
 | ✅ v0.3.0 | Color management: ICC via `moxcms`, sRGB and Display P3 |
 | ✅ v0.4.0 | WebP, and one place that names every format |
 | ✅ v0.4.1 | Untagged images pass through unconverted |
-| v0.4.2 | JPEG XL, SVG |
-| v0.5.0 | Sandboxed C decoders — HEIC and AVIF |
-| v0.6.0 | HDR output on Windows (`Bt2100Pq` on `Rgb10a2Unorm`) |
-| v0.7.0 | Toolbar, thumbnail strip, settings |
-| v0.8.0 | Shell integration, installer, auto-update |
-| v0.9.0 | RAW via `rawler` |
-| v1.0.0 | Public release |
+| ✅ v0.4.2 | JPEG XL |
+| v0.5.0 | SVG, rasterised at the current zoom |
+| v0.6.0 | Sandboxed decoder process |
+| v0.7.0 | HEIC and AVIF, behind that sandbox |
+| v0.8.0 | Background decode — no format can block the UI |
+| v0.9.0 | Animation: GIF, WebP, APNG |
+| v0.10.0 | HDR output on Windows (`Bt2100Pq` on `Rgb10a2Unorm`) |
+| v0.11.0 | Gigapixel images via tiled rendering |
+| v0.12.0 – v0.31.0 | The everyday viewer: single instance, toolbar, EXIF panel, clipboard, file operations, culling, comparison, settings |
+| v0.32.0 – v0.35.0 | Windows integration: context menu, installer, auto-update, thumbnails |
+| v0.36.0 – v0.37.0 | Documentation site, stabilisation |
+| v1.0.0 | Public release — the default viewer, nothing missing |
+
+Beyond 1.0: **2.x** makes a separate screenshot tool unnecessary — capture a
+series, pick from it, hand it over in one action — with RAW at its tail. **3.x**
+is the gallery: grid, folders, filters, timeline, duplicates.
 
 ## Building
 
@@ -180,7 +191,7 @@ Two decisions shape everything else:
 
 **nitid owns its swapchain.** HDR output on Windows is only reachable through `Bt2100Pq` on the `Rgb10a2Unorm` format — DirectX 12 has no extended-sRGB swapchain color space. A GUI framework that configures the surface for you closes that door, so the window and renderer are ours; `egui` is used for widgets only.
 
-**Untrusted input is isolated.** An image decoder parses hostile data by definition — pictures arrive from the internet. Pure-Rust decoders run in-process, where a malformed file causes a panic rather than code execution. HEIC and AVIF exist only as C libraries, so from v0.5.0 they run in a separate low-integrity process: a crash there means "could not open this file", not a compromised viewer.
+**Untrusted input is isolated.** An image decoder parses hostile data by definition — pictures arrive from the internet. Pure-Rust decoders run in-process, where a malformed file causes a panic rather than code execution. HEIC and AVIF exist only as C libraries, so from v0.7.0 they run in a separate low-integrity process: a crash there means "could not open this file", not a compromised viewer.
 
 Architecture decisions are recorded in [`docs/adr/`](docs/adr/).
 
