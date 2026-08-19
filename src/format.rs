@@ -17,6 +17,7 @@ pub enum Format {
     Png,
     WebP,
     JpegXl,
+    Heic,
     Svg,
     Gif,
     Bmp,
@@ -33,6 +34,7 @@ impl Format {
         Format::Png,
         Format::WebP,
         Format::JpegXl,
+        Format::Heic,
         Format::Svg,
         Format::Gif,
         Format::Bmp,
@@ -60,6 +62,9 @@ impl Format {
         // files in the wild, so both signatures are recognised.
         if bytes.starts_with(&[0xFF, 0x0A]) || bytes.starts_with(&[0x00, 0x00, 0x00, 0x0C, b'J', b'X', b'L', 0x20, 0x0D, 0x0A, 0x87, 0x0A]) {
             return Some(Format::JpegXl);
+        }
+        if is_heic(bytes) {
+            return Some(Format::Heic);
         }
         if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
             return Some(Format::Gif);
@@ -91,6 +96,7 @@ impl Format {
             Format::Png => &["png"],
             Format::WebP => &["webp"],
             Format::JpegXl => &["jxl"],
+            Format::Heic => &["heic", "heif", "hif"],
             Format::Svg => &["svg"],
             Format::Gif => &["gif"],
             Format::Bmp => &["bmp"],
@@ -105,6 +111,7 @@ impl Format {
             Format::Png => "PNG",
             Format::WebP => "WebP",
             Format::JpegXl => "JPEG XL",
+            Format::Heic => "HEIC",
             Format::Svg => "SVG",
             Format::Gif => "GIF",
             Format::Bmp => "BMP",
@@ -121,8 +128,15 @@ impl Format {
     ///
     /// Applying the EXIF tag on top of that would rotate such an image twice,
     /// so the viewer asks here instead of assuming.
+    ///
+    /// HEIC answers true for the same reason by a different route: the
+    /// rotation of a HEIC lives in the container as `irot`/`imir` properties,
+    /// the decoder applies them, and an encoder writing a photograph turns the
+    /// EXIF orientation into exactly those properties. Both descriptions are
+    /// therefore present in the same file, and honouring both turns a portrait
+    /// photograph on its side.
     pub fn orients_itself(self) -> bool {
-        matches!(self, Format::JpegXl)
+        matches!(self, Format::JpegXl | Format::Heic)
     }
 
     /// Whether this format's decoder must run in a sandboxed process.
@@ -146,6 +160,42 @@ impl Format {
     pub fn is_vector(self) -> bool {
         matches!(self, Format::Svg)
     }
+}
+
+/// Whether the file is a HEIC, judged by the brands in its `ftyp` box.
+///
+/// HEIC shares its ISOBMFF container with AVIF and with video: `.mp4`, `.mov`
+/// and `.avif` all begin the same way, and only the brands distinguish them.
+/// So the brands are read rather than the box type — matching `ftyp` alone
+/// would claim every video file on the machine.
+fn is_heic(bytes: &[u8]) -> bool {
+    /// Brands naming a still image coded with HEVC. `mif1`/`msf1` are the
+    /// generic HEIF brands, which a HEIC also carries; AVIF files declare
+    /// `avif`/`avis` instead and are left to the decoder that will open them.
+    const BRANDS: [&[u8; 4]; 6] = [b"heic", b"heix", b"heim", b"heis", b"hevc", b"hevx"];
+
+    // Box length, then the type: `....ftyp`.
+    if bytes.len() < 12 || &bytes[4..8] != b"ftyp" {
+        return false;
+    }
+
+    let length = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+    // The major brand sits at 8, then a version, then the compatible brands.
+    // A malformed length must not read past the buffer, so the box is clamped
+    // to what is actually there.
+    let end = length.min(bytes.len());
+    let Some(box_bytes) = bytes.get(8..end) else {
+        return false;
+    };
+
+    // The major brand and every compatible brand are four bytes each; the
+    // minor version between them is four bytes too, so reading the lot as
+    // four-byte words and skipping the version is the whole parse.
+    box_bytes
+        .chunks_exact(4)
+        .enumerate()
+        .filter(|(index, _)| *index != 1)
+        .any(|(_, brand)| BRANDS.iter().any(|known| *brand == **known))
 }
 
 /// Whether the start of the file reads as an SVG document.
@@ -207,6 +257,58 @@ mod tests {
         assert_eq!(Format::detect(&[0xFF, 0x00, 0x00, 0x00]), None);
     }
 
+    /// HEIC is recognised by brand, not by the container it shares with video
+    /// and with AVIF.
+    #[test]
+    fn detects_heic_by_its_brands() {
+        assert_eq!(Format::detect(&ftyp(b"heic", &[b"mif1"])), Some(Format::Heic));
+        // The brand naming the still image may appear only in the compatible
+        // list, behind a generic major brand.
+        assert_eq!(Format::detect(&ftyp(b"mif1", &[b"heic"])), Some(Format::Heic));
+        assert_eq!(Format::detect(&ftyp(b"heix", &[])), Some(Format::Heic));
+    }
+
+    /// Everything else in an ISOBMFF box looks the same from the outside, and
+    /// claiming a video or an AVIF would be worse than refusing both.
+    #[test]
+    fn does_not_claim_the_rest_of_the_isobmff_family() {
+        assert_eq!(Format::detect(&ftyp(b"avif", &[b"mif1", b"miaf"])), None);
+        assert_eq!(Format::detect(&ftyp(b"isom", &[b"mp42", b"avc1"])), None);
+        assert_eq!(Format::detect(&ftyp(b"qt  ", &[])), None);
+        // A generic HEIF brand with nothing coded as HEVC alongside it is not
+        // something this build can decode.
+        assert_eq!(Format::detect(&ftyp(b"mif1", &[b"miaf"])), None);
+    }
+
+    /// A brand list whose declared length runs past the file must be read as
+    /// far as the bytes go, not past them.
+    #[test]
+    fn a_lying_box_length_does_not_read_past_the_file() {
+        let mut file = ftyp(b"heic", &[]);
+        file[..4].copy_from_slice(&9999u32.to_be_bytes());
+        assert_eq!(Format::detect(&file), Some(Format::Heic));
+
+        // And a box cut short mid-brand is simply not a HEIC.
+        for length in 0..file.len() {
+            let _ = Format::detect(&file[..length]);
+        }
+    }
+
+    /// Build an `ftyp` box: length, tag, major brand, minor version, then the
+    /// compatible brands.
+    fn ftyp(major: &[u8; 4], compatible: &[&[u8; 4]]) -> Vec<u8> {
+        let length = 16 + compatible.len() * 4;
+        let mut out = Vec::with_capacity(length);
+        out.extend_from_slice(&(length as u32).to_be_bytes());
+        out.extend_from_slice(b"ftyp");
+        out.extend_from_slice(major);
+        out.extend_from_slice(&0u32.to_be_bytes());
+        for brand in compatible {
+            out.extend_from_slice(*brand);
+        }
+        out
+    }
+
     /// SVG has no signature at a fixed offset, so it is recognised by its root
     /// element — which real files put behind a declaration, a doctype, or
     /// nothing at all.
@@ -239,11 +341,13 @@ mod tests {
     }
 
     /// Only the formats whose decoder applies the orientation itself may say
-    /// so: claiming it wrongly leaves a rotated photograph on its side.
+    /// so: claiming it wrongly leaves a rotated photograph on its side, and
+    /// denying it rotates one that was already upright.
     #[test]
-    fn only_jpeg_xl_orients_itself() {
+    fn only_self_orienting_formats_say_so() {
         for format in Format::ALL {
-            assert_eq!(format.orients_itself(), *format == Format::JpegXl, "{format:?} answers orients_itself wrongly");
+            let expected = matches!(format, Format::JpegXl | Format::Heic);
+            assert_eq!(format.orients_itself(), expected, "{format:?} answers orients_itself wrongly");
         }
     }
 

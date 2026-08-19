@@ -1,8 +1,10 @@
 //! Decoding an image file into pixels the renderer can upload.
 //!
 //! Every decoder in this module is pure Rust: a malformed file costs a panic or
-//! an error, never code execution. C-backed formats (HEIC, AVIF) arrive in
-//! v0.7.0 behind a separate process — see `docs/adr/0002-sandbox-c-decoders.md`.
+//! an error, never code execution. That now includes HEIC, which turned out to
+//! have a Rust decoder and so never reached the sandbox built for it — see
+//! `docs/adr/0007-heic-decodes-in-rust.md`. AVIF still has no such decoder and
+//! is the format the sandbox of `docs/adr/0002-sandbox-c-decoders.md` awaits.
 
 use std::fs;
 use std::io::Cursor;
@@ -210,6 +212,7 @@ fn decode_with(bytes: &[u8], confinement: Confinement) -> Result<LoadedImage> {
         Format::JpegXl => decode_jxl(bytes).with_context(malformed)?,
         Format::Jpeg => (decode_jpeg(bytes).with_context(malformed)?, color::profile_from(bytes)),
         Format::WebP => (decode_webp(bytes).with_context(malformed)?, color::profile_from(bytes)),
+        Format::Heic => (decode_heic(bytes).with_context(malformed)?, color::profile_from(bytes)),
         // PNG, GIF, BMP and TIFF share one pure-Rust decoder.
         _ => (decode_via_image_crate(bytes).with_context(malformed)?, color::profile_from(bytes)),
     };
@@ -347,6 +350,41 @@ fn decode_webp(bytes: &[u8]) -> Result<DecodedImage> {
 /// Decode a JPEG XL, returning the pixels together with the profile the file
 /// carries.
 ///
+/// Decode a HEIC — the format a modern iPhone photographs in.
+///
+/// Pure Rust, container and HEVC alike, which is the reason this format does
+/// not go through the sandbox built in v0.6.0: there is no C library here to
+/// confine. See `docs/adr/0007-heic-decodes-in-rust.md`.
+///
+/// The decoder delivers sRGB. A photograph tagged Display P3 has therefore
+/// already been converted by the time it arrives, which is why no profile is
+/// attached to it: the pixels are in the space the profile would convert them
+/// *to*. That costs a wide-gamut photograph the part of the display's gamut
+/// sRGB cannot reach, and it is the one place in the viewer where colour is
+/// resolved on the way in rather than in the shader — recorded as a
+/// limitation, not left to be discovered.
+fn decode_heic(bytes: &[u8]) -> Result<DecodedImage> {
+    // The container is parsed by the same crate that decodes the pixels, so a
+    // file that opens elsewhere and not here fails as one error rather than
+    // half-succeeding.
+    let image = heif_oxide::decode_bytes(bytes).map_err(|error| anyhow::anyhow!("{error}"))?;
+
+    let width = image.width;
+    let height = image.height;
+    let expected = pixel_count(width, height)?;
+
+    // 10- and 12-bit sources come back as 16-bit samples and are narrowed
+    // here, because the renderer uploads RGBA8. The depth is not thrown away
+    // silently for ever: HDR (v0.10.0) is where it starts to matter, and this
+    // is one of the places that will read the wider buffer instead.
+    let pixels = image.to_rgba8();
+    if pixels.len() != expected {
+        bail!("the HEIC decoded to {} bytes but {width}x{height} RGBA needs {expected}", pixels.len());
+    }
+
+    Ok(DecodedImage { width, height, pixels })
+}
+
 /// The two come back together because `jxl-oxide` reaches both in the same
 /// pass: asking for the profile separately would mean parsing the codestream a
 /// second time, and JXL is not a format where that is cheap.
@@ -676,6 +714,186 @@ mod tests {
         assert_eq!(grey_to_rgba8([(40u8, 0xFF)].into_iter(), 4), vec![40, 40, 40, 0xFF]);
         // Grey with alpha keeps the alpha it was given.
         assert_eq!(grey_to_rgba8([(10u8, 20u8), (30, 40)].into_iter(), 8), vec![10, 10, 10, 20, 30, 30, 30, 40]);
+    }
+
+    /// A 16x16 gradient written by libheif, the encoder behind every HEIC
+    /// tool that is not this one — so the decoder is checked against another
+    /// implementation rather than against itself.
+    ///
+    /// Carried as text because the suite ships no binary fixtures, and small
+    /// because a HEIC cannot be built from a few bytes of header the way a
+    /// PNG can: its pixels are HEVC, and no Rust encoder for them builds
+    /// within this crate's MSRV.
+    const HEIC_GRADIENT: &str = concat!(
+        "AAAAHGZ0eXBoZWljAAAAAG1pZjFoZWljbWlhZgAAAXxtZXRhAAAAAAAAACFoZGxyAAAAAAAAAABwaWN0AAAAAAAAAAAAAAAA",
+        "AAAAACJpbG9jAAAAAERAAAEAAQAAAAABoAABAAAAAAAAAMUAAAAjaWluZgAAAAAAAQAAABVpbmZlAgAAAAABAABodmMxAAAA",
+        "AA5waXRtAAAAAAABAAAA/GlwcnAAAADcaXBjbwAAAHVodmNDAQNwAAAAAAAAAAAAHvAA/P34+AAADwNgAAEAGEABDAH//wNw",
+        "AAADAJAAAAMAAAMAHroCQGEAAQApQgEBA3AAAAMAkAAAAwAAAwAeoCCBBZbqrprm4CGgwIAAAAyAAAADAIRiAAEABkQBwXPB",
+        "iQAAABNjb2xybmNseAABAA0ABoAAAAAUaXNwZQAAAAAAAABAAAAAQAAAAChjbGFwAAAAEAAAAAEAAAAQAAAAAf///9AAAAAC",
+        "////0AAAAAIAAAAQcGl4aQAAAAADCAgIAAAAGGlwbWEAAAAAAAAAAQABBYECAwWEAAAAzW1kYXQAAADBKAGvBrIe4SSwkawM",
+        "wY6ON9EJjG7hymaKZ/pf/3WrYjYL5EOMXoj/oUiSf/V4YmFoXp41sHLqVaifyq4sC4/ttdN2GzH9rdcqNdzCZA3yC2x2QxMy",
+        "byTwBoM8oUSRLrSH4EbaR/9AZGEfAS+8Jyn/9J0//89t2z3s9KMylHQsoHew08RJD+KqEiWSI8PgIoxH0TPl0Wx6BM96P48E",
+        "1DP93HbO0R8fhSMQwb1/WD6xg0OjqSXlrDVYtqDnMl3Ekl4ZoA==",
+    );
+
+    /// The same gradient, saved with an EXIF orientation asking for a quarter
+    /// turn — which libheif also wrote into the container as an `irot`
+    /// property, exactly as a phone does.
+    const HEIC_GRADIENT_ROTATED: &str = concat!(
+        "AAAAHGZ0eXBoZWljAAAAAG1pZjFoZWljbWlhZgAAAcdtZXRhAAAAAAAAACFoZGxyAAAAAAAAAABwaWN0AAAAAAAAAAAAAAAA",
+        "AAAAADRpbG9jAAAAAERAAAIAAQAAAAAB6wABAAAAAAAAAMUAAgAAAAACsAABAAAAAAAAACQAAAA4aWluZgAAAAAAAgAAABVp",
+        "bmZlAgAAAAABAABodmMxAAAAABVpbmZlAgAAAQACAABFeGlmAAAAAA5waXRtAAAAAAABAAABBmlwcnAAAADlaXBjbwAAAHVo",
+        "dmNDAQNwAAAAAAAAAAAAHvAA/P34+AAADwNgAAEAGEABDAH//wNwAAADAJAAAAMAAAMAHroCQGEAAQApQgEBA3AAAAMAkAAA",
+        "AwAAAwAeoCCBBZbqrprm4CGgwIAAAAyAAAADAIRiAAEABkQBwXPBiQAAABNjb2xybmNseAABAA0ABoAAAAAUaXNwZQAAAAAA",
+        "AABAAAAAQAAAAChjbGFwAAAAEAAAAAEAAAAQAAAAAf///9AAAAAC////0AAAAAIAAAAQcGl4aQAAAAADCAgIAAAACWlyb3QD",
+        "AAAAGWlwbWEAAAAAAAAAAQABBoECAwWEhgAAABppcmVmAAAAAAAAAA5jZHNjAAIAAQABAAAA8W1kYXQAAADBKAGvBrIe4SSw",
+        "kawMwY6ON9EJjG7hymaKZ/pf/3WrYjYL5EOMXoj/oUiSf/V4YmFoXp41sHLqVaifyq4sC4/ttdN2GzH9rdcqNdzCZA3yC2x2",
+        "QxMybyTwBoM8oUSRLrSH4EbaR/9AZGEfAS+8Jyn/9J0//89t2z3s9KMylHQsoHew08RJD+KqEiWSI8PgIoxH0TPl0Wx6BM96",
+        "P48E1DP93HbO0R8fhSMQwb1/WD6xg0OjqSXlrDVYtqDnMl3Ekl4ZoAAAAAZFeGlmAABNTQAqAAAACAABARIAAwAAAAEABgAA",
+        "AAAAAA==",
+    );
+
+    /// Decode base64 into the bytes of a fixture.
+    ///
+    /// Hand-written because the viewer has no use for base64 anywhere else,
+    /// and a dependency carried solely to unpack two test files would be a
+    /// dependency in everyone's build.
+    fn from_base64(text: &str) -> Vec<u8> {
+        const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+        let mut out = Vec::new();
+        let mut accumulator: u32 = 0;
+        let mut bits = 0;
+        for byte in text.bytes().filter(|byte| *byte != b'=') {
+            let value = ALPHABET.iter().position(|candidate| *candidate == byte).expect("a base64 character") as u32;
+            accumulator = (accumulator << 6) | value;
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                out.push((accumulator >> bits) as u8);
+            }
+        }
+        out
+    }
+
+    /// The colour at a pixel, ignoring alpha.
+    fn pixel_at(image: &DecodedImage, x: u32, y: u32) -> [u8; 3] {
+        let start = ((y * image.width + x) * 4) as usize;
+        [image.pixels[start], image.pixels[start + 1], image.pixels[start + 2]]
+    }
+
+    /// The format a modern phone photographs in, opened end to end.
+    #[test]
+    fn decodes_heic_to_rgba() {
+        let loaded = decode(&from_base64(HEIC_GRADIENT)).unwrap();
+        assert_eq!((loaded.image.width, loaded.image.height), (16, 16));
+        assert_eq!(loaded.image.pixels.len(), 16 * 16 * 4);
+        assert!(
+            loaded.image.pixels.chunks_exact(4).all(|pixel| pixel[3] == 0xFF),
+            "an opaque HEIC decoded with transparency"
+        );
+
+        // The fixture is a gradient: red rises to the right, green downwards.
+        // Compared with a wide margin because HEVC stores colour at half
+        // resolution, so a corner is not exactly the value encoded there.
+        let top_left = pixel_at(&loaded.image, 0, 0);
+        let top_right = pixel_at(&loaded.image, 15, 0);
+        let bottom_left = pixel_at(&loaded.image, 0, 15);
+        assert!(
+            top_right[0] > top_left[0] + 100,
+            "red did not rise across the image: {top_left:?} to {top_right:?}"
+        );
+        assert!(
+            bottom_left[1] > top_left[1] + 100,
+            "green did not rise down the image: {top_left:?} to {bottom_left:?}"
+        );
+    }
+
+    /// A HEIC states its rotation in the container, and the decoder applies
+    /// it. An encoder writing a photograph puts the same rotation in EXIF, so
+    /// honouring the tag as well would turn a portrait photograph on its side.
+    #[test]
+    fn a_heic_is_not_rotated_a_second_time() {
+        let loaded = decode(&from_base64(HEIC_GRADIENT_ROTATED)).unwrap();
+        assert_eq!(
+            loaded.orientation,
+            Orientation::Normal,
+            "the EXIF rotation was applied on top of the rotation the container already carried"
+        );
+
+        // The file asks for a quarter turn and the pixels arrive already
+        // turned: what was the bottom-left corner of the gradient is now the
+        // top-left one.
+        let upright = decode(&from_base64(HEIC_GRADIENT)).unwrap();
+        let turned_corner = pixel_at(&loaded.image, 0, 0);
+        let original_corner = pixel_at(&upright.image, 0, 15);
+        for channel in 0..3 {
+            let difference = turned_corner[channel].abs_diff(original_corner[channel]);
+            assert!(
+                difference < 20,
+                "the rotated image is not the upright one turned: {turned_corner:?} against {original_corner:?}"
+            );
+        }
+    }
+
+    /// The same gradient with an ICC profile embedded in the container, which
+    /// is how a phone tags a photograph as Display P3.
+    const HEIC_GRADIENT_TAGGED: &str = concat!(
+        "AAAAHGZ0eXBoZWljAAAAAG1pZjFoZWljbWlhZgAAA8FtZXRhAAAAAAAAACFoZGxyAAAAAAAAAABwaWN0AAAAAAAAAAAAAAAA",
+        "AAAAACJpbG9jAAAAAERAAAEAAQAAAAAD5QABAAAAAAAAAMUAAAAjaWluZgAAAAAAAQAAABVpbmZlAgAAAAABAABodmMxAAAA",
+        "AA5waXRtAAAAAAABAAADQWlwcnAAAAMhaXBjbwAAAHVodmNDAQNwAAAAAAAAAAAAHvAA/P34+AAADwNgAAEAGEABDAH//wNw",
+        "AAADAJAAAAMAAAMAHroCQGEAAQApQgEBA3AAAAMAkAAAAwAAAwAeoCCBBZbqrprm4CGgwIAAAAyAAAADAIRiAAEABkQBwXPB",
+        "iQAAAlhjb2xycHJvZgAAAkxsY21zBEAAAG1udHJSR0IgWFlaIAfqAAgAEwAUAAAAMWFjc3BNU0ZUAAAAAAAAAAAAAAAAAAAA",
+        "AAAAAAAAAAAAAAD21gABAAAAANMtbGNtcwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "C2Rlc2MAAAEIAAAANmNwcnQAAAFAAAAATHd0cHQAAAGMAAAAFGNoYWQAAAGgAAAALHJYWVoAAAHMAAAAFGJYWVoAAAHgAAAA",
+        "FGdYWVoAAAH0AAAAFHJUUkMAAAIIAAAAIGdUUkMAAAIIAAAAIGJUUkMAAAIIAAAAIGNocm0AAAIoAAAAJG1sdWMAAAAAAAAA",
+        "AQAAAAxlblVTAAAAGgAAABwAcwBSAEcAQgAgAGIAdQBpAGwAdAAtAGkAbgAAbWx1YwAAAAAAAAABAAAADGVuVVMAAAAwAAAA",
+        "HABOAG8AIABjAG8AcAB5AHIAaQBnAGgAdAAsACAAdQBzAGUAIABmAHIAZQBlAGwAeVhZWiAAAAAAAAD21gABAAAAANMtc2Yz",
+        "MgAAAAAAAQxCAAAF3v//8yUAAAeTAAD9kP//+6H///2iAAAD3AAAwG5YWVogAAAAAAAAb6AAADj1AAADkFhZWiAAAAAAAAAk",
+        "nwAAD4QAALbDWFlaIAAAAAAAAGKXAAC3hwAAGNlwYXJhAAAAAAADAAAAAmZmAADypwAADVkAABPQAAAKW2Nocm0AAAAAAAMA",
+        "AAAAo9cAAFR7AABMzQAAmZoAACZmAAAPXAAAABRpc3BlAAAAAAAAAEAAAABAAAAAKGNsYXAAAAAQAAAAAQAAABAAAAAB////",
+        "0AAAAAL////QAAAAAgAAABBwaXhpAAAAAAMICAgAAAAYaXBtYQAAAAAAAAABAAEFgQIDBYQAAADNbWRhdAAAAMEoAa8Gsh7h",
+        "JLCRrAzBjo430QmMbuHKZopn+l//datiNgvkQ4xeiP+hSJJ/9XhiYWhenjWwcupVqJ/KriwLj+2103YbMf2t1yo13MJkDfIL",
+        "bHZDEzJvJPAGgzyhRJEutIfgRtpH/0BkYR8BL7wnKf/0nT//z23bPez0ozKUdCygd7DTxEkP4qoSJZIjw+AijEfRM+XRbHoE",
+        "z3o/jwTUM/3cds7RHx+FIxDBvX9YPrGDQ6OpJeWsNVi2oOcyXcSSXhmg",
+    );
+
+    /// HEIC pixels arrive already converted to sRGB, so the profile must not
+    /// be attached — applying it would convert them a second time, see
+    /// ADR 0007.
+    ///
+    /// Asserted on a file that really does carry an ICC profile, so this
+    /// cannot pass merely because there was nothing to find.
+    #[test]
+    fn a_tagged_heic_arrives_without_a_profile_to_apply() {
+        // The fixture carries a profile: a format that read it would find one.
+        let tagged = from_base64(HEIC_GRADIENT_TAGGED);
+        assert!(
+            tagged.windows(4).any(|window| window == b"prof"),
+            "the fixture is meant to carry an ICC profile"
+        );
+
+        assert!(decode(&tagged).unwrap().profile.is_none());
+        assert!(decode(&from_base64(HEIC_GRADIENT)).unwrap().profile.is_none());
+    }
+
+    /// A decoder reading a hostile file is the reason the sandbox exists; this
+    /// one is Rust, so a broken file must come back as an error rather than
+    /// taking the viewer with it.
+    #[test]
+    fn a_broken_heic_is_an_error_rather_than_a_panic() {
+        let whole = from_base64(HEIC_GRADIENT);
+        for cut in [0, 1, 12, 40, whole.len() / 2, whole.len() - 1] {
+            assert!(decode(&whole[..cut]).is_err(), "a HEIC cut to {cut} bytes decoded anyway");
+        }
+
+        // Bytes flipped throughout the file: the decoder may refuse it or
+        // produce nonsense pixels, but it must not take the viewer down.
+        let mut damaged = whole.clone();
+        for index in (0..damaged.len()).step_by(29) {
+            damaged[index] ^= 0xA5;
+        }
+        let _ = decode(&damaged);
     }
 
     /// jxl-oxide applies the header orientation itself. The viewer must not

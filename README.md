@@ -83,6 +83,7 @@ code execution.
 | PNG | `.png` | yes |
 | WebP | `.webp` | yes |
 | JPEG XL | `.jxl` | yes |
+| HEIC | `.heic` `.heif` `.hif` | converted at decode |
 | SVG | `.svg` | drawn in sRGB |
 | GIF | `.gif` | sRGB by definition |
 | BMP | `.bmp` | no |
@@ -91,14 +92,24 @@ code execution.
 The format is decided by the bytes, not the extension: a `.png` that is really
 a JPEG opens rather than erroring.
 
-HEIC and AVIF need C libraries, where a malformed file is a memory-safety bug
-rather than an error, so they will not decode in this process. The boundary
-they will run behind is already built: a child process created suspended,
-stripped of every privilege, dropped to low integrity, held in a job object
-that caps its memory and kills it with the viewer. It is handed the file's
-bytes on a pipe and never its path, so a decoder that is taken over cannot ask
-for a different file. A crash there is a message on screen, not a lost viewer.
-The decoders arrive in v0.7.0.
+HEIC — the format a modern phone photographs in — decodes in Rust like the
+rest, container and HEVC alike. Two things about it are worth knowing before
+they surprise you. Its pixels arrive already converted to sRGB by the decoder,
+so a photograph tagged Display P3 is shown inside sRGB rather than across a
+wide-gamut display's full range: the one place in nitid where colour is
+resolved on the way in instead of on the GPU. And it has no quick first frame —
+where a JPEG shows its embedded thumbnail in milliseconds, a HEIC waits for the
+whole decode, about a second for a 12-megapixel photograph. Both are measured,
+gated in the test suite, and on the list to fix; the reasoning is in
+[ADR 0007](docs/adr/0007-heic-decodes-in-rust.md).
+
+AVIF still needs a C library, where a malformed file is a memory-safety bug
+rather than an error, so it will not decode in this process. The boundary it
+will run behind is already built: a child process created suspended, stripped
+of every privilege, dropped to low integrity, held in a job object that caps
+its memory and kills it with the viewer. It is handed the file's bytes on a
+pipe and never its path, so a decoder that is taken over cannot ask for a
+different file. A crash there is a message on screen, not a lost viewer.
 
 SVG is drawn for the size it is shown at, and drawn again when that changes, so
 zooming in sharpens the picture instead of enlarging pixels. A document that
@@ -109,8 +120,8 @@ has no size limit to hide behind.
 
 ## Status
 
-Early development — v0.6.0 is out. Startup, colour and pure-Rust format
-coverage all hold. HDR is still ahead. Development runs in small versions, each
+Early development — v0.7.0 is out. Startup, colour and format coverage hold,
+and a phone's photographs open. HDR is still ahead. Development runs in small versions, each
 one theme; the road to 1.0 is fixed:
 
 | Version | What lands |
@@ -123,8 +134,8 @@ one theme; the road to 1.0 is fixed:
 | ✅ v0.4.2 | JPEG XL |
 | ✅ v0.5.0 | SVG, redrawn at the size it is shown |
 | ✅ v0.6.0 | Sandboxed decoder process |
-| v0.7.0 | HEIC and AVIF, behind that sandbox |
-| v0.8.0 | Background decode — no format can block the UI |
+| ✅ v0.7.0 | HEIC, decoded in Rust |
+| v0.8.0 | AVIF behind the sandbox; background decode — no format blocks the UI |
 | v0.9.0 | Animation: GIF, WebP, APNG |
 | v0.10.0 | HDR output on Windows (`Bt2100Pq` on `Rgb10a2Unorm`) |
 | v0.11.0 | Gigapixel images via tiled rendering |
@@ -207,7 +218,7 @@ Two decisions shape everything else:
 
 **nitid owns its swapchain.** HDR output on Windows is only reachable through `Bt2100Pq` on the `Rgb10a2Unorm` format — DirectX 12 has no extended-sRGB swapchain color space. A GUI framework that configures the surface for you closes that door, so the window and renderer are ours; `egui` is used for widgets only.
 
-**Untrusted input is isolated.** An image decoder parses hostile data by definition — pictures arrive from the internet. Pure-Rust decoders run in-process, where a malformed file causes a panic rather than code execution. HEIC and AVIF exist only as C libraries, so from v0.7.0 they run in a separate low-integrity process: a crash there means "could not open this file", not a compromised viewer.
+**Untrusted input is isolated.** An image decoder parses hostile data by definition — pictures arrive from the internet. Pure-Rust decoders run in-process, where a malformed file causes a panic rather than code execution, and that now covers every format nitid opens, HEIC included. AVIF exists only as a C library, so it will run in a separate low-integrity process: a crash there means "could not open this file", not a compromised viewer.
 
 Architecture decisions are recorded in [`docs/adr/`](docs/adr/).
 

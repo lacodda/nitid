@@ -168,6 +168,14 @@ fn raw_profile(bytes: &[u8]) -> Option<Vec<u8>> {
         // codestream again here to answer the same question would double the
         // cost of opening the format. See `image_source::decode_jxl`.
         Format::JpegXl => None,
+        // HEIC carries a profile, and the pixels do not need it: the decoder
+        // converts them to sRGB on the way out and the file's own primaries
+        // are gone by the time they arrive here. Attaching the profile anyway
+        // would convert an already-converted image a second time. The cost of
+        // that conversion — a Display P3 photograph shown inside sRGB rather
+        // than in the display's full gamut — is written down in
+        // `docs/adr/0007-heic-decodes-in-rust.md`.
+        Format::Heic => None,
         // SVG states colours as sRGB values in the markup itself; there is no
         // profile to read, and none to attach.
         Format::Svg => None,

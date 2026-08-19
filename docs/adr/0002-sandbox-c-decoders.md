@@ -1,7 +1,12 @@
 # 0002 — C-backed decoders run in a sandboxed process
 
 Date: 2026-08-09
-Status: accepted
+Status: accepted, narrowed by [ADR 0007](0007-heic-decodes-in-rust.md)
+
+> **Narrowed 2026-08-19.** The premise below — that HEIC has no viable Rust
+> decoder — stopped holding: `heif-oxide` decodes it in Rust, and v0.7.0 opens
+> HEIC in-process without this boundary. Everything here still stands for AVIF,
+> which is the format the sandbox now waits for. See ADR 0007.
 
 ## Context
 

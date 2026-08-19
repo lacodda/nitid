@@ -10,12 +10,29 @@
 //! this has to hold on a shared CI runner with a software rasteriser as well as
 //! on a desktop with a GPU. It is a regression alarm, not a benchmark: a change
 //! that puts a full decode back on the startup path blows straight past it.
+//!
+//! There are two gates, because two formats reach the screen by different
+//! routes. JPEG has an embedded thumbnail and is held to the promise. HEIC has
+//! no thumbnail this build can read, so its first frame waits for the whole
+//! HEVC decode — slower, measured separately, and held to a threshold that
+//! says what it costs today rather than what the product wants it to cost.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// What a startup may cost before the gate complains.
+/// What a startup may cost before the gate complains, for a format whose first
+/// frame comes from an embedded thumbnail.
 const THRESHOLD_MS: f64 = 1500.0;
+
+/// The same for HEIC, which has no such shortcut in this build.
+///
+/// A HEIC reaches the screen only when its HEVC payload has been decoded in
+/// full: on a desktop that is around a second for a 12-megapixel photograph
+/// against 40 ms for the equivalent JPEG, and a CI runner without a GPU is
+/// slower still. The number is therefore a regression alarm around a known
+/// cost, not an endorsement of it — the entry in `План.md` for reading the
+/// container's own thumbnail item is what brings it down to the promise.
+const HEIC_THRESHOLD_MS: f64 = 4000.0;
 
 /// How many times to run; the fastest counts.
 ///
@@ -73,6 +90,86 @@ fn a_picture_reaches_the_screen_quickly() {
          Something is blocking startup — most likely a full decode that belongs \
          on a worker thread, or a thumbnail path that stopped being taken."
     );
+}
+
+/// The same gate for HEIC, the format a phone photographs in.
+///
+/// Held separately because the mechanism is different: there is no quick frame
+/// to check for, and the whole measurement is the decode. If reading the
+/// container's thumbnail item ever lands, this test is where it shows up — the
+/// number should fall to the JPEG gate and this comment should go.
+#[test]
+fn a_heic_reaches_the_screen_within_its_slower_budget() {
+    let Some(exe) = viewer_binary() else {
+        eprintln!("skipping: the viewer binary was not found next to the test");
+        return;
+    };
+
+    let dir = tempfile::tempdir().expect("creating a temporary folder");
+    let image = dir.path().join("photo.heic");
+    std::fs::write(&image, heic_fixture()).expect("writing the test image");
+
+    let mut best = f64::INFINITY;
+    let mut failures = Vec::new();
+
+    for attempt in 1..=RUNS {
+        match measure(&exe, &image) {
+            Ok(run) => {
+                eprintln!("run {attempt}: {:.1} ms", run.first_pixels_ms);
+                best = best.min(run.first_pixels_ms);
+            }
+            Err(reason) => failures.push(format!("run {attempt}: {reason}")),
+        }
+    }
+
+    if best.is_infinite() {
+        eprintln!("skipping: the viewer could not open a window here\n  {}", failures.join("\n  "));
+        return;
+    }
+
+    assert!(
+        best <= HEIC_THRESHOLD_MS,
+        "the first pixels of a HEIC took {best:.1} ms, over the {HEIC_THRESHOLD_MS:.0} ms gate.\n\
+         The whole decode is on the startup path for this format, so this is \
+         either a slower decoder than before or work that belongs on a worker \
+         thread."
+    );
+}
+
+/// A small HEIC, written by libheif.
+///
+/// Small on purpose: this gate is about the startup path, and a photograph-
+/// sized HEVC payload would spend the measurement on the decoder rather than
+/// on what the test is watching. The same fixture as the decoder tests, kept
+/// as text because the suite ships no binary files.
+fn heic_fixture() -> Vec<u8> {
+    const BASE64: &str = concat!(
+        "AAAAHGZ0eXBoZWljAAAAAG1pZjFoZWljbWlhZgAAAXxtZXRhAAAAAAAAACFoZGxyAAAAAAAAAABwaWN0AAAAAAAAAAAAAAAA",
+        "AAAAACJpbG9jAAAAAERAAAEAAQAAAAABoAABAAAAAAAAAMUAAAAjaWluZgAAAAAAAQAAABVpbmZlAgAAAAABAABodmMxAAAA",
+        "AA5waXRtAAAAAAABAAAA/GlwcnAAAADcaXBjbwAAAHVodmNDAQNwAAAAAAAAAAAAHvAA/P34+AAADwNgAAEAGEABDAH//wNw",
+        "AAADAJAAAAMAAAMAHroCQGEAAQApQgEBA3AAAAMAkAAAAwAAAwAeoCCBBZbqrprm4CGgwIAAAAyAAAADAIRiAAEABkQBwXPB",
+        "iQAAABNjb2xybmNseAABAA0ABoAAAAAUaXNwZQAAAAAAAABAAAAAQAAAAChjbGFwAAAAEAAAAAEAAAAQAAAAAf///9AAAAAC",
+        "////0AAAAAIAAAAQcGl4aQAAAAADCAgIAAAAGGlwbWEAAAAAAAAAAQABBYECAwWEAAAAzW1kYXQAAADBKAGvBrIe4SSwkawM",
+        "wY6ON9EJjG7hymaKZ/pf/3WrYjYL5EOMXoj/oUiSf/V4YmFoXp41sHLqVaifyq4sC4/ttdN2GzH9rdcqNdzCZA3yC2x2QxMy",
+        "byTwBoM8oUSRLrSH4EbaR/9AZGEfAS+8Jyn/9J0//89t2z3s9KMylHQsoHew08RJD+KqEiWSI8PgIoxH0TPl0Wx6BM96P48E",
+        "1DP93HbO0R8fhSMQwb1/WD6xg0OjqSXlrDVYtqDnMl3Ekl4ZoA==",
+    );
+
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    let mut out = Vec::new();
+    let mut accumulator: u32 = 0;
+    let mut bits = 0;
+    for byte in BASE64.bytes().filter(|byte| *byte != b'=') {
+        let value = ALPHABET.iter().position(|candidate| *candidate == byte).expect("a base64 character") as u32;
+        accumulator = (accumulator << 6) | value;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((accumulator >> bits) as u8);
+        }
+    }
+    out
 }
 
 /// What one run of the viewer reported about its startup.
