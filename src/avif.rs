@@ -600,7 +600,7 @@ mod tests {
         assert_eq!((decoded.image.width, decoded.image.height), (16, 16));
         assert_eq!(decoded.image.pixels.len(), 16 * 16 * 4);
         assert!(
-            decoded.image.pixels.chunks_exact(4).all(|pixel| pixel[3] == 0xFF),
+            decoded.image.pixels.as_chunks::<4>().0.iter().all(|pixel| pixel[3] == 0xFF),
             "an opaque AVIF decoded with transparency"
         );
 

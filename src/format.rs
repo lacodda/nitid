@@ -215,20 +215,16 @@ fn isobmff_format(bytes: &[u8]) -> Option<Format> {
     // A file may carry both families of brand — `mif1` is generic and appears
     // in each — so the major brand is asked first and the compatible list only
     // decides when the major brand says nothing either way.
-    let brands: Vec<&[u8]> = box_bytes
-        .chunks_exact(4)
-        .enumerate()
-        .filter(|(index, _)| *index != 1)
-        .map(|(_, brand)| brand)
-        .collect();
+    let (brands, _) = box_bytes.as_chunks::<4>();
+    let brands: Vec<&[u8; 4]> = brands.iter().enumerate().filter(|(index, _)| *index != 1).map(|(_, brand)| brand).collect();
 
-    let names = |known: &[&[u8; 4]]| brands.iter().any(|brand| known.iter().any(|candidate| *brand == *candidate));
+    let names = |known: &[&[u8; 4]]| brands.iter().any(|brand| known.contains(brand));
 
     // The major brand is the file's own statement about what it is; a
     // compatible brand only says what it can also be read as.
     match brands.first() {
-        Some(major) if HEVC.iter().any(|known| *major == *known) => return Some(Format::Heic),
-        Some(major) if AV1.iter().any(|known| *major == *known) => return Some(Format::Avif),
+        Some(major) if HEVC.contains(major) => return Some(Format::Heic),
+        Some(major) if AV1.contains(major) => return Some(Format::Avif),
         _ => {}
     }
 

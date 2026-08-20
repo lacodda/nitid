@@ -78,8 +78,8 @@ fn a_file_decodes_in_the_sandboxed_process() {
 
     assert_eq!((decoded.image.width, decoded.image.height), (7, 5));
     assert_eq!(decoded.image.pixels.len(), 7 * 5 * 4);
-    for pixel in decoded.image.pixels.chunks_exact(4) {
-        assert_eq!(pixel, [10, 200, 90, 255], "the pixels did not survive the crossing");
+    for pixel in decoded.image.pixels.as_chunks::<4>().0.iter() {
+        assert_eq!(pixel, &[10, 200, 90, 255], "the pixels did not survive the crossing");
     }
 }
 
@@ -91,7 +91,7 @@ fn a_large_image_crosses_the_pipe_whole() {
 
     assert_eq!((decoded.image.width, decoded.image.height), (800, 600));
     assert_eq!(decoded.image.pixels.len(), 800 * 600 * 4);
-    assert!(decoded.image.pixels.chunks_exact(4).all(|pixel| pixel == [10, 200, 90, 255]));
+    assert!(decoded.image.pixels.as_chunks::<4>().0.iter().all(|pixel| pixel == &[10, 200, 90, 255]));
 }
 
 /// The reason the boundary exists: a file that defeats the decoder comes back

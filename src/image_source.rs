@@ -445,7 +445,7 @@ fn decode_jxl(bytes: &[u8]) -> Result<(DecodedImage, Option<ColorProfile>)> {
     let pixels = match channels {
         4 => samples,
         3 => rgb_to_rgba8(&samples, expected),
-        2 => grey_to_rgba8(samples.chunks_exact(2).map(|pair| (pair[0], pair[1])), expected),
+        2 => grey_to_rgba8(samples.as_chunks::<2>().0.iter().map(|pair| (pair[0], pair[1])), expected),
         1 => grey_to_rgba8(samples.iter().map(|grey| (*grey, 0xFF)), expected),
         // CMYK reaches the same stream with five channels or more. Left
         // unhandled rather than guessed at: converting it needs the profile,
@@ -476,7 +476,7 @@ pub(crate) fn pixel_count(width: u32, height: u32) -> Result<usize> {
 /// ones.
 fn grey_to_rgba8(samples: impl Iterator<Item = (u8, u8)>, expected: usize) -> Vec<u8> {
     let mut pixels = vec![0xFFu8; expected];
-    for (target, (grey, alpha)) in pixels.chunks_exact_mut(4).zip(samples) {
+    for (target, (grey, alpha)) in pixels.as_chunks_mut::<4>().0.iter_mut().zip(samples) {
         target[..3].fill(grey);
         target[3] = alpha;
     }
@@ -486,7 +486,7 @@ fn grey_to_rgba8(samples: impl Iterator<Item = (u8, u8)>, expected: usize) -> Ve
 /// Widen opaque RGB samples to the RGBA8 the renderer uploads.
 fn rgb_to_rgba8(rgb: &[u8], expected: usize) -> Vec<u8> {
     let mut pixels = vec![0xFFu8; expected];
-    for (target, source) in pixels.chunks_exact_mut(4).zip(rgb.chunks_exact(3)) {
+    for (target, source) in pixels.as_chunks_mut::<4>().0.iter_mut().zip(rgb.as_chunks::<3>().0) {
         target[..3].copy_from_slice(source);
     }
     pixels
@@ -584,7 +584,7 @@ mod tests {
     #[test]
     fn an_opaque_webp_comes_back_opaque() {
         let loaded = decode(&encode_webp(3, 3, None)).unwrap();
-        for pixel in loaded.image.pixels.chunks_exact(4) {
+        for pixel in loaded.image.pixels.as_chunks::<4>().0.iter() {
             assert_eq!(pixel[3], 0xFF, "an opaque WebP decoded to a transparent pixel");
         }
     }
@@ -650,8 +650,8 @@ mod tests {
     #[test]
     fn a_lossless_jpeg_xl_round_trips_exactly() {
         let loaded = decode(&encode_jxl(3, 2, None)).unwrap();
-        for pixel in loaded.image.pixels.chunks_exact(4) {
-            assert_eq!(pixel, [10, 200, 90, 0xFF], "a lossless JPEG XL came back with different pixels");
+        for pixel in loaded.image.pixels.as_chunks::<4>().0.iter() {
+            assert_eq!(pixel, &[10, 200, 90, 0xFF], "a lossless JPEG XL came back with different pixels");
         }
     }
 
@@ -684,8 +684,8 @@ mod tests {
 
         let loaded = decode(&jxl).unwrap();
         assert_eq!((loaded.image.width, loaded.image.height), (4, 4));
-        for (pixel, grey) in loaded.image.pixels.chunks_exact(4).zip(&pixels) {
-            assert_eq!(pixel, [*grey, *grey, *grey, 0xFF], "a grey sample was not spread across the colour channels");
+        for (pixel, grey) in loaded.image.pixels.as_chunks::<4>().0.iter().zip(&pixels) {
+            assert_eq!(pixel, &[*grey, *grey, *grey, 0xFF], "a grey sample was not spread across the colour channels");
         }
     }
 
@@ -807,7 +807,7 @@ mod tests {
         assert_eq!((loaded.image.width, loaded.image.height), (16, 16));
         assert_eq!(loaded.image.pixels.len(), 16 * 16 * 4);
         assert!(
-            loaded.image.pixels.chunks_exact(4).all(|pixel| pixel[3] == 0xFF),
+            loaded.image.pixels.as_chunks::<4>().0.iter().all(|pixel| pixel[3] == 0xFF),
             "an opaque HEIC decoded with transparency"
         );
 
