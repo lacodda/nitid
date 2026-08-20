@@ -2,6 +2,11 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.9.0] - 2026-08-20
+
+### Features
+- Stop a decode that nobody is waiting for
+
 ## [0.8.0] - 2026-08-20
 
 ### Features
