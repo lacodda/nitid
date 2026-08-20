@@ -9,6 +9,12 @@
 //!    arrow key draws from memory instead of waiting on a disk and a decoder.
 //!
 //! A file with no thumbnail skips step 1; nothing else changes.
+//!
+//! Two things guard that order against a decoder that is slow or stuck. A job
+//! is abandoned the moment the user navigates past it — checked before the
+//! read and again before the decode, because a held arrow key can outrun a
+//! 12-megapixel HEIC several times over. And a decode that never finishes is
+//! given up on rather than waited for: see `Deadline`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -102,7 +108,16 @@ impl Loader {
                                     continue;
                                 }
 
-                                let loaded = load_or_take(&cache, &path);
+                                // Checked again inside, between reading the
+                                // file and decoding it: on a folder of large
+                                // images the read alone is long enough for a
+                                // held arrow key to move on twice.
+                                let still_wanted = {
+                                    let generation = Arc::clone(&generation);
+                                    move || want == generation.load(Ordering::SeqCst)
+                                };
+
+                                let loaded = load_or_take(&cache, &path, &still_wanted);
                                 let result = match loaded {
                                     Ok(image) => {
                                         remember(&cache, &path, Arc::clone(&image));
@@ -121,7 +136,11 @@ impl Loader {
                                 if cache.lock().expect("the cache is poisoned").contains_key(&path) {
                                     continue;
                                 }
-                                if let Ok(image) = load_or_take(&cache, &path) {
+                                // A prefetch answers to nobody in particular,
+                                // so there is no navigation that makes it
+                                // stale — it either lands in the cache or is
+                                // dropped when the window moves.
+                                if let Ok(image) = load_or_take(&cache, &path, &|| true) {
                                     remember(&cache, &path, image);
                                 }
                             }
@@ -214,13 +233,33 @@ pub enum Request {
 }
 
 /// Take the image from the cache, or decode it.
-fn load_or_take(cache: &Cache, path: &Path) -> Result<Arc<LoadedImage>, String> {
+///
+/// `still_wanted` is asked between the two expensive steps — reading the file
+/// and decoding it. A job the user has navigated past stops there rather than
+/// finishing work whose result is thrown away on arrival.
+fn load_or_take(cache: &Cache, path: &Path, still_wanted: &dyn Fn() -> bool) -> Result<Arc<LoadedImage>, String> {
     if let Some(ready) = cache.lock().expect("the cache is poisoned").get(path) {
         return Ok(Arc::clone(ready));
     }
 
-    image_source::load(path).map(Arc::new).map_err(|error| format!("{error:#}"))
+    let bytes = std::fs::read(path).map_err(|error| format!("reading {}: {error}", path.display()))?;
+
+    if !still_wanted() {
+        return Err(ABANDONED.to_string());
+    }
+
+    image_source::decode(&bytes)
+        .map(Arc::new)
+        .map_err(|error| format!("decoding {}: {error:#}", path.display()))
 }
+
+/// What an abandoned job reports.
+///
+/// It reaches nobody: the reply is addressed to a generation that has already
+/// been superseded, so the event loop drops it before looking at the result.
+/// The string exists so the code path is not silently indistinguishable from
+/// a real failure while reading it.
+pub const ABANDONED: &str = "the image was left before it finished decoding";
 
 fn remember(cache: &Cache, path: &Path, image: Arc<LoadedImage>) {
     cache.lock().expect("the cache is poisoned").insert(path.to_path_buf(), image);
@@ -316,6 +355,72 @@ mod tests {
 
         loader.request(&second);
         assert!(!loader.is_current(generation));
+    }
+
+    /// A job the user has navigated past stops between reading the file and
+    /// decoding it, rather than finishing work whose result is discarded on
+    /// arrival. On a folder of large images the difference is a held arrow key
+    /// that keeps up against one that falls a decode behind per press.
+    #[test]
+    fn a_job_the_user_left_is_abandoned_before_it_decodes() {
+        let cache: Cache = Arc::new(Mutex::new(HashMap::new()));
+        let dir = tempfile::tempdir().unwrap();
+        let path = image_file(dir.path(), "left.png");
+
+        // The user navigated away while the file was being read.
+        let result = load_or_take(&cache, &path, &|| false);
+
+        assert_eq!(result.err().as_deref(), Some(ABANDONED));
+        assert!(cache.lock().unwrap().is_empty(), "an abandoned job left something in the cache");
+    }
+
+    /// The same job, still wanted, decodes as before — otherwise the test
+    /// above would pass against a loader that decodes nothing at all.
+    #[test]
+    fn a_job_still_wanted_decodes() {
+        let cache: Cache = Arc::new(Mutex::new(HashMap::new()));
+        let dir = tempfile::tempdir().unwrap();
+        let path = image_file(dir.path(), "wanted.png");
+
+        assert!(load_or_take(&cache, &path, &|| true).is_ok());
+    }
+
+    /// A file that cannot be read reports why, rather than reporting the
+    /// abandonment that never happened.
+    #[test]
+    fn an_unreadable_file_is_not_reported_as_abandoned() {
+        let cache: Cache = Arc::new(Mutex::new(HashMap::new()));
+        let missing = Path::new("no-such-directory-here").join("nothing.png");
+
+        let Err(error) = load_or_take(&cache, &missing, &|| true) else {
+            panic!("a missing file decoded anyway");
+        };
+        assert!(error.contains("reading"), "the error does not say what went wrong: {error}");
+        assert_ne!(error, ABANDONED);
+    }
+
+    /// A prefetch answers to no particular navigation, so it must not be
+    /// abandoned by one: it either lands in the cache or is dropped when the
+    /// window of neighbours moves.
+    #[test]
+    fn a_prefetch_is_not_abandoned_by_navigation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = image_file(dir.path(), "ahead.png");
+
+        let loader = Loader::new(|_| {});
+        // Navigate several times, as a held arrow key would.
+        for _ in 0..5 {
+            loader.request(&path);
+        }
+        loader.prefetch(std::slice::from_ref(&path));
+
+        for _ in 0..100 {
+            if loader.cache.lock().unwrap().contains_key(&path) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        panic!("the prefetch never landed, so navigation cancelled work that answers to nobody");
     }
 
     #[test]

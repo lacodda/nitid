@@ -27,6 +27,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use moxcms::ColorProfile;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
 use windows::Win32::Security::{
@@ -42,7 +43,7 @@ use windows::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED, Open
 use windows::core::{PCWSTR, w};
 
 use super::protocol;
-use crate::image_source::DecodedImage;
+use crate::image_source::{DecodedImage, Fidelity, LoadedImage, Orientation};
 
 /// The attribute marking a token's mandatory label group.
 ///
@@ -57,7 +58,7 @@ const SE_GROUP_INTEGRITY: u32 = 0x20;
 const MEMORY_LIMIT: usize = 1024 * 1024 * 1024;
 
 /// Decode `bytes` in a confined child process.
-pub fn decode(bytes: &[u8], timeout: Duration) -> Result<DecodedImage> {
+pub fn decode(bytes: &[u8], timeout: Duration) -> Result<LoadedImage> {
     let mut child = Command::new(super::decoder_executable()?)
         .arg(super::DECODE_ARGUMENT)
         .stdin(Stdio::piped())
@@ -83,10 +84,22 @@ pub fn decode(bytes: &[u8], timeout: Duration) -> Result<DecodedImage> {
     drop(guard);
 
     match reply? {
-        Ok(image) => Ok(DecodedImage {
-            width: image.width,
-            height: image.height,
-            pixels: image.pixels,
+        Ok(image) => Ok(LoadedImage {
+            orientation: Orientation::from_exif(u16::from(image.orientation)),
+            // A profile the decoder sent that will not parse here is treated
+            // as no profile, the same as anywhere else: broken colour metadata
+            // is not a reason to refuse an image.
+            profile: (!image.profile.is_empty()).then(|| ColorProfile::new_from_slice(&image.profile).ok()).flatten(),
+            image: DecodedImage {
+                width: image.width,
+                height: image.height,
+                pixels: image.pixels,
+            },
+            fidelity: Fidelity::Full,
+            // A vector document does not cross the boundary: the formats that
+            // need a sandbox are all raster, and re-rasterising on zoom would
+            // mean a round trip per frame.
+            vector: None,
         }),
         // A file the decoder could not read is an ordinary failure carrying
         // the decoder's own words, not a sandbox event.
@@ -366,8 +379,16 @@ fn first_thread_of(process_id: u32) -> Result<u32> {
 }
 
 // Not done here, and worth saying plainly rather than leaving to be assumed:
-// the network is still reachable from the decoder. Low integrity does not
-// close a socket, and the only mechanisms that do are an AppContainer with no
-// capabilities or a firewall rule naming this executable. Both are more than
-// this stage carries, and neither is needed by the decoders behind the
-// boundary today — every one of them is pure Rust and none opens a socket.
+// the network is still reachable from the decoder. That is no longer a
+// suspicion — a decoder taught to try reported `listen=true connect=true` from
+// inside this boundary, so a low integrity token demonstrably does not close a
+// socket.
+//
+// Closing it needs an AppContainer with no capabilities, which was attempted
+// in v0.9.0 and turned out to be a stage of its own: the container needs its
+// own SID granted access not only to the executable but along every directory
+// leading to it, which means the viewer editing permissions on folders it does
+// not own. That work has its own version in the plan. Until then the gap costs
+// nothing measurable — every decoder behind this boundary is Rust and none
+// opens a socket — but it is a gap, and it is written down rather than papered
+// over.

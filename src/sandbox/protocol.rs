@@ -8,6 +8,12 @@
 //!
 //! A request is: magic, version, length, then that many bytes of image file.
 //! A reply is: magic, version, tag, then a payload the tag describes.
+//!
+//! The reply carries what the decoder learned about the file as well as its
+//! pixels — the orientation to apply and the colour profile, if any. Reading
+//! those in the parent instead would work for a format whose profile sits in
+//! the container, and quietly lose it for one like AVIF, where the colour
+//! description lives in the bitstream and only the decoder ever sees it.
 
 use std::io::{Read, Write};
 
@@ -22,7 +28,9 @@ const MAGIC: [u8; 4] = *b"NTDS";
 /// Both ends ship in the same executable and are updated together, so a
 /// mismatch means something is impersonating one of them — refuse rather than
 /// negotiate.
-const VERSION: u16 = 1;
+///
+/// Version 2 added the orientation and the colour profile to an image reply.
+const VERSION: u16 = 2;
 
 /// The largest file the decoder will be handed, and the largest reply it may
 /// send back.
@@ -38,7 +46,24 @@ pub struct RawImage {
     pub height: u32,
     /// `width * height * 4` bytes of RGBA8.
     pub pixels: Vec<u8>,
+    /// The orientation to apply, as EXIF numbers it (1 through 8).
+    ///
+    /// The decoder is the half that knows: some formats state the turn in the
+    /// container and some in EXIF, and some decoders apply it themselves.
+    pub orientation: u8,
+    /// The ICC profile describing the pixels, if the decoder produced one.
+    ///
+    /// Empty when the image is untagged, which — following ADR 0005 — means
+    /// it is shown as it is rather than converted from an assumed sRGB.
+    pub profile: Vec<u8>,
 }
+
+/// The largest colour profile that will cross the boundary.
+///
+/// Real profiles run to a few kilobytes; a CMYK press profile with a large
+/// lookup table might reach a megabyte. Past that, the decoder is either
+/// broken or being used to make the viewer allocate.
+pub const MAX_PROFILE: usize = 4 * 1024 * 1024;
 
 /// Ask the decoder to decode `bytes`.
 pub fn write_request(mut to: impl Write, bytes: &[u8]) -> Result<()> {
@@ -70,11 +95,18 @@ pub fn read_request(mut from: impl Read) -> Result<Vec<u8>> {
 
 /// Send a decoded image back to the viewer.
 pub fn write_image(mut to: impl Write, image: &RawImage) -> Result<()> {
+    if image.profile.len() > MAX_PROFILE {
+        bail!("the profile is {} bytes, past the {MAX_PROFILE} this build will carry", image.profile.len());
+    }
+
     to.write_all(&MAGIC)?;
     to.write_all(&VERSION.to_le_bytes())?;
     to.write_all(&[TAG_IMAGE])?;
     to.write_all(&image.width.to_le_bytes())?;
     to.write_all(&image.height.to_le_bytes())?;
+    to.write_all(&[image.orientation])?;
+    to.write_all(&(image.profile.len() as u64).to_le_bytes())?;
+    to.write_all(&image.profile)?;
     to.write_all(&(image.pixels.len() as u64).to_le_bytes())?;
     to.write_all(&image.pixels)?;
     to.flush()?;
@@ -114,6 +146,20 @@ pub fn read_reply(mut from: impl Read) -> Result<Result<RawImage, String>> {
         TAG_IMAGE => {
             let width = read_u32(&mut from)?;
             let height = read_u32(&mut from)?;
+
+            let mut orientation = [0u8; 1];
+            from.read_exact(&mut orientation)?;
+            // Out-of-range values appear in real files; upright is the safe
+            // reading, and the same one `Orientation::from_exif` takes.
+            let orientation = orientation[0];
+
+            let profile_length = read_u64(&mut from)? as usize;
+            if profile_length > MAX_PROFILE {
+                bail!("the decoder returned a {profile_length}-byte profile, past the {MAX_PROFILE} limit");
+            }
+            let mut profile = vec![0u8; profile_length];
+            from.read_exact(&mut profile)?;
+
             let length = read_u64(&mut from)? as usize;
 
             let expected = (width as usize)
@@ -129,7 +175,13 @@ pub fn read_reply(mut from: impl Read) -> Result<Result<RawImage, String>> {
 
             let mut pixels = vec![0u8; length];
             from.read_exact(&mut pixels)?;
-            Ok(Ok(RawImage { width, height, pixels }))
+            Ok(Ok(RawImage {
+                width,
+                height,
+                pixels,
+                orientation,
+                profile,
+            }))
         }
         TAG_FAILURE => {
             let length = read_u64(&mut from)? as usize;
@@ -195,6 +247,8 @@ mod tests {
             width: 2,
             height: 1,
             pixels: vec![1, 2, 3, 4, 5, 6, 7, 8],
+            orientation: 1,
+            profile: Vec::new(),
         };
 
         let mut wire = Vec::new();
@@ -215,6 +269,85 @@ mod tests {
             panic!("the failure did not survive the round trip");
         };
         assert_eq!(message, "the JPEG data is malformed");
+    }
+
+    /// What the decoder learned about the file has to cross with the pixels.
+    /// Reading it in the parent instead loses it for AVIF, whose colour
+    /// description lives in the bitstream where only the decoder sees it.
+    #[test]
+    fn the_orientation_and_profile_cross_with_the_pixels() {
+        let profile = moxcms::ColorProfile::new_srgb().encode().expect("encoding a profile");
+        let image = RawImage {
+            width: 2,
+            height: 2,
+            pixels: vec![7; 16],
+            // A quarter turn, as EXIF numbers it.
+            orientation: 6,
+            profile: profile.clone(),
+        };
+
+        let mut wire = Vec::new();
+        write_image(&mut wire, &image).unwrap();
+
+        let Ok(Ok(decoded)) = read_reply(&wire[..]) else {
+            panic!("the image did not survive the round trip");
+        };
+        assert_eq!(decoded.orientation, 6);
+        assert_eq!(decoded.profile, profile);
+        assert_eq!(decoded.pixels, vec![7; 16]);
+    }
+
+    /// An untagged image says so by sending no profile at all, which must not
+    /// be confused with a profile of length zero being lost somewhere.
+    #[test]
+    fn an_untagged_image_crosses_without_a_profile() {
+        let image = RawImage {
+            width: 1,
+            height: 1,
+            pixels: vec![0; 4],
+            orientation: 1,
+            profile: Vec::new(),
+        };
+
+        let mut wire = Vec::new();
+        write_image(&mut wire, &image).unwrap();
+
+        let Ok(Ok(decoded)) = read_reply(&wire[..]) else {
+            panic!("the image did not survive the round trip");
+        };
+        assert!(decoded.profile.is_empty());
+    }
+
+    /// The profile arrives from the process that read the hostile file, so its
+    /// length is checked like every other number it sends.
+    #[test]
+    fn an_absurd_profile_length_is_refused_rather_than_allocated_for() {
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&MAGIC);
+        wire.extend_from_slice(&VERSION.to_le_bytes());
+        wire.push(TAG_IMAGE);
+        wire.extend_from_slice(&1u32.to_le_bytes());
+        wire.extend_from_slice(&1u32.to_le_bytes());
+        wire.push(1);
+        // A profile larger than any real one, and larger than the cap.
+        wire.extend_from_slice(&(u64::MAX / 2).to_le_bytes());
+
+        assert!(read_reply(&wire[..]).is_err());
+    }
+
+    /// And the writer refuses to send one, so a decoder cannot push the
+    /// viewer past the cap from its side either.
+    #[test]
+    fn writing_an_oversized_profile_is_refused() {
+        let image = RawImage {
+            width: 1,
+            height: 1,
+            pixels: vec![0; 4],
+            orientation: 1,
+            profile: vec![0; MAX_PROFILE + 1],
+        };
+
+        assert!(write_image(Vec::new(), &image).is_err());
     }
 
     /// The decoder is the process holding the hostile file, so what it says
@@ -283,6 +416,8 @@ mod tests {
             width: 4,
             height: 4,
             pixels: vec![0; 64],
+            orientation: 1,
+            profile: Vec::new(),
         };
         let mut wire = Vec::new();
         write_image(&mut wire, &image).unwrap();

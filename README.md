@@ -123,12 +123,22 @@ display's gamut rather than folded into sRGB. 10- and 12-bit AVIF are refused
 for now rather than shown narrowed to eight bits; they arrive with HDR. See
 [ADR 0008](docs/adr/0008-avif-decodes-with-rav1d.md).
 
-Both formats the sandbox was built for now decode in Rust, so the boundary
-stands unused — built, tested, and one word away from holding a decoder if that
-ever changes. It is a child process created suspended, stripped of every
-privilege, dropped to low integrity, and held in a job object that caps its
-memory and kills it with the viewer; it is handed a file's bytes on a pipe and
-never its path.
+HEIC and AVIF decode in a **separate process** — not because they are unsafe
+any more, but because a process can be stopped and a thread cannot. Navigate
+away from a large image and the decode is abandoned rather than finished for
+nobody; hand the viewer a file that wedges a decoder and the child is killed on
+a timeout rather than taking a worker with it. The child is created suspended,
+stripped of every privilege, dropped to low integrity, and held in a job object
+that caps its memory and kills it with the viewer; it is handed the file's
+bytes on a pipe and never its path. See
+[ADR 0009](docs/adr/0009-heavy-decodes-run-in-a-child.md).
+
+One thing that boundary does **not** do is close the network, and this is
+measured rather than assumed: a decoder taught to try reaches the internet from
+inside it. A low integrity token does not close a socket, whatever the common
+belief. Nothing behind the boundary opens one — every decoder is Rust and none
+has any use for a socket — but closing it properly needs an AppContainer, and
+that has its own version ahead.
 
 SVG is drawn for the size it is shown at, and drawn again when that changes, so
 zooming in sharpens the picture instead of enlarging pixels. A document that
@@ -139,9 +149,9 @@ has no size limit to hide behind.
 
 ## Status
 
-Early development — v0.8.0 is out. Startup, colour and format coverage hold:
-every modern still format opens, a phone's photographs included. HDR is still
-ahead. Development runs in small versions, each
+Early development — v0.9.0 is out. Startup, colour and format coverage hold:
+every modern still format opens, a phone's photographs included, and a slow
+decode no longer holds the viewer up. HDR is still ahead. Development runs in small versions, each
 one theme; the road to 1.0 is fixed:
 
 | Version | What lands |
@@ -156,14 +166,15 @@ one theme; the road to 1.0 is fixed:
 | ✅ v0.6.0 | Sandboxed decoder process |
 | ✅ v0.7.0 | HEIC, decoded in Rust |
 | ✅ v0.8.0 | AVIF, decoded with `rav1d` |
-| v0.9.0 | Background decode — no format can block the UI |
+| ✅ v0.9.0 | Decodes that can be stopped: cancelled on navigation, killed on a timeout |
 | v0.10.0 | HEIC's remaining debts: a quick first frame, and colour on the GPU |
-| v0.11.0 | Animation: GIF, WebP, APNG |
-| v0.12.0 | HDR output on Windows (`Bt2100Pq` on `Rgb10a2Unorm`) |
-| v0.13.0 | Gigapixel images via tiled rendering |
-| v0.14.0 – v0.33.0 | The everyday viewer: single instance, toolbar, EXIF panel, clipboard, file operations, culling, comparison, settings |
-| v0.34.0 – v0.37.0 | Windows integration: context menu, installer, auto-update, thumbnails |
-| v0.38.0 – v0.39.0 | Documentation site, stabilisation |
+| v0.11.0 | Format tails, and the network closed to the decoder |
+| v0.12.0 | Animation: GIF, WebP, APNG |
+| v0.13.0 | HDR output on Windows (`Bt2100Pq` on `Rgb10a2Unorm`) |
+| v0.14.0 | Gigapixel images via tiled rendering |
+| v0.15.0 – v0.34.0 | The everyday viewer: single instance, toolbar, EXIF panel, clipboard, file operations, culling, comparison, settings |
+| v0.35.0 – v0.38.0 | Windows integration: context menu, installer, auto-update, thumbnails |
+| v0.39.0 – v0.40.0 | Documentation site, stabilisation |
 | v1.0.0 | Public release — the default viewer, nothing missing |
 
 Beyond 1.0: **2.x** makes a separate screenshot tool unnecessary — capture a
@@ -240,7 +251,7 @@ Two decisions shape everything else:
 
 **nitid owns its swapchain.** HDR output on Windows is only reachable through `Bt2100Pq` on the `Rgb10a2Unorm` format — DirectX 12 has no extended-sRGB swapchain color space. A GUI framework that configures the surface for you closes that door, so the window and renderer are ours; `egui` is used for widgets only.
 
-**Untrusted input is isolated.** An image decoder parses hostile data by definition — pictures arrive from the internet. Every decoder nitid ships is Rust, so a malformed file causes a panic or an error rather than code execution — including the two formats that were the reason for a sandbox in the first place. That sandbox is built and stands ready: a separate low-integrity process where a crash means "could not open this file", not a compromised viewer.
+**Untrusted input is isolated, and slow input is interruptible.** An image decoder parses hostile data by definition — pictures arrive from the internet. Every decoder nitid ships is Rust, so a malformed file causes a panic or an error rather than code execution. The separate low-integrity process that was built for memory safety earns its keep for a different reason: a thread cannot be stopped and a process can, so a decode is abandoned when you navigate away and killed when it wedges.
 
 Architecture decisions are recorded in [`docs/adr/`](docs/adr/).
 

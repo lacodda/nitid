@@ -16,15 +16,48 @@ fn decoder() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_nitid"))
 }
 
-/// Point the sandbox at the binary cargo just built.
+/// Serialises the tests in this file.
 ///
-/// Without this the child would be the test harness, which does not answer the
-/// protocol — and every assertion below would pass for the wrong reason.
+/// They configure the sandbox through environment variables, which belong to
+/// the process rather than to a test. Left to run in parallel, one test's
+/// "hang on purpose" reaches another's decode — which is exactly what happened
+/// when this file first grew a timeout test.
+static ENVIRONMENT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Point the sandbox at the binary cargo just built, and hold the environment
+/// for the duration.
+///
+/// Without the first the child would be the test harness, which does not
+/// answer the protocol — and every assertion below would pass for the wrong
+/// reason. Without the second the variables would race.
 fn with_decoder<T>(body: impl FnOnce() -> T) -> T {
-    // SAFETY: the tests in this file run in one process; the variable is set
-    // once at the start of each and read by the spawn that follows.
-    unsafe { std::env::set_var("NITID_DECODER", decoder()) };
-    body()
+    with_environment(&[], body)
+}
+
+/// The same, with extra variables set for this test only and removed after.
+fn with_environment<T>(variables: &[(&str, &str)], body: impl FnOnce() -> T) -> T {
+    // A poisoned lock means another test panicked while holding it; the
+    // variables are set afresh below either way, so the guard is taken back.
+    let _guard = ENVIRONMENT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    // SAFETY: the lock above makes this the only test touching the environment.
+    unsafe {
+        std::env::set_var("NITID_DECODER", decoder());
+        for (name, value) in variables {
+            std::env::set_var(name, value);
+        }
+    }
+
+    let outcome = body();
+
+    // SAFETY: still under the lock, and only what this call set is removed.
+    unsafe {
+        for (name, _) in variables {
+            std::env::remove_var(name);
+        }
+    }
+
+    outcome
 }
 
 /// A PNG, encoded here so the test ships no binary fixture.
@@ -43,9 +76,9 @@ fn png(width: u32, height: u32) -> Vec<u8> {
 fn a_file_decodes_in_the_sandboxed_process() {
     let decoded = with_decoder(|| nitid::testing::decode_sandboxed(&png(7, 5))).expect("the sandboxed decode should succeed");
 
-    assert_eq!((decoded.width, decoded.height), (7, 5));
-    assert_eq!(decoded.pixels.len(), 7 * 5 * 4);
-    for pixel in decoded.pixels.chunks_exact(4) {
+    assert_eq!((decoded.image.width, decoded.image.height), (7, 5));
+    assert_eq!(decoded.image.pixels.len(), 7 * 5 * 4);
+    for pixel in decoded.image.pixels.chunks_exact(4) {
         assert_eq!(pixel, [10, 200, 90, 255], "the pixels did not survive the crossing");
     }
 }
@@ -56,9 +89,9 @@ fn a_file_decodes_in_the_sandboxed_process() {
 fn a_large_image_crosses_the_pipe_whole() {
     let decoded = with_decoder(|| nitid::testing::decode_sandboxed(&png(800, 600))).expect("a large sandboxed decode should succeed");
 
-    assert_eq!((decoded.width, decoded.height), (800, 600));
-    assert_eq!(decoded.pixels.len(), 800 * 600 * 4);
-    assert!(decoded.pixels.chunks_exact(4).all(|pixel| pixel == [10, 200, 90, 255]));
+    assert_eq!((decoded.image.width, decoded.image.height), (800, 600));
+    assert_eq!(decoded.image.pixels.len(), 800 * 600 * 4);
+    assert!(decoded.image.pixels.chunks_exact(4).all(|pixel| pixel == [10, 200, 90, 255]));
 }
 
 /// The reason the boundary exists: a file that defeats the decoder comes back
@@ -103,12 +136,48 @@ fn corrupted_files_never_take_the_viewer_down() {
 
 /// Several decodes in a row: each child is created and reaped cleanly, so
 /// nothing accumulates. A leaked process or handle would show up here first.
+/// A decoder that never answers must be given up on, not waited for.
+///
+/// This is the reason the decode moved into a child process at all: work in
+/// this process runs to completion whatever it does, and only a separate one
+/// can be killed. The child here really does hang — parked for ever on
+/// request — so what is exercised is the code that kills it, rather than a
+/// stand-in for that code.
+#[test]
+fn a_decoder_that_hangs_is_killed_rather_than_waited_for() {
+    let started = std::time::Instant::now();
+    let result = with_environment(&[("NITID_DECODER_HANGS", "1"), ("NITID_DECODE_TIMEOUT_MS", "1500")], || {
+        nitid::testing::decode_sandboxed(&png(4, 4))
+    });
+    let waited = started.elapsed();
+
+    assert!(result.is_err(), "a decoder that never answered was reported as a successful decode");
+
+    // Generous against the 1.5 second timeout — a loaded machine may be slow
+    // to start the child — but far below the thirty seconds the real timeout
+    // allows, so a broken timeout cannot pass this.
+    assert!(
+        waited < std::time::Duration::from_secs(15),
+        "the viewer waited {waited:?} on a decoder that never answered"
+    );
+}
+
+/// The timeout must not fire on a decode that is merely working: an image
+/// large enough to take a moment still has to come back whole.
+#[test]
+fn a_slow_but_working_decode_is_not_cut_short() {
+    let decoded =
+        with_environment(&[("NITID_DECODE_TIMEOUT_MS", "20000")], || nitid::testing::decode_sandboxed(&png(800, 600))).expect("a working decode was cut short");
+
+    assert_eq!((decoded.image.width, decoded.image.height), (800, 600));
+}
+
 #[test]
 fn repeated_decodes_do_not_accumulate_processes() {
     with_decoder(|| {
         for _ in 0..8 {
             let decoded = nitid::testing::decode_sandboxed(&png(16, 16)).expect("each decode should succeed");
-            assert_eq!(decoded.pixels.len(), 16 * 16 * 4);
+            assert_eq!(decoded.image.pixels.len(), 16 * 16 * 4);
         }
     });
 }

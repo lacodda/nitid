@@ -1,18 +1,23 @@
 # 0002 — C-backed decoders run in a sandboxed process
 
 Date: 2026-08-09
-Status: accepted, superseded in practice by [ADR 0007](0007-heic-decodes-in-rust.md) and [ADR 0008](0008-avif-decodes-with-rav1d.md)
+Status: accepted; its premise superseded by [ADR 0007](0007-heic-decodes-in-rust.md) and [ADR 0008](0008-avif-decodes-with-rav1d.md), its machinery kept for a different reason by [ADR 0009](0009-heavy-decodes-run-in-a-child.md)
 
 > **Narrowed 2026-08-19, twice in one day.** The premise below — that HEIC and
 > AVIF have no viable Rust decoder — stopped holding for both. `heif-oxide`
 > decodes HEIC (ADR 0007) and `rav1d` decodes AVIF (ADR 0008), so v0.7.0 and
 > v0.8.0 open them in-process and this boundary holds nothing.
 >
-> The machinery below is built, tested and kept: `Format::needs_sandbox` is one
-> word away from putting a decoder behind it, and the reasoning here is what
-> would justify doing so. The two open questions it left — closing the network
-> to the decoder, and what to do about a decoder that hangs — belong to the
-> stage that gives the boundary a job.
+> The machinery below is built, tested and now used — for a reason this ADR did
+> not anticipate. A decode on a worker thread cannot be stopped; one in a child
+> process can be killed on a timeout or abandoned when the user navigates away.
+> That is what v0.9.0 uses it for (ADR 0009), and it applies to decoders that
+> are merely slow rather than unsafe.
+>
+> Of the two questions this ADR left open, the hanging decoder is answered and
+> tested. The network is not: it is now *measured* rather than suspected — a
+> decoder taught to try reached the internet from inside the boundary — and
+> closing it needs an AppContainer, which has its own version ahead.
 
 ## Context
 

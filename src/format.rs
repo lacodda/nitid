@@ -151,16 +151,21 @@ impl Format {
         matches!(self, Format::JpegXl | Format::Heic)
     }
 
-    /// Whether this format's decoder must run in a sandboxed process.
+    /// Whether this format's decoder runs in a separate process.
     ///
-    /// True for formats decoded by a C library, where a malformed file is a
-    /// memory-safety bug rather than a panic — see
-    /// `docs/adr/0002-sandbox-c-decoders.md`. Nothing answers true yet: every
-    /// decoder in this build is pure Rust, and HEIC and AVIF arrive in v0.7.0.
-    /// The boundary is built first so that adding them is adding a decoder,
-    /// not adding a decoder and an architecture at once.
+    /// Not about memory safety any more: every decoder in this build is Rust,
+    /// including the two the boundary was originally built for (ADR 0007,
+    /// ADR 0008). What the separate process buys now is the ability to *stop*
+    /// — a decode in this process runs to completion whatever happens, while
+    /// one in a child can be killed on a timeout or abandoned when the user
+    /// navigates away. See `docs/adr/0009-heavy-decodes-run-in-a-child.md`.
+    ///
+    /// True for the two formats whose decoders are large, complex, and slow
+    /// enough that a crafted file could keep one busy for a long time. The
+    /// cheap decoders stay in-process, where they cost less than the round
+    /// trip would.
     pub fn needs_sandbox(self) -> bool {
-        false
+        matches!(self, Format::Heic | Format::Avif)
     }
 
     /// Whether the file describes shapes rather than a grid of pixels.

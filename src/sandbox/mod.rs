@@ -14,6 +14,12 @@
 //! The file crosses as bytes on stdin and comes back as pixels on stdout: the
 //! child is never told a path, so a compromised decoder cannot ask for a
 //! different file than the one the user opened.
+//!
+//! What comes back is the whole of what the decoder learned — pixels, the
+//! orientation to apply, and the colour profile if there is one. Reading the
+//! last two in the parent would work for formats that state them in the
+//! container and quietly lose them for AVIF, where the colour description
+//! lives in the bitstream and only the decoder ever sees it.
 
 // The protocol is written and tested everywhere, but only the Windows build
 // has a process on the other end of it: elsewhere `decode` runs in-process, so
@@ -29,7 +35,7 @@ use std::io::{self, Read, Write};
 
 use anyhow::{Context, Result};
 
-use crate::image_source::DecodedImage;
+use crate::image_source::LoadedImage;
 
 /// The argument that turns this executable into a decoder.
 ///
@@ -45,14 +51,29 @@ pub const DECODE_ARGUMENT: &str = "--decode-stdin";
 #[cfg(windows)]
 const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// The timeout, or a shorter one asked for through the environment.
+///
+/// Overridable so the timeout can be tested against a decoder that really
+/// hangs, in a second rather than in thirty. Without this the code that kills
+/// a wedged decoder would ship unexercised — which is the state it was in
+/// from v0.6.0 until now.
+#[cfg(windows)]
+fn timeout() -> std::time::Duration {
+    std::env::var("NITID_DECODE_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(TIMEOUT)
+}
+
 /// Decode `bytes` in a sandboxed child process.
 ///
 /// A crash, a hang, or a refusal in the child all come back as an ordinary
 /// error: the viewer says the file would not open and stays alive, which is
 /// the entire point of the boundary.
 #[cfg(windows)]
-pub fn decode(bytes: &[u8]) -> Result<DecodedImage> {
-    windows::decode(bytes, TIMEOUT)
+pub fn decode(bytes: &[u8]) -> Result<LoadedImage> {
+    windows::decode(bytes, timeout())
 }
 
 /// Off Windows there is no sandbox yet, so the decode happens in-process.
@@ -60,7 +81,7 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedImage> {
 /// nitid ships for Windows; this keeps the Linux CI build honest rather than
 /// pretending to a confinement it does not have.
 #[cfg(not(windows))]
-pub fn decode(bytes: &[u8]) -> Result<DecodedImage> {
+pub fn decode(bytes: &[u8]) -> Result<LoadedImage> {
     decode_in_this_process(bytes)
 }
 
@@ -94,18 +115,33 @@ pub fn run_as_decoder() -> Result<()> {
     let mut input = Vec::new();
     io::stdin().read_to_end(&mut input).context("reading the request")?;
 
+    // A decoder that never answers, on request. This exists so the timeout can
+    // be tested against a real wedged child rather than a stand-in: the code
+    // that kills one is exactly the code that must not be assumed to work.
+    // Nothing in normal use sets this.
+    if std::env::var_os("NITID_DECODER_HANGS").is_some() {
+        loop {
+            std::thread::park();
+        }
+    }
+
     let request = protocol::read_request(&input[..]).context("reading the request")?;
 
     let stdout = io::stdout();
     let mut out = stdout.lock();
 
     match decode_in_this_process(&request) {
-        Ok(image) => protocol::write_image(
+        Ok(loaded) => protocol::write_image(
             &mut out,
             &protocol::RawImage {
-                width: image.width,
-                height: image.height,
-                pixels: image.pixels,
+                width: loaded.image.width,
+                height: loaded.image.height,
+                pixels: loaded.image.pixels,
+                orientation: loaded.orientation.to_exif(),
+                // A profile that will not re-encode is sent as none rather
+                // than failing the decode: the picture is worth more than the
+                // colour management on it.
+                profile: loaded.profile.and_then(|profile| profile.encode().ok()).unwrap_or_default(),
             },
         ),
         Err(error) => protocol::write_failure(&mut out, &format!("{error:#}")),
@@ -120,6 +156,6 @@ pub fn run_as_decoder() -> Result<()> {
 ///
 /// In the child that is the point; in the viewer it is the fallback for
 /// platforms without a sandbox.
-fn decode_in_this_process(bytes: &[u8]) -> Result<DecodedImage> {
-    crate::image_source::decode_here(bytes).map(|loaded| loaded.image)
+fn decode_in_this_process(bytes: &[u8]) -> Result<LoadedImage> {
+    crate::image_source::decode_here(bytes)
 }

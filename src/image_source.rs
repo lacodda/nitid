@@ -7,7 +7,6 @@
 //! (ADR 0008). The boundary stands unused, and `Format::needs_sandbox` is
 //! still the one word that would put a decoder behind it.
 
-use std::fs;
 use std::io::Cursor;
 use std::path::Path;
 
@@ -61,7 +60,7 @@ pub enum Orientation {
 }
 
 impl Orientation {
-    fn from_exif(value: u16) -> Self {
+    pub fn from_exif(value: u16) -> Self {
         match value {
             2 => Self::FlipHorizontal,
             3 => Self::Rotate180,
@@ -71,6 +70,24 @@ impl Orientation {
             7 => Self::Transverse,
             8 => Self::Rotate270,
             _ => Self::Normal,
+        }
+    }
+
+    /// The EXIF number for this orientation.
+    ///
+    /// The inverse of `from_exif`, for the decoder process: the orientation
+    /// crosses the boundary as the number every format already speaks rather
+    /// than as a private encoding the two halves would have to agree on.
+    pub fn to_exif(self) -> u8 {
+        match self {
+            Self::Normal => 1,
+            Self::FlipHorizontal => 2,
+            Self::Rotate180 => 3,
+            Self::FlipVertical => 4,
+            Self::Transpose => 5,
+            Self::Rotate90 => 6,
+            Self::Transverse => 7,
+            Self::Rotate270 => 8,
         }
     }
 
@@ -129,12 +146,6 @@ pub fn is_supported(path: &Path) -> bool {
         .is_some_and(|ext| supported_extensions().contains(&ext.as_str()))
 }
 
-/// Read a file from disk and decode it.
-pub fn load(path: &Path) -> Result<LoadedImage> {
-    let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    decode(&bytes).with_context(|| format!("decoding {}", path.display()))
-}
-
 /// Decode an image already in memory.
 ///
 /// The format is detected from the content rather than the extension: a `.png`
@@ -172,18 +183,11 @@ fn decode_with(bytes: &[u8], confinement: Confinement) -> Result<LoadedImage> {
     // The pixels come back over a pipe; everything else about the file — its
     // profile, its orientation — is read here, in Rust, from the same bytes.
     if format.needs_sandbox() && confinement == Confinement::Sandboxed {
-        let image = crate::sandbox::decode(bytes).with_context(|| format!("decoding the {}", format.name()))?;
-        return Ok(LoadedImage {
-            image,
-            orientation: if format.orients_itself() {
-                Orientation::Normal
-            } else {
-                read_orientation(bytes)
-            },
-            fidelity: Fidelity::Full,
-            profile: color::profile_from(bytes),
-            vector: None,
-        });
+        // Everything the file says about itself comes back with the pixels.
+        // Reading the profile and the orientation again here would work for a
+        // format that states them in its container, and lose them for one
+        // that states them in the bitstream — which is the case for AVIF.
+        return crate::sandbox::decode(bytes).with_context(|| format!("decoding the {}", format.name()));
     }
 
     let malformed = || format!("the {} data is malformed", format.name());
