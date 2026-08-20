@@ -18,6 +18,7 @@ pub enum Format {
     WebP,
     JpegXl,
     Heic,
+    Avif,
     Svg,
     Gif,
     Bmp,
@@ -35,6 +36,7 @@ impl Format {
         Format::WebP,
         Format::JpegXl,
         Format::Heic,
+        Format::Avif,
         Format::Svg,
         Format::Gif,
         Format::Bmp,
@@ -63,8 +65,11 @@ impl Format {
         if bytes.starts_with(&[0xFF, 0x0A]) || bytes.starts_with(&[0x00, 0x00, 0x00, 0x0C, b'J', b'X', b'L', 0x20, 0x0D, 0x0A, 0x87, 0x0A]) {
             return Some(Format::JpegXl);
         }
-        if is_heic(bytes) {
-            return Some(Format::Heic);
+        // HEIC and AVIF share the ISOBMFF container and are told apart only by
+        // the brands inside it, so one function reads the box and both answers
+        // come out of it.
+        if let Some(format) = isobmff_format(bytes) {
+            return Some(format);
         }
         if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
             return Some(Format::Gif);
@@ -97,6 +102,7 @@ impl Format {
             Format::WebP => &["webp"],
             Format::JpegXl => &["jxl"],
             Format::Heic => &["heic", "heif", "hif"],
+            Format::Avif => &["avif"],
             Format::Svg => &["svg"],
             Format::Gif => &["gif"],
             Format::Bmp => &["bmp"],
@@ -112,6 +118,7 @@ impl Format {
             Format::WebP => "WebP",
             Format::JpegXl => "JPEG XL",
             Format::Heic => "HEIC",
+            Format::Avif => "AVIF",
             Format::Svg => "SVG",
             Format::Gif => "GIF",
             Format::Bmp => "BMP",
@@ -135,6 +142,11 @@ impl Format {
     /// EXIF orientation into exactly those properties. Both descriptions are
     /// therefore present in the same file, and honouring both turns a portrait
     /// photograph on its side.
+    /// AVIF is deliberately absent: it carries the same `irot`/`imir` in the
+    /// same kind of container, but nothing applies them on the way out — the
+    /// decoder here returns the AV1 frame as coded, and `image_source` turns
+    /// it. So AVIF answers false and the container's rotation is honoured
+    /// once, by the viewer.
     pub fn orients_itself(self) -> bool {
         matches!(self, Format::JpegXl | Format::Heic)
     }
@@ -162,21 +174,26 @@ impl Format {
     }
 }
 
-/// Whether the file is a HEIC, judged by the brands in its `ftyp` box.
+/// Which still-image format an ISOBMFF file holds, judged by the brands in its
+/// `ftyp` box.
 ///
-/// HEIC shares its ISOBMFF container with AVIF and with video: `.mp4`, `.mov`
-/// and `.avif` all begin the same way, and only the brands distinguish them.
-/// So the brands are read rather than the box type — matching `ftyp` alone
-/// would claim every video file on the machine.
-fn is_heic(bytes: &[u8]) -> bool {
-    /// Brands naming a still image coded with HEVC. `mif1`/`msf1` are the
-    /// generic HEIF brands, which a HEIC also carries; AVIF files declare
-    /// `avif`/`avis` instead and are left to the decoder that will open them.
-    const BRANDS: [&[u8; 4]; 6] = [b"heic", b"heix", b"heim", b"heis", b"hevc", b"hevx"];
+/// HEIC, AVIF and video all share this container: `.mp4`, `.mov`, `.heic` and
+/// `.avif` begin the same way, and only the brands tell them apart. So the
+/// brands are read rather than the box type — matching `ftyp` alone would
+/// claim every video file on the machine.
+///
+/// Returns `None` for a container this build does not decode, which includes
+/// every video and any HEIF variant coded with something other than HEVC or
+/// AV1.
+fn isobmff_format(bytes: &[u8]) -> Option<Format> {
+    /// Brands naming a still image coded with HEVC.
+    const HEVC: [&[u8; 4]; 6] = [b"heic", b"heix", b"heim", b"heis", b"hevc", b"hevx"];
+    /// Brands naming a still image, or a sequence of them, coded with AV1.
+    const AV1: [&[u8; 4]; 2] = [b"avif", b"avis"];
 
     // Box length, then the type: `....ftyp`.
     if bytes.len() < 12 || &bytes[4..8] != b"ftyp" {
-        return false;
+        return None;
     }
 
     let length = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
@@ -184,18 +201,39 @@ fn is_heic(bytes: &[u8]) -> bool {
     // A malformed length must not read past the buffer, so the box is clamped
     // to what is actually there.
     let end = length.min(bytes.len());
-    let Some(box_bytes) = bytes.get(8..end) else {
-        return false;
-    };
+    let box_bytes = bytes.get(8..end)?;
 
     // The major brand and every compatible brand are four bytes each; the
     // minor version between them is four bytes too, so reading the lot as
     // four-byte words and skipping the version is the whole parse.
-    box_bytes
+    //
+    // A file may carry both families of brand — `mif1` is generic and appears
+    // in each — so the major brand is asked first and the compatible list only
+    // decides when the major brand says nothing either way.
+    let brands: Vec<&[u8]> = box_bytes
         .chunks_exact(4)
         .enumerate()
         .filter(|(index, _)| *index != 1)
-        .any(|(_, brand)| BRANDS.iter().any(|known| *brand == **known))
+        .map(|(_, brand)| brand)
+        .collect();
+
+    let names = |known: &[&[u8; 4]]| brands.iter().any(|brand| known.iter().any(|candidate| *brand == *candidate));
+
+    // The major brand is the file's own statement about what it is; a
+    // compatible brand only says what it can also be read as.
+    match brands.first() {
+        Some(major) if HEVC.iter().any(|known| *major == *known) => return Some(Format::Heic),
+        Some(major) if AV1.iter().any(|known| *major == *known) => return Some(Format::Avif),
+        _ => {}
+    }
+
+    if names(&AV1) {
+        Some(Format::Avif)
+    } else if names(&HEVC) {
+        Some(Format::Heic)
+    } else {
+        None
+    }
 }
 
 /// Whether the start of the file reads as an SVG document.
@@ -268,15 +306,32 @@ mod tests {
         assert_eq!(Format::detect(&ftyp(b"heix", &[])), Some(Format::Heic));
     }
 
-    /// Everything else in an ISOBMFF box looks the same from the outside, and
-    /// claiming a video or an AVIF would be worse than refusing both.
+    /// AVIF shares the container with HEIC and is told apart by brand alone.
+    #[test]
+    fn detects_avif_by_its_brands() {
+        assert_eq!(Format::detect(&ftyp(b"avif", &[b"mif1", b"miaf"])), Some(Format::Avif));
+        assert_eq!(Format::detect(&ftyp(b"mif1", &[b"avif"])), Some(Format::Avif));
+        // An AV1 image sequence is still an AVIF; the first frame is shown.
+        assert_eq!(Format::detect(&ftyp(b"avis", &[b"avif"])), Some(Format::Avif));
+    }
+
+    /// A file may list brands from both families — `mif1` is generic and
+    /// appears in each. The major brand is the file's own statement about
+    /// what it is, so it decides.
+    #[test]
+    fn the_major_brand_decides_when_a_file_claims_both() {
+        assert_eq!(Format::detect(&ftyp(b"avif", &[b"mif1", b"heic"])), Some(Format::Avif));
+        assert_eq!(Format::detect(&ftyp(b"heic", &[b"mif1", b"avif"])), Some(Format::Heic));
+    }
+
+    /// Video shares this container too, and claiming a `.mp4` as an image
+    /// would put nitid in front of every film on the machine.
     #[test]
     fn does_not_claim_the_rest_of_the_isobmff_family() {
-        assert_eq!(Format::detect(&ftyp(b"avif", &[b"mif1", b"miaf"])), None);
         assert_eq!(Format::detect(&ftyp(b"isom", &[b"mp42", b"avc1"])), None);
         assert_eq!(Format::detect(&ftyp(b"qt  ", &[])), None);
-        // A generic HEIF brand with nothing coded as HEVC alongside it is not
-        // something this build can decode.
+        // A generic HEIF brand with nothing coded as HEVC or AV1 alongside it
+        // is not something this build can decode.
         assert_eq!(Format::detect(&ftyp(b"mif1", &[b"miaf"])), None);
     }
 

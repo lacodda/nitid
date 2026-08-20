@@ -1,10 +1,11 @@
 //! Decoding an image file into pixels the renderer can upload.
 //!
 //! Every decoder in this module is pure Rust: a malformed file costs a panic or
-//! an error, never code execution. That now includes HEIC, which turned out to
-//! have a Rust decoder and so never reached the sandbox built for it — see
-//! `docs/adr/0007-heic-decodes-in-rust.md`. AVIF still has no such decoder and
-//! is the format the sandbox of `docs/adr/0002-sandbox-c-decoders.md` awaits.
+//! an error, never code execution. That includes the two formats the sandbox
+//! of `docs/adr/0002-sandbox-c-decoders.md` was built for — HEIC decodes in
+//! Rust (ADR 0007) and AVIF decodes through `rav1d`, dav1d translated to Rust
+//! (ADR 0008). The boundary stands unused, and `Format::needs_sandbox` is
+//! still the one word that would put a decoder behind it.
 
 use std::fs;
 use std::io::Cursor;
@@ -208,8 +209,21 @@ fn decode_with(bytes: &[u8], confinement: Confinement) -> Result<LoadedImage> {
     // JPEG XL comes back with its profile attached: one pass over the file
     // yields both, where reading the profile separately — as the other formats
     // do — would mean decoding the image twice.
+    // AVIF states its rotation in the container rather than in EXIF, and the
+    // decoder reads it while walking the boxes; it overrides the EXIF tag
+    // below because a file carrying both means the same turn twice.
+    let mut avif_orientation = None;
+
     let (image, profile) = match format {
         Format::JpegXl => decode_jxl(bytes).with_context(malformed)?,
+        // AVIF states its colour inside the AV1 bitstream, which the decoder
+        // reads on the way past; asking a second parser for it afterwards
+        // would mean walking the same bytes again.
+        Format::Avif => {
+            let decoded = crate::avif::decode(bytes).with_context(malformed)?;
+            avif_orientation = decoded.orientation;
+            (decoded.image, decoded.profile)
+        }
         Format::Jpeg => (decode_jpeg(bytes).with_context(malformed)?, color::profile_from(bytes)),
         Format::WebP => (decode_webp(bytes).with_context(malformed)?, color::profile_from(bytes)),
         Format::Heic => (decode_heic(bytes).with_context(malformed)?, color::profile_from(bytes)),
@@ -222,7 +236,7 @@ fn decode_with(bytes: &[u8], confinement: Confinement) -> Result<LoadedImage> {
     let orientation = if format.orients_itself() {
         Orientation::Normal
     } else {
-        read_orientation(bytes)
+        avif_orientation.unwrap_or_else(|| read_orientation(bytes))
     };
 
     Ok(LoadedImage {
@@ -442,7 +456,7 @@ fn decode_jxl(bytes: &[u8]) -> Result<(DecodedImage, Option<ColorProfile>)> {
 ///
 /// Checked rather than multiplied: the dimensions come from a file that may be
 /// lying, and a 32-bit overflow here would size the buffer far too small.
-fn pixel_count(width: u32, height: u32) -> Result<usize> {
+pub(crate) fn pixel_count(width: u32, height: u32) -> Result<usize> {
     (width as usize)
         .checked_mul(height as usize)
         .and_then(|pixels| pixels.checked_mul(4))

@@ -168,6 +168,10 @@ fn raw_profile(bytes: &[u8]) -> Option<Vec<u8>> {
         // codestream again here to answer the same question would double the
         // cost of opening the format. See `image_source::decode_jxl`.
         Format::JpegXl => None,
+        // AVIF states its colour as CICP code points inside the AV1 bitstream,
+        // and the decoder reads them in the pass that produces the pixels —
+        // the same arrangement as JPEG XL. See `avif::profile_from`.
+        Format::Avif => None,
         // HEIC carries a profile, and the pixels do not need it: the decoder
         // converts them to sRGB on the way out and the file's own primaries
         // are gone by the time they arrive here. Attaching the profile anyway

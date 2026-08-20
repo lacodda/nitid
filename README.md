@@ -72,6 +72,17 @@ profile costs a redraw rather than a reload.
 When the image and the display already agree, no conversion happens at all and
 the hardware does the sRGB decoding for free.
 
+## Building
+
+```
+cargo build --release
+```
+
+One tool beyond cargo is required: **NASM**, which `rav1d` needs to assemble
+the AV1 decoder's kernels — without it the build fails rather than falling back
+to something slower. `winget install NASM.NASM`, `scoop install nasm`, or your
+platform's package manager.
+
 ## Formats
 
 Everything below decodes in pure Rust: a malformed file costs an error, never
@@ -84,6 +95,7 @@ code execution.
 | WebP | `.webp` | yes |
 | JPEG XL | `.jxl` | yes |
 | HEIC | `.heic` `.heif` `.hif` | converted at decode |
+| AVIF | `.avif` | yes, from the bitstream |
 | SVG | `.svg` | drawn in sRGB |
 | GIF | `.gif` | sRGB by definition |
 | BMP | `.bmp` | no |
@@ -103,13 +115,20 @@ whole decode, about a second for a 12-megapixel photograph. Both are measured,
 gated in the test suite, and on the list to fix; the reasoning is in
 [ADR 0007](docs/adr/0007-heic-decodes-in-rust.md).
 
-AVIF still needs a C library, where a malformed file is a memory-safety bug
-rather than an error, so it will not decode in this process. The boundary it
-will run behind is already built: a child process created suspended, stripped
-of every privilege, dropped to low integrity, held in a job object that caps
-its memory and kills it with the viewer. It is handed the file's bytes on a
-pipe and never its path, so a decoder that is taken over cannot ask for a
-different file. A crash there is a message on screen, not a lost viewer.
+AVIF decodes through `rav1d` — dav1d translated to Rust by the ISRG — with the
+container read separately. It gets the full colour treatment: the file's
+primaries and transfer curve are read from the bitstream and applied on the GPU
+like every other tagged format, so a Display P3 AVIF is shown across the
+display's gamut rather than folded into sRGB. 10- and 12-bit AVIF are refused
+for now rather than shown narrowed to eight bits; they arrive with HDR. See
+[ADR 0008](docs/adr/0008-avif-decodes-with-rav1d.md).
+
+Both formats the sandbox was built for now decode in Rust, so the boundary
+stands unused — built, tested, and one word away from holding a decoder if that
+ever changes. It is a child process created suspended, stripped of every
+privilege, dropped to low integrity, and held in a job object that caps its
+memory and kills it with the viewer; it is handed a file's bytes on a pipe and
+never its path.
 
 SVG is drawn for the size it is shown at, and drawn again when that changes, so
 zooming in sharpens the picture instead of enlarging pixels. A document that
@@ -120,8 +139,9 @@ has no size limit to hide behind.
 
 ## Status
 
-Early development — v0.7.0 is out. Startup, colour and format coverage hold,
-and a phone's photographs open. HDR is still ahead. Development runs in small versions, each
+Early development — v0.8.0 is out. Startup, colour and format coverage hold:
+every modern still format opens, a phone's photographs included. HDR is still
+ahead. Development runs in small versions, each
 one theme; the road to 1.0 is fixed:
 
 | Version | What lands |
@@ -135,13 +155,15 @@ one theme; the road to 1.0 is fixed:
 | ✅ v0.5.0 | SVG, redrawn at the size it is shown |
 | ✅ v0.6.0 | Sandboxed decoder process |
 | ✅ v0.7.0 | HEIC, decoded in Rust |
-| v0.8.0 | AVIF behind the sandbox; background decode — no format blocks the UI |
-| v0.9.0 | Animation: GIF, WebP, APNG |
-| v0.10.0 | HDR output on Windows (`Bt2100Pq` on `Rgb10a2Unorm`) |
-| v0.11.0 | Gigapixel images via tiled rendering |
-| v0.12.0 – v0.31.0 | The everyday viewer: single instance, toolbar, EXIF panel, clipboard, file operations, culling, comparison, settings |
-| v0.32.0 – v0.35.0 | Windows integration: context menu, installer, auto-update, thumbnails |
-| v0.36.0 – v0.37.0 | Documentation site, stabilisation |
+| ✅ v0.8.0 | AVIF, decoded with `rav1d` |
+| v0.9.0 | Background decode — no format can block the UI |
+| v0.10.0 | HEIC's remaining debts: a quick first frame, and colour on the GPU |
+| v0.11.0 | Animation: GIF, WebP, APNG |
+| v0.12.0 | HDR output on Windows (`Bt2100Pq` on `Rgb10a2Unorm`) |
+| v0.13.0 | Gigapixel images via tiled rendering |
+| v0.14.0 – v0.33.0 | The everyday viewer: single instance, toolbar, EXIF panel, clipboard, file operations, culling, comparison, settings |
+| v0.34.0 – v0.37.0 | Windows integration: context menu, installer, auto-update, thumbnails |
+| v0.38.0 – v0.39.0 | Documentation site, stabilisation |
 | v1.0.0 | Public release — the default viewer, nothing missing |
 
 Beyond 1.0: **2.x** makes a separate screenshot tool unnecessary — capture a
@@ -218,7 +240,7 @@ Two decisions shape everything else:
 
 **nitid owns its swapchain.** HDR output on Windows is only reachable through `Bt2100Pq` on the `Rgb10a2Unorm` format — DirectX 12 has no extended-sRGB swapchain color space. A GUI framework that configures the surface for you closes that door, so the window and renderer are ours; `egui` is used for widgets only.
 
-**Untrusted input is isolated.** An image decoder parses hostile data by definition — pictures arrive from the internet. Pure-Rust decoders run in-process, where a malformed file causes a panic rather than code execution, and that now covers every format nitid opens, HEIC included. AVIF exists only as a C library, so it will run in a separate low-integrity process: a crash there means "could not open this file", not a compromised viewer.
+**Untrusted input is isolated.** An image decoder parses hostile data by definition — pictures arrive from the internet. Every decoder nitid ships is Rust, so a malformed file causes a panic or an error rather than code execution — including the two formats that were the reason for a sandbox in the first place. That sandbox is built and stands ready: a separate low-integrity process where a crash means "could not open this file", not a compromised viewer.
 
 Architecture decisions are recorded in [`docs/adr/`](docs/adr/).
 

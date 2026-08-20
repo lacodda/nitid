@@ -10,6 +10,7 @@
 //! `docs/adr/0004-two-binaries-console-and-windowed.md`.
 
 mod app;
+mod avif;
 mod color;
 mod config;
 mod console;

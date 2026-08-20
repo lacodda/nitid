@@ -23,6 +23,10 @@ jobs:
           # git-cliff reads the whole history to write the changelog section.
           fetch-depth: 0
 
+      # `rav1d` assembles its own hand-written kernels and does not compile at
+      # all without NASM — not "falls back to a slower path", does not build.
+      - name: Install NASM (rav1d, for AVIF)
+        uses: ilammy/setup-nasm@v1
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 

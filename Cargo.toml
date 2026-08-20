@@ -54,6 +54,17 @@ jxl-oxide = { version = "0.12.6", features = ["moxcms"] }
 # to build at all. It delivers sRGB rather than the file's own primaries, which
 # is a real limitation and is written down in ADR 0007.
 heif-oxide = "0.1.0"
+# AVIF, in two halves: `avif-parse` reads the container, `rav1d` decodes the
+# AV1 payload. `rav1d` is dav1d translated to Rust by the ISRG, so the format
+# whose C decoders were the reason for the sandbox does not need one — see
+# `docs/adr/0008-avif-decodes-with-rav1d.md`. It is the one dependency that
+# needs a build tool: NASM, without which the crate does not compile at all.
+#
+# `avif-parse` is held at 1.x deliberately: 2.x requires Rust 1.90 and would
+# raise the MSRV promised to anyone building from source, for a container
+# parser whose API is identical across the two.
+rav1d = "1.1.0"
+avif-parse = "1.4"
 
 # Metadata
 kamadak-exif = "0.6"

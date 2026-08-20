@@ -1,12 +1,18 @@
 # 0002 — C-backed decoders run in a sandboxed process
 
 Date: 2026-08-09
-Status: accepted, narrowed by [ADR 0007](0007-heic-decodes-in-rust.md)
+Status: accepted, superseded in practice by [ADR 0007](0007-heic-decodes-in-rust.md) and [ADR 0008](0008-avif-decodes-with-rav1d.md)
 
-> **Narrowed 2026-08-19.** The premise below — that HEIC has no viable Rust
-> decoder — stopped holding: `heif-oxide` decodes it in Rust, and v0.7.0 opens
-> HEIC in-process without this boundary. Everything here still stands for AVIF,
-> which is the format the sandbox now waits for. See ADR 0007.
+> **Narrowed 2026-08-19, twice in one day.** The premise below — that HEIC and
+> AVIF have no viable Rust decoder — stopped holding for both. `heif-oxide`
+> decodes HEIC (ADR 0007) and `rav1d` decodes AVIF (ADR 0008), so v0.7.0 and
+> v0.8.0 open them in-process and this boundary holds nothing.
+>
+> The machinery below is built, tested and kept: `Format::needs_sandbox` is one
+> word away from putting a decoder behind it, and the reasoning here is what
+> would justify doing so. The two open questions it left — closing the network
+> to the decoder, and what to do about a decoder that hangs — belong to the
+> stage that gives the boundary a job.
 
 ## Context
 
