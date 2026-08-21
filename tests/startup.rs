@@ -99,7 +99,7 @@ fn a_picture_reaches_the_screen_quickly() {
 /// container's thumbnail item ever lands, this test is where it shows up — the
 /// number should fall to the JPEG gate and this comment should go.
 #[test]
-fn a_heic_reaches_the_screen_within_its_slower_budget() {
+fn a_heic_reaches_the_screen_from_its_thumbnail() {
     let Some(exe) = viewer_binary() else {
         eprintln!("skipping: the viewer binary was not found next to the test");
         return;
@@ -110,6 +110,7 @@ fn a_heic_reaches_the_screen_within_its_slower_budget() {
     std::fs::write(&image, heic_fixture()).expect("writing the test image");
 
     let mut best = f64::INFINITY;
+    let mut took_thumbnail_path = false;
     let mut failures = Vec::new();
 
     for attempt in 1..=RUNS {
@@ -117,6 +118,7 @@ fn a_heic_reaches_the_screen_within_its_slower_budget() {
             Ok(run) => {
                 eprintln!("run {attempt}: {:.1} ms", run.first_pixels_ms);
                 best = best.min(run.first_pixels_ms);
+                took_thumbnail_path |= run.used_thumbnail;
             }
             Err(reason) => failures.push(format!("run {attempt}: {reason}")),
         }
@@ -127,6 +129,13 @@ fn a_heic_reaches_the_screen_within_its_slower_budget() {
         return;
     }
 
+    // The timing alone would still pass if the quick frame stopped being drawn
+    // and the machine were simply fast. This is the mechanism itself.
+    assert!(
+        took_thumbnail_path,
+        "the container's thumbnail item was never the first frame, so the image on          screen waited for a full HEVC decode. Either the `thmb` reference stopped          being read, or the quick frame is no longer drawn before the background          decode finishes."
+    );
+
     assert!(
         best <= HEIC_THRESHOLD_MS,
         "the first pixels of a HEIC took {best:.1} ms, over the {HEIC_THRESHOLD_MS:.0} ms gate.\n\
@@ -136,23 +145,34 @@ fn a_heic_reaches_the_screen_within_its_slower_budget() {
     );
 }
 
-/// A small HEIC, written by libheif.
+/// A small HEIC with a thumbnail item beside the picture, as libheif writes
+/// one and as a phone does.
 ///
 /// Small on purpose: this gate is about the startup path, and a photograph-
 /// sized HEVC payload would spend the measurement on the decoder rather than
-/// on what the test is watching. The same fixture as the decoder tests, kept
-/// as text because the suite ships no binary files.
+/// on what the test is watching. Kept as text because the suite ships no
+/// binary files.
 fn heic_fixture() -> Vec<u8> {
     const BASE64: &str = concat!(
-        "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",
+        "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",
+        "Re971BP/RVjqIPldaiYgJ66SerO98+4BMLg=",
     );
 
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

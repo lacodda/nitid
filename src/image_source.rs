@@ -230,7 +230,7 @@ fn decode_with(bytes: &[u8], confinement: Confinement) -> Result<LoadedImage> {
         }
         Format::Jpeg => (decode_jpeg(bytes).with_context(malformed)?, color::profile_from(bytes)),
         Format::WebP => (decode_webp(bytes).with_context(malformed)?, color::profile_from(bytes)),
-        Format::Heic => (decode_heic(bytes).with_context(malformed)?, color::profile_from(bytes)),
+        Format::Heic => decode_heic_with_colour(bytes).with_context(malformed)?,
         // PNG, GIF, BMP and TIFF share one pure-Rust decoder.
         _ => (decode_via_image_crate(bytes).with_context(malformed)?, color::profile_from(bytes)),
     };
@@ -264,6 +264,12 @@ fn decode_with(bytes: &[u8], confinement: Confinement) -> Result<LoadedImage> {
 /// error: most PNGs and every screenshot lack one, and the full decode covers
 /// that case on its own.
 pub fn decode_thumbnail(bytes: &[u8]) -> Option<LoadedImage> {
+    // HEIC keeps its thumbnail as a second coded image in the container rather
+    // than in EXIF, so it is reached a different way.
+    if Format::detect(bytes) == Some(Format::Heic) {
+        return decode_heic_thumbnail(bytes);
+    }
+
     let exif = read_exif(bytes)?;
 
     // The thumbnail lives at an offset inside the EXIF block, described by two
@@ -296,6 +302,51 @@ pub fn decode_thumbnail(bytes: &[u8]) -> Option<LoadedImage> {
         // quick frame and the image replacing it are the same colour.
         profile: color::profile_from(bytes),
         // Thumbnails come from EXIF, which only raster formats carry.
+        vector: None,
+    })
+}
+
+/// Decode the thumbnail a camera stored inside a HEIC.
+///
+/// A HEIC carries no EXIF thumbnail. What it has instead is a second, small
+/// picture in the same container, tied to the full one by a `thmb` reference —
+/// which is what a phone writes, and what the shell shows in a folder.
+///
+/// `heif-oxide` decodes the primary item and offers no way to ask for another,
+/// so the file is handed back to it with the `pitm` box rewritten to name the
+/// thumbnail. That is a two-byte edit to a copy of the header; nothing else
+/// about the file changes, and the decoder does the reading as it always does.
+/// The alternative — assembling a standalone HEIC around the thumbnail's
+/// coded data — would mean rebuilding `iloc`, `iinf`, `ipco` and `ipma` by
+/// hand, which is a second container writer to keep correct for no gain.
+///
+/// The difference this makes is the whole point: on a 12-megapixel photograph
+/// the thumbnail decodes in about 5 ms against 470 ms for the full image.
+fn decode_heic_thumbnail(bytes: &[u8]) -> Option<LoadedImage> {
+    let primary = crate::isobmff::primary_item(bytes)?;
+    let thumbnail = crate::isobmff::thumbnail_of(bytes, primary.id)?;
+
+    // Only the header is copied: `pitm` sits near the front, and the coded
+    // images — the bulk of the file — are left where they are.
+    let mut rewritten = bytes.to_vec();
+    let identifier = rewritten.get_mut(primary.offset..primary.offset + primary.width)?;
+    match primary.width {
+        2 => identifier.copy_from_slice(&u16::try_from(thumbnail).ok()?.to_be_bytes()),
+        _ => identifier.copy_from_slice(&thumbnail.to_be_bytes()),
+    }
+
+    let image = decode_heic(&rewritten).ok()?;
+
+    Some(LoadedImage {
+        image,
+        // HEIC states its rotation in the container and the decoder applies
+        // it — to the thumbnail as much as to the full image, since both are
+        // items in the same file. See `Format::orients_itself`.
+        orientation: Orientation::Normal,
+        fidelity: Fidelity::Thumbnail,
+        // The pixels arrive as sRGB, the same as the full decode: attaching a
+        // profile would convert them twice (ADR 0007).
+        profile: None,
         vector: None,
     })
 }
@@ -368,6 +419,55 @@ fn decode_webp(bytes: &[u8]) -> Result<DecodedImage> {
 /// Decode a JPEG XL, returning the pixels together with the profile the file
 /// carries.
 ///
+/// Decode a HEIC, and say what colour its pixels are in.
+///
+/// Nearly every HEIC describes its colour with CICP code points in a `colr`
+/// box, and `heif-oxide` reads those: a Display P3 photograph is converted to
+/// sRGB on the way out, which is the limitation ADR 0007 records.
+///
+/// A file that carries an **ICC profile instead** is a different matter, and
+/// a worse one. The decoder notices the profile but does not read it, so it
+/// falls back to a default set of matrix coefficients — and that default is
+/// wrong often enough to be visible: a flat green that libheif reads as
+/// (10, 200, 90) comes back as (0, 185, 85).
+///
+/// So for such a file the `colr` box is rewritten, in a copy, to state the
+/// coefficients the pixels were actually coded with. The decoder then produces
+/// the same pixels libheif does, and the ICC profile is handed on to the
+/// shader — which is how every other format in the viewer is treated, and
+/// better than what the CICP path manages.
+fn decode_heic_with_colour(bytes: &[u8]) -> Result<(DecodedImage, Option<ColorProfile>)> {
+    let Some(colour) = crate::isobmff::colour_box(bytes).filter(|colour| colour.is_icc) else {
+        // The ordinary case: the file states CICP codes, the decoder reads
+        // them and resolves the colour itself. Nothing to attach — see
+        // `color::raw_profile`.
+        return Ok((decode_heic(bytes)?, color::profile_from(bytes)));
+    };
+
+    let mut rewritten = bytes.to_vec();
+    // `colr` is a kind tag followed by its payload. An ICC box is far larger
+    // than the seven bytes an `nclx` one needs, so the codes are written over
+    // the front of the profile and the rest of the box is left as it lies —
+    // the decoder reads the codes and stops.
+    let Some(body) = rewritten.get_mut(colour.kind_offset..colour.kind_offset + 11) else {
+        return Ok((decode_heic(bytes)?, color::profile_from(bytes)));
+    };
+
+    body[..4].copy_from_slice(b"nclx");
+    // BT.709 primaries and the sRGB transfer, so the decoder does not convert
+    // the primaries at all — the profile below describes them instead. The
+    // matrix is what actually matters here: BT.601 is what these files are
+    // coded with, and assuming BT.709 is the error being corrected.
+    body[4..6].copy_from_slice(&1u16.to_be_bytes());
+    body[6..8].copy_from_slice(&13u16.to_be_bytes());
+    body[8..10].copy_from_slice(&6u16.to_be_bytes());
+    // Full range, as a still image is.
+    body[10] = 0x80;
+
+    let image = decode_heic(&rewritten)?;
+    Ok((image, color::profile_from(bytes)))
+}
+
 /// Decode a HEIC — the format a modern iPhone photographs in.
 ///
 /// Pure Rust, container and HEVC alike, which is the reason this format does
@@ -827,6 +927,160 @@ mod tests {
         );
     }
 
+    /// A flat green written by libheif with an ICC profile and no CICP codes.
+    ///
+    /// This is the shape of file the decoder gets wrong on its own: it notices
+    /// the profile, does not read it, and falls back to matrix coefficients
+    /// that are not the ones the pixels were coded with.
+    const HEIC_WITH_ICC: &str = concat!(
+        "AAAAHGZ0eXBoZWljAAAAAG1pZjFoZWljbWlhZgAAA8FtZXRhAAAAAAAAACFoZGxyAAAAAAAAAABwaWN0AAAAAAAAAAAAAAAA",
+        "AAAAACJpbG9jAAAAAERAAAEAAQAAAAAD5QABAAAAAAAAADYAAAAjaWluZgAAAAAAAQAAABVpbmZlAgAAAAABAABodmMxAAAA",
+        "AA5waXRtAAAAAAABAAADQWlwcnAAAAMhaXBjbwAAAHVodmNDAQNwAAAAAAAAAAAAHvAA/P34+AAADwNgAAEAGEABDAH//wNw",
+        "AAADAJAAAAMAAAMAHroCQGEAAQApQgEBA3AAAAMAkAAAAwAAAwAeoCCBBZbqrprm4CGgwIAAAAyAAAADAIRiAAEABkQBwXPB",
+        "iQAAAlhjb2xycHJvZgAAAkxsY21zBEAAAG1udHJSR0IgWFlaIAfqAAgAFQAVABgAJWFjc3BNU0ZUAAAAAAAAAAAAAAAAAAAA",
+        "AAAAAAAAAAAAAAD21gABAAAAANMtbGNtcwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "C2Rlc2MAAAEIAAAANmNwcnQAAAFAAAAATHd0cHQAAAGMAAAAFGNoYWQAAAGgAAAALHJYWVoAAAHMAAAAFGJYWVoAAAHgAAAA",
+        "FGdYWVoAAAH0AAAAFHJUUkMAAAIIAAAAIGdUUkMAAAIIAAAAIGJUUkMAAAIIAAAAIGNocm0AAAIoAAAAJG1sdWMAAAAAAAAA",
+        "AQAAAAxlblVTAAAAGgAAABwAcwBSAEcAQgAgAGIAdQBpAGwAdAAtAGkAbgAAbWx1YwAAAAAAAAABAAAADGVuVVMAAAAwAAAA",
+        "HABOAG8AIABjAG8AcAB5AHIAaQBnAGgAdAAsACAAdQBzAGUAIABmAHIAZQBlAGwAeVhZWiAAAAAAAAD21gABAAAAANMtc2Yz",
+        "MgAAAAAAAQxCAAAF3v//8yUAAAeTAAD9kP//+6H///2iAAAD3AAAwG5YWVogAAAAAAAAb6AAADj1AAADkFhZWiAAAAAAAAAk",
+        "nwAAD4QAALbDWFlaIAAAAAAAAGKXAAC3hwAAGNlwYXJhAAAAAAADAAAAAmZmAADypwAADVkAABPQAAAKW2Nocm0AAAAAAAMA",
+        "AAAAo9cAAFR7AABMzQAAmZoAACZmAAAPXAAAABRpc3BlAAAAAAAAAEAAAABAAAAAKGNsYXAAAAAQAAAAAQAAABAAAAAB////",
+        "0AAAAAL////QAAAAAgAAABBwaXhpAAAAAAMICAgAAAAYaXBtYQAAAAAAAAABAAEFgQIDBYQAAAA+bWRhdAAAADIoAa8GshZn",
+        "NJICQ+mv///CYf//0qlAFrA2X2/oZsTkstqBHPph8xg6licaI3CtwJy7wA==",
+    );
+
+    /// The colour of an ICC-tagged HEIC must match what libheif reads from the
+    /// same file, not what the decoder produces when it guesses.
+    ///
+    /// The fixture is a flat (10, 200, 90). Left to itself the decoder returns
+    /// roughly (0, 185, 85) — visibly wrong, and wrong in a way no amount of
+    /// colour management afterwards can undo.
+    #[test]
+    fn an_icc_tagged_heic_decodes_to_the_colour_it_was_encoded_with() {
+        let loaded = decode(&from_base64(HEIC_WITH_ICC)).unwrap();
+
+        let pixel = &loaded.image.pixels[..3];
+        for (channel, expected) in pixel.iter().zip([10u8, 200, 90]) {
+            let difference = channel.abs_diff(expected);
+            assert!(
+                difference <= 6,
+                "the flat colour came back as {pixel:?}, not the (10, 200, 90) it was encoded with"
+            );
+        }
+    }
+
+    /// And the profile reaches the viewer, so the colour is finished on the
+    /// GPU like every other tagged format rather than resolved on the way in.
+    #[test]
+    fn an_icc_tagged_heic_carries_its_profile_to_the_shader() {
+        let loaded = decode(&from_base64(HEIC_WITH_ICC)).unwrap();
+        assert!(
+            loaded.profile.is_some(),
+            "the ICC profile was dropped, so the image would be shown in the wrong space"
+        );
+    }
+
+    /// A HEIC stating CICP codes is the ordinary case and must not be touched:
+    /// the decoder resolves its colour, and attaching a profile on top would
+    /// convert the pixels a second time.
+    #[test]
+    fn a_cicp_tagged_heic_is_still_left_to_the_decoder() {
+        assert!(decode(&from_base64(HEIC_GRADIENT)).unwrap().profile.is_none());
+    }
+
+    /// A 64x48 gradient with a 16-pixel thumbnail beside it, as libheif writes
+    /// one — the same arrangement a phone produces.
+    const HEIC_WITH_THUMBNAIL: &str = concat!(
+        "AAAAHGZ0eXBoZWljAAAAAG1pZjFoZWljbWlhZgAAAmJtZXRhAAAAAAAAACFoZGxyAAAAAAAAAABwaWN0AAAAAAAAAAAAAAAA",
+        "AAAAADRpbG9jAAAAAERAAAIAAQAAAAAChgABAAAAAAAAAfkAAgAAAAAEfwABAAAAAAAAAKsAAAA4aWluZgAAAAAAAgAAABVp",
+        "bmZlAgAAAAABAABodmMxAAAAABVpbmZlAgAAAAACAABodmMxAAAAAA5waXRtAAAAAAABAAABoWlwcnAAAAF6aXBjbwAAAHZo",
+        "dmNDAQNwAAAAAAAAAAAAHvAA/P34+AAADwNgAAEAGEABDAH//wNwAAADAJAAAAMAAAMAHroCQGEAAQAqQgEBA3AAAAMAkAAA",
+        "AwAAAwAeoCCBBZbq5Ka5uAhoMCAAAAMDIAAAAwAhYgABAAZEAcFzwIkAAAATY29scm5jbHgAAQANAAaAAAAAFGlzcGUAAAAA",
+        "AAAAQAAAAEAAAAAoY2xhcAAAAEAAAAABAAAAMAAAAAEAAAAAAAAAAv////AAAAACAAAAEHBpeGkAAAAAAwgICAAAAHVodmND",
+        "AQNwAAAAAAAAAAAAHvAA/P34+AAADwNgAAEAGEABDAH//wNwAAADAJAAAAMAAAMAHroCQGEAAQApQgEBA3AAAAMAkAAAAwAA",
+        "AwAeoCCBBZbqrprm4CGgwIAAAAyAAAADAIRiAAEABkQBwXPBiQAAAChjbGFwAAAAEAAAAAEAAAAMAAAAAf///9AAAAAC////",
+        "zAAAAAIAAAAfaXBtYQAAAAAAAAACAAEFgQIDBYQAAgSGAwWHAAAAGmlyZWYAAAAAAAAADnRobWIAAgABAAEAAAKsbWRhdAAA",
+        "AfUoAa8GOOllh0y24R+1b38FdWdZTuD5dwhtN6PJqe1YKIOOvBc8+ihN9TE+OXBSE9SxAP0GxfEU/d//MaUXxds9jzT71tY6",
+        "UaNk0p//RTlyWRIWPKCJX0/14eyMZXkgmRdNLxm1/BDztF32wn8nvh803+VOL7mR7pTmrrecO9tn/K9XXdx96RWIWiVgq+5J",
+        "J97xVdz7AGPjwo/9neVw6g8/Jxp5ehIYYWZtk5O3C3drDDaiRQnutkZ/vkPIENf4h4TXmPxkBZ0vuv8I8xYTlI835zebdZm1",
+        "ys4Cc/+Twtm27YrvSzx6fj2nTn0B+Q4SZOhDzPTW/FtJVEcdX/h//wWjQCSdOrNwNJV/20ifUy4yYBQc3EDL0oFOmsDJkJR2",
+        "LeJ2WLsAQe9jWj3Zf2z6q5YV4Mks9tPsn/If5BKWH8LCxqPuficC95A7bkvpO/6CB0Xqi9JN6HKiLM1AXBKUJ/d8WH9vFQk8",
+        "Ocf3f7relkYi87LGZWka/Ly/aeuCZ/3P5H6bxpBGfTSSKog2AOvGaeqckqkXiOL3AeFxFbt5TRL/DWid3gaIscpUw565rh4N",
+        "ZIzUyQGEG6V2q6oT7M9JCaE7ZydC2Y64HjoODeBwqxvBBsBIDvGxqMQDwRPg1ecELx701Jbs/WIgQ9nV3yN80l6jmX1bK/4A",
+        "AACnKAGvBjIeyRRQiQKs/NTUAT6FlCZD6UbwABv5nF56+QMX/gPVP0xOkl3jXeehAf9tmAXeka/8Joxx+T9T9KM6U8Gh6Vhl",
+        "Rb3H+A606130rjgTHYIETU5ovmwv6o2jez/qvl9Acs/wfYJ11sZlrK/i4eU6199ApGfuY14gKMQU9L0v04HBj5VS2bftL+We",
+        "Re971BP/RVjqIPldaiYgJ66SerO98+4BMLg=",
+    );
+
+    /// The quick frame of a HEIC comes from the thumbnail item the encoder
+    /// stored beside the picture — not from EXIF, which a HEIC does not carry
+    /// one in.
+    #[test]
+    fn a_heic_thumbnail_is_found_and_decoded() {
+        let bytes = from_base64(HEIC_WITH_THUMBNAIL);
+        let thumbnail = decode_thumbnail(&bytes).expect("the thumbnail was not found");
+
+        assert_eq!(thumbnail.fidelity, Fidelity::Thumbnail);
+        // Smaller than the picture it stands in for, which is the whole point:
+        // it decodes in a fraction of the time.
+        assert!(
+            thumbnail.image.width < 64 && thumbnail.image.height < 48,
+            "the full image came back instead of the thumbnail: {}x{}",
+            thumbnail.image.width,
+            thumbnail.image.height
+        );
+        assert_eq!(thumbnail.image.pixels.len(), (thumbnail.image.width * thumbnail.image.height * 4) as usize);
+    }
+
+    /// The quick frame must look like the picture it stands in for. A
+    /// thumbnail showing something else — the wrong item, or bytes read at the
+    /// wrong offset — would be worse than no quick frame at all.
+    #[test]
+    fn the_thumbnail_looks_like_the_image_it_stands_in_for() {
+        let bytes = from_base64(HEIC_WITH_THUMBNAIL);
+        let thumbnail = decode_thumbnail(&bytes).expect("the thumbnail was not found");
+        let full = decode(&bytes).expect("the full image");
+
+        // The fixture is a gradient: red rises to the right, green downwards.
+        // Both pictures must agree about that, with a wide margin for the
+        // scale difference and for chroma stored at half resolution.
+        let corner = |image: &DecodedImage, x: u32, y: u32| {
+            let start = ((y * image.width + x) * 4) as usize;
+            [image.pixels[start], image.pixels[start + 1], image.pixels[start + 2]]
+        };
+
+        let small = corner(&thumbnail.image, thumbnail.image.width - 1, 0);
+        let large = corner(&full.image, full.image.width - 1, 0);
+        for channel in 0..3 {
+            let difference = small[channel].abs_diff(large[channel]);
+            assert!(difference < 60, "the top-right corners disagree: {small:?} against {large:?}");
+        }
+    }
+
+    /// Most HEICs carry no thumbnail, and that is not an error: the viewer
+    /// waits for the full decode, as it did before.
+    #[test]
+    fn a_heic_without_a_thumbnail_has_no_quick_frame() {
+        assert!(decode_thumbnail(&from_base64(HEIC_GRADIENT)).is_none());
+    }
+
+    /// The quick frame reaches the same code that reads the file, so a
+    /// damaged one must come back as no thumbnail rather than as a panic.
+    #[test]
+    fn a_broken_heic_yields_no_thumbnail_rather_than_panicking() {
+        let whole = from_base64(HEIC_WITH_THUMBNAIL);
+        for cut in [0, 1, 12, 40, 600, whole.len() / 2, whole.len() - 1] {
+            let _ = decode_thumbnail(&whole[..cut.min(whole.len())]);
+        }
+
+        let mut damaged = whole.clone();
+        for index in (0..damaged.len()).step_by(23) {
+            damaged[index] ^= 0xA5;
+        }
+        let _ = decode_thumbnail(&damaged);
+    }
+
     /// A HEIC states its rotation in the container, and the decoder applies
     /// it. An encoder writing a photograph puts the same rotation in EXIF, so
     /// honouring the tag as well would turn a portrait photograph on its side.
@@ -876,23 +1130,31 @@ mod tests {
         "z3o/jwTUM/3cds7RHx+FIxDBvX9YPrGDQ6OpJeWsNVi2oOcyXcSSXhmg",
     );
 
-    /// HEIC pixels arrive already converted to sRGB, so the profile must not
-    /// be attached — applying it would convert them a second time, see
-    /// ADR 0007.
+    /// A HEIC's colour is finished in one of two places, and which one depends
+    /// on how the file describes itself.
     ///
-    /// Asserted on a file that really does carry an ICC profile, so this
-    /// cannot pass merely because there was nothing to find.
+    /// With CICP codes the decoder resolves it and the pixels arrive as sRGB,
+    /// so nothing may be attached — applying a profile on top would convert
+    /// them twice (ADR 0007). With an ICC profile the decoder resolves
+    /// nothing, so the profile is carried through to the shader instead.
+    ///
+    /// Both halves are asserted here: the first alone would pass for a build
+    /// that never reads a profile at all.
     #[test]
-    fn a_tagged_heic_arrives_without_a_profile_to_apply() {
-        // The fixture carries a profile: a format that read it would find one.
+    fn a_heic_carries_a_profile_only_when_the_decoder_did_not_use_one() {
+        // Stated with CICP codes: resolved on the way in, nothing to attach.
+        assert!(decode(&from_base64(HEIC_GRADIENT)).unwrap().profile.is_none());
+
+        // Stated with an ICC profile: carried to the shader.
         let tagged = from_base64(HEIC_GRADIENT_TAGGED);
         assert!(
             tagged.windows(4).any(|window| window == b"prof"),
             "the fixture is meant to carry an ICC profile"
         );
-
-        assert!(decode(&tagged).unwrap().profile.is_none());
-        assert!(decode(&from_base64(HEIC_GRADIENT)).unwrap().profile.is_none());
+        assert!(
+            decode(&tagged).unwrap().profile.is_some(),
+            "an ICC-tagged HEIC lost its profile, so it would be shown in whatever space the decoder guessed"
+        );
     }
 
     /// A decoder reading a hostile file is the reason the sandbox exists; this

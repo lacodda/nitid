@@ -172,14 +172,14 @@ fn raw_profile(bytes: &[u8]) -> Option<Vec<u8>> {
         // and the decoder reads them in the pass that produces the pixels —
         // the same arrangement as JPEG XL. See `avif::profile_from`.
         Format::Avif => None,
-        // HEIC carries a profile, and the pixels do not need it: the decoder
-        // converts them to sRGB on the way out and the file's own primaries
-        // are gone by the time they arrive here. Attaching the profile anyway
-        // would convert an already-converted image a second time. The cost of
-        // that conversion — a Display P3 photograph shown inside sRGB rather
-        // than in the display's full gamut — is written down in
-        // `docs/adr/0007-heic-decodes-in-rust.md`.
-        Format::Heic => None,
+        // HEIC states its colour one of two ways. With CICP codes — the usual
+        // case — the decoder resolves the colour itself and the pixels arrive
+        // as sRGB, so attaching anything would convert them twice; that is the
+        // limitation ADR 0007 records. With an ICC profile, the decoder reads
+        // no such thing, so the profile is read here and applied on the GPU
+        // like any other format's. `image_source::decode_heic_with_colour`
+        // decides which case a file is and makes the pixels match.
+        Format::Heic => heic_profile(bytes),
         // SVG states colours as sRGB values in the markup itself; there is no
         // profile to read, and none to attach.
         Format::Svg => None,
@@ -187,6 +187,22 @@ fn raw_profile(bytes: &[u8]) -> Option<Vec<u8>> {
         // neither appears tagged in practice often enough to justify a parser.
         Format::Gif | Format::Bmp | Format::Tiff => None,
     }
+}
+
+/// Extract the ICC profile a HEIC embeds, if it has one rather than CICP
+/// codes.
+///
+/// The `colr` box holds either, never both in a way that matters here: a file
+/// stating CICP has had its colour resolved by the decoder already.
+fn heic_profile(bytes: &[u8]) -> Option<Vec<u8>> {
+    let colour = crate::isobmff::colour_box(bytes)?;
+    if !colour.is_icc {
+        return None;
+    }
+
+    // The kind tag, then the profile itself, to the end of the box.
+    let body = crate::isobmff::find_box(bytes, b"colr")?;
+    body.get(4..).map(<[u8]>::to_vec)
 }
 
 /// Pull an `iCCP` chunk out of a PNG.

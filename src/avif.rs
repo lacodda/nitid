@@ -28,6 +28,7 @@ use rav1d::include::dav1d::picture::Dav1dPicture;
 use rav1d::src::lib::{dav1d_close, dav1d_data_create, dav1d_default_settings, dav1d_get_picture, dav1d_open, dav1d_picture_unref, dav1d_send_data};
 
 use crate::image_source::{DecodedImage, Orientation};
+use crate::isobmff::find_box;
 
 /// The decoder wants more input before it can produce a picture.
 ///
@@ -248,9 +249,7 @@ unsafe fn copy_out(picture: &Dav1dPicture) -> Result<Frame> {
 /// its side.
 ///
 /// `avif-parse` does not surface these properties, so the two boxes are found
-/// here. They are fixed-size and trivially shaped — a length, a name, one byte
-/// of payload — which is why this is a scan for the box rather than a second
-/// container parser.
+/// with the box walk in `isobmff`, which HEIC uses as well.
 ///
 /// Returns `None` when the file asks for nothing, leaving the EXIF tag to
 /// decide.
@@ -294,71 +293,6 @@ fn orientation_from(bytes: &[u8]) -> Option<Orientation> {
         // Unreachable: rotation is masked to two bits and mirror to one.
         _ => Orientation::Normal,
     })
-}
-
-/// Find a box by name anywhere in `bytes`, and return its body.
-///
-/// ISOBMFF boxes are length-prefixed, named by four bytes, and nested: the
-/// rotation this module wants sits inside `ipco`, inside `iprp`, inside
-/// `meta`. So the walk descends into every box it does not recognise rather
-/// than stepping over the lot at one level.
-///
-/// The bytes come from a file that may be lying about them, so a length that
-/// would not advance the walk — zero, or one running past the end — ends it
-/// instead of looping or reading past the buffer. Recursion is bounded by
-/// `depth` for the same reason: a file can nest boxes as deeply as it likes.
-fn find_box<'a>(bytes: &'a [u8], name: &[u8; 4]) -> Option<&'a [u8]> {
-    find_box_within(bytes, name, 0)
-}
-
-/// How deep the search will follow nested boxes.
-///
-/// The properties this module reads sit four levels down; twice that is room
-/// for any real file and a bound against one built to recurse for ever.
-const MAX_DEPTH: u32 = 8;
-
-fn find_box_within<'a>(bytes: &'a [u8], name: &[u8; 4], depth: u32) -> Option<&'a [u8]> {
-    if depth > MAX_DEPTH {
-        return None;
-    }
-
-    let mut offset = 0;
-    while offset + 8 <= bytes.len() {
-        let length = u32::from_be_bytes([bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]]) as usize;
-        let kind = &bytes[offset + 4..offset + 8];
-
-        // A box shorter than its own header, or longer than what is left, is
-        // a file this cannot walk any further.
-        let end = if length < 8 || offset + length > bytes.len() {
-            bytes.len()
-        } else {
-            offset + length
-        };
-
-        let body = bytes.get(offset + 8..end)?;
-
-        if kind == name {
-            return Some(body);
-        }
-
-        // `meta` is a FullBox: four bytes of version and flags sit between its
-        // header and the boxes inside it. Reading those four bytes as a length
-        // would derail the walk one level down — which is where the properties
-        // this module wants actually live.
-        let body = if kind == b"meta" { body.get(4..).unwrap_or_default() } else { body };
-
-        // Not this box: it may still hold the one being looked for.
-        if let Some(found) = find_box_within(body, name, depth + 1) {
-            return Some(found);
-        }
-
-        // A length that does not advance would leave the walk in place.
-        if length < 8 || offset + length > bytes.len() {
-            return None;
-        }
-        offset += length;
-    }
-    None
 }
 
 /// Turn the frame's colour description into a profile the shader can apply.

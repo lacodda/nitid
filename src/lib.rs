@@ -20,6 +20,7 @@ mod gpu;
 mod image_source;
 #[cfg(windows)]
 mod install;
+mod isobmff;
 mod loader;
 mod sandbox;
 mod startup;
