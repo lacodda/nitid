@@ -94,7 +94,7 @@ code execution.
 | PNG | `.png` | yes |
 | WebP | `.webp` | yes |
 | JPEG XL | `.jxl` | yes |
-| HEIC | `.heic` `.heif` `.hif` | converted at decode |
+| HEIC | `.heic` `.heif` `.hif` | yes when embedded; code points converted at decode |
 | AVIF | `.avif` | yes, from the bitstream |
 | SVG | `.svg` | drawn in sRGB |
 | GIF | `.gif` | sRGB by definition |
@@ -105,14 +105,16 @@ The format is decided by the bytes, not the extension: a `.png` that is really
 a JPEG opens rather than erroring.
 
 HEIC — the format a modern phone photographs in — decodes in Rust like the
-rest, container and HEVC alike. Two things about it are worth knowing before
-they surprise you. Its pixels arrive already converted to sRGB by the decoder,
-so a photograph tagged Display P3 is shown inside sRGB rather than across a
-wide-gamut display's full range: the one place in nitid where colour is
-resolved on the way in instead of on the GPU. And it has no quick first frame —
-where a JPEG shows its embedded thumbnail in milliseconds, a HEIC waits for the
-whole decode, about a second for a 12-megapixel photograph. Both are measured,
-gated in the test suite, and on the list to fix; the reasoning is in
+rest, container and HEVC alike, and reaches the screen as fast as a JPEG: it
+carries a thumbnail as a second image inside its container, and nitid shows
+that first while the full picture decodes behind it.
+
+One limitation remains, and only for some files. A HEIC states its colour
+either as a set of standard code points or as an embedded ICC profile. With a
+profile, nitid reads it and applies it on the GPU like every other format.
+With code points — the more common case — the decoder resolves the colour
+itself before nitid sees the pixels, so a photograph tagged Display P3 is
+shown inside sRGB rather than across a wide-gamut display's full range. See
 [ADR 0007](docs/adr/0007-heic-decodes-in-rust.md).
 
 AVIF decodes through `rav1d` — dav1d translated to Rust by the ISRG — with the
@@ -149,9 +151,9 @@ has no size limit to hide behind.
 
 ## Status
 
-Early development — v0.9.0 is out. Startup, colour and format coverage hold:
-every modern still format opens, a phone's photographs included, and a slow
-decode no longer holds the viewer up. HDR is still ahead. Development runs in small versions, each
+Early development — v0.10.0 is out. Startup, colour and format coverage hold:
+every modern still format opens, a phone's photographs included, and every one
+of them reaches the screen without a wait. HDR is still ahead. Development runs in small versions, each
 one theme; the road to 1.0 is fixed:
 
 | Version | What lands |
@@ -167,7 +169,7 @@ one theme; the road to 1.0 is fixed:
 | ✅ v0.7.0 | HEIC, decoded in Rust |
 | ✅ v0.8.0 | AVIF, decoded with `rav1d` |
 | ✅ v0.9.0 | Decodes that can be stopped: cancelled on navigation, killed on a timeout |
-| v0.10.0 | HEIC's remaining debts: a quick first frame, and colour on the GPU |
+| ✅ v0.10.0 | HEIC from its thumbnail, and its ICC colour on the GPU |
 | v0.11.0 | Format tails, and the network closed to the decoder |
 | v0.12.0 | Animation: GIF, WebP, APNG |
 | v0.13.0 | HDR output on Windows (`Bt2100Pq` on `Rgb10a2Unorm`) |

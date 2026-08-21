@@ -6,6 +6,22 @@ Date: 2026-08-19
 
 Accepted. Narrows [ADR 0002](0002-sandbox-c-decoders.md) without replacing it.
 
+> **Two of the consequences below were settled in v0.10.0**, and one of them
+> turned out to be worse than described.
+>
+> The missing quick frame is fixed: a HEIC does carry a thumbnail, as an item
+> in its container rather than in EXIF, and nitid now shows it — about 5 ms
+> against 470 ms for a 12-megapixel photograph.
+>
+> The colour limitation was two things. For a file stating CICP codes it is as
+> written: the decoder resolves the colour and the gamut is lost. For a file
+> carrying an **ICC profile** instead, the decoder was producing *wrong*
+> pixels, not merely narrow ones — it notices the profile, does not read it,
+> and falls back to matrix coefficients the image was not coded with. That path
+> now rewrites the `colr` box in a copy so the decoder agrees with libheif, and
+> passes the ICC profile to the shader. Such files get the colour management
+> the rest of the viewer gives; CICP files still do not.
+
 ## Context
 
 ADR 0002 built a sandbox for HEIC and AVIF on a premise: both formats exist

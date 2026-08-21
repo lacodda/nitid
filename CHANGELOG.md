@@ -2,6 +2,11 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.10.0] - 2026-08-21
+
+### Features
+- Show a HEIC from its thumbnail, and read the colour it states
+
 ## [0.9.0] - 2026-08-20
 
 ### Features
