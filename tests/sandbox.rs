@@ -35,6 +35,10 @@ fn with_decoder<T>(body: impl FnOnce() -> T) -> T {
 }
 
 /// The same, with extra variables set for this test only and removed after.
+///
+/// Only the timeout tests pass anything here, and those are Windows-only, so
+/// off Windows this would be an unused function rather than a missing one.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn with_environment<T>(variables: &[(&str, &str)], body: impl FnOnce() -> T) -> T {
     // A poisoned lock means another test panicked while holding it; the
     // variables are set afresh below either way, so the guard is taken back.
@@ -143,6 +147,12 @@ fn corrupted_files_never_take_the_viewer_down() {
 /// can be killed. The child here really does hang — parked for ever on
 /// request — so what is exercised is the code that kills it, rather than a
 /// stand-in for that code.
+///
+/// Windows only, and not as a convenience: off Windows `sandbox::decode` runs
+/// in this very process, where there is no child to hang and no timeout to
+/// enforce. The test would pass there by decoding the file successfully, which
+/// would be a green result for the absence of the thing being tested.
+#[cfg(windows)]
 #[test]
 fn a_decoder_that_hangs_is_killed_rather_than_waited_for() {
     let started = std::time::Instant::now();
@@ -164,6 +174,10 @@ fn a_decoder_that_hangs_is_killed_rather_than_waited_for() {
 
 /// The timeout must not fire on a decode that is merely working: an image
 /// large enough to take a moment still has to come back whole.
+///
+/// Windows only for the same reason as above: there is no timeout to avoid
+/// firing where there is no child process.
+#[cfg(windows)]
 #[test]
 fn a_slow_but_working_decode_is_not_cut_short() {
     let decoded =
