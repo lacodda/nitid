@@ -35,6 +35,7 @@ mod view;
 #[doc(hidden)]
 pub mod testing {
     pub use crate::color::{ColorTransform, profile_from};
+    pub use crate::image_source::decode_here;
     pub use crate::sandbox::decode as decode_sandboxed;
 }
 

@@ -186,6 +186,203 @@ fn a_slow_but_working_decode_is_not_cut_short() {
     assert_eq!((decoded.image.width, decoded.image.height), (800, 600));
 }
 
+/// The pipe path stays alive behind the section: a viewer that could not
+/// create one hands the decoder no handle, and the pixels come back inline.
+/// Without this test the fallback would be the code that only runs on the
+/// machine where something else already went wrong.
+#[cfg(windows)]
+#[test]
+fn pixels_still_cross_when_shared_memory_is_unavailable() {
+    let decoded =
+        with_environment(&[("NITID_SHM_DISABLED", "1")], || nitid::testing::decode_sandboxed(&png(800, 600))).expect("the decode should fall back to the pipe");
+
+    assert_eq!((decoded.image.width, decoded.image.height), (800, 600));
+    assert!(decoded.image.pixels.as_chunks::<4>().0.iter().all(|pixel| pixel == &[10, 200, 90, 255]));
+}
+
+/// The pixels really do cross through the section, not merely *may*: with the
+/// fallback forbidden in the child, a decode that succeeds is proof the
+/// shared path carried them. Without this, a broken section path would hide
+/// behind the pipe and every other test would stay green.
+#[cfg(windows)]
+#[test]
+fn pixels_cross_through_the_section_and_not_by_accident() {
+    let decoded = with_environment(&[("NITID_SHM_REQUIRED", "1")], || nitid::testing::decode_sandboxed(&png(800, 600)))
+        .expect("the shared memory path should carry the pixels");
+    assert_eq!((decoded.image.width, decoded.image.height), (800, 600));
+    assert!(decoded.image.pixels.as_chunks::<4>().0.iter().all(|pixel| pixel == &[10, 200, 90, 255]));
+
+    // And the lever itself is live: with the section withheld by the viewer,
+    // the same requirement must fail the decode. A lever that cannot fail
+    // would prove nothing above.
+    let refused = with_environment(&[("NITID_SHM_REQUIRED", "1"), ("NITID_SHM_DISABLED", "1")], || {
+        nitid::testing::decode_sandboxed(&png(8, 8))
+    });
+    assert!(refused.is_err(), "the decode used the pipe although the section was required");
+}
+
+/// A measuring stick, not a test: times the boundary itself — spawn, request,
+/// decode, reply — for the file named by `NITID_BENCH_FILE`, over the section
+/// and over the pipe. Run by hand when the cost of the crossing is the
+/// question:
+///
+/// `NITID_BENCH_FILE=big.heic cargo test --release --test sandbox -- --ignored --nocapture`
+#[cfg(windows)]
+#[test]
+#[ignore = "a measurement, run by hand with NITID_BENCH_FILE set"]
+fn measure_the_boundary() {
+    let path = std::env::var_os("NITID_BENCH_FILE").expect("set NITID_BENCH_FILE to the image to measure with");
+    let bytes = std::fs::read(path).expect("reading the bench file");
+
+    // The boundary's fixed cost first: a tiny file decodes in no time, so
+    // what remains is spawn, confinement and the round trip themselves.
+    for run in 1..=5 {
+        let tiny = png(16, 16);
+        let started = std::time::Instant::now();
+        with_decoder(|| nitid::testing::decode_sandboxed(&tiny)).expect("the tiny decode should succeed");
+        eprintln!("fixed cost run {run}: {:.0} ms", started.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    // In this process first: the decode alone, which is the floor the
+    // boundary's cost is measured against.
+    for run in 1..=5 {
+        let started = std::time::Instant::now();
+        let decoded = nitid::testing::decode_here(&bytes).expect("the bench decode should succeed");
+        eprintln!(
+            "in-process run {run}: {:.0} ms for {}x{}",
+            started.elapsed().as_secs_f64() * 1000.0,
+            decoded.image.width,
+            decoded.image.height
+        );
+    }
+
+    for (label, variables) in [("section", &[][..]), ("pipe", &[("NITID_SHM_DISABLED", "1")][..])] {
+        for run in 1..=5 {
+            let started = std::time::Instant::now();
+            let decoded = with_environment(variables, || nitid::testing::decode_sandboxed(&bytes)).expect("the bench decode should succeed");
+            eprintln!(
+                "{label} run {run}: {:.0} ms for {}x{}",
+                started.elapsed().as_secs_f64() * 1000.0,
+                decoded.image.width,
+                decoded.image.height
+            );
+        }
+    }
+}
+
+/// The reason the AppContainer exists: nothing the decoder sends gets out.
+/// The decoder is taught to try to reach a live listener waiting just
+/// outside the sandbox — the exfiltration direction — and must fail. This
+/// same probe is what proved a low integrity token does NOT close the
+/// network, and `container=true` in the reply is the decoder's own token
+/// saying which confinement answered: a decoder that quietly fell back would
+/// say `container=false` and fail here loudly.
+///
+/// The container needs no ACL grants to run from the build directory — the
+/// viewer maps the executable image itself, so the child never opens its own
+/// path. That is not assumed: this test running green from an ungrant-ed
+/// `target/` directory is the measurement.
+#[cfg(windows)]
+#[test]
+fn the_container_closes_the_network_outward() {
+    // Something real for the probe to reach: a listener outside the sandbox.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a listener for the probe");
+    let address = listener.local_addr().expect("the listener has an address").to_string();
+
+    let result = with_environment(&[("NITID_DECODER_PROBES_NETWORK", &address)], || nitid::testing::decode_sandboxed(&png(4, 4)));
+
+    let Err(error) = result else {
+        panic!("the probe answers through the failure channel, not with an image");
+    };
+    let message = error.to_string();
+    assert!(message.contains("container=true"), "the decoder did not run in the container: {message}");
+    assert!(
+        message.contains("connect=false"),
+        "the decoder reached the network from inside the container: {message}"
+    );
+}
+
+/// The other direction: a listener bound *inside* the container — binding
+/// succeeds there, which alone would read as a hole — must be unreachable
+/// from outside. The decoder binds a port and waits; this test hammers that
+/// port for the same window; nobody gets through.
+#[cfg(windows)]
+#[test]
+fn the_container_closes_the_network_inward() {
+    // A port that is free right now: bound, read, released. The window
+    // between the release and the decoder's own bind is a race in theory and
+    // irrelevant in practice — a collision would fail the accept probe
+    // towards `accepted=false`, which is the passing direction, and the
+    // hammering below connecting to some unrelated process's new listener
+    // would still not make the *decoder* accept anything.
+    let port = {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("finding a free port");
+        probe.local_addr().expect("the probe has an address").port()
+    };
+
+    // Hammer the port from outside the sandbox while the decoder listens on
+    // it inside.
+    let hammering = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        let mut reached = false;
+        while std::time::Instant::now() < deadline {
+            if std::net::TcpStream::connect_timeout(
+                &format!("127.0.0.1:{port}").parse().expect("a loopback address"),
+                std::time::Duration::from_millis(100),
+            )
+            .is_ok()
+            {
+                reached = true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        reached
+    });
+
+    let probe = format!("accept:{port}");
+    let result = with_environment(&[("NITID_DECODER_PROBES_NETWORK", &probe)], || nitid::testing::decode_sandboxed(&png(4, 4)));
+
+    let reached = hammering.join().expect("the hammering thread finished");
+    let Err(error) = result else {
+        panic!("the probe answers through the failure channel, not with an image");
+    };
+    let message = error.to_string();
+    assert!(message.contains("container=true"), "the decoder did not run in the container: {message}");
+    assert!(
+        message.contains("accepted=false") && !reached,
+        "a connection from outside reached a listener inside the container: {message}, reached={reached}"
+    );
+}
+
+/// The restricted-token fallback must stay alive — it is what a machine that
+/// cannot register a container profile gets — and the probe must be able to
+/// see an *open* network from behind it: that is the lever proving
+/// `connect=false` in the container test is the container's doing and not a
+/// broken probe, a firewall, or a typo'd address.
+#[cfg(windows)]
+#[test]
+fn the_fallback_still_decodes_and_its_network_stays_observably_open() {
+    let decoded = with_environment(&[("NITID_NO_CONTAINER", "1")], || nitid::testing::decode_sandboxed(&png(5, 4)))
+        .expect("the decode should fall back to the restricted token and succeed");
+    assert_eq!((decoded.image.width, decoded.image.height), (5, 4));
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a listener for the probe");
+    let address = listener.local_addr().expect("the listener has an address").to_string();
+
+    let result = with_environment(&[("NITID_NO_CONTAINER", "1"), ("NITID_DECODER_PROBES_NETWORK", &address)], || {
+        nitid::testing::decode_sandboxed(&png(4, 4))
+    });
+    let Err(error) = result else {
+        panic!("the probe answers through the failure channel, not with an image");
+    };
+    let message = error.to_string();
+    assert!(message.contains("container=false"), "the lever did not refuse the container: {message}");
+    assert!(
+        message.contains("connect=true"),
+        "the probe could not see the network even without a container, so the container test proves nothing: {message}"
+    );
+}
+
 #[test]
 fn repeated_decodes_do_not_accumulate_processes() {
     with_decoder(|| {

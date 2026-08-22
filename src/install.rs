@@ -99,6 +99,13 @@ pub fn uninstall() -> Result<()> {
     unregister()?;
     println!("Removed the file type registration");
 
+    // The decoder's AppContainer profile is machine state nitid registered on
+    // its first sandboxed decode; uninstalling takes it too. A machine that
+    // never decoded a HEIC has nothing to remove, which is not an error.
+    if crate::sandbox::remove_container_profile().is_ok() {
+        println!("Removed the decoder's container profile");
+    }
+
     let dir = install_dir()?;
     let running = env::current_exe().unwrap_or_default();
     let mut removed = false;

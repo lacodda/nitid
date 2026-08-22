@@ -29,6 +29,10 @@
 pub mod protocol;
 
 #[cfg(windows)]
+mod section;
+#[cfg(windows)]
+mod spawn;
+#[cfg(windows)]
 mod windows;
 
 use std::io::{self, Read, Write};
@@ -74,6 +78,69 @@ fn timeout() -> std::time::Duration {
 #[cfg(windows)]
 pub fn decode(bytes: &[u8]) -> Result<LoadedImage> {
     windows::decode(bytes, timeout())
+}
+
+/// Bind `port` on loopback and report whether any connection arrives within
+/// two seconds. The other half of this handshake is the test, which hammers
+/// the port from outside the sandbox for the same window.
+fn connection_arrives_on(port: &str) -> bool {
+    let Ok(listener) = std::net::TcpListener::bind(format!("127.0.0.1:{port}")) else {
+        return false;
+    };
+    if listener.set_nonblocking(true).is_err() {
+        return false;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        if listener.accept().is_ok() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    false
+}
+
+/// Remove the decoder's container profile, as part of uninstalling.
+#[cfg(windows)]
+pub fn remove_container_profile() -> Result<()> {
+    spawn::delete_profile()
+}
+
+/// Whether this process holds an AppContainer token.
+///
+/// Asked by the probe so the tests can assert *which* confinement answered:
+/// "the network was closed" only counts as the container's doing if the
+/// process can show it was in one.
+#[cfg(windows)]
+fn running_in_container() -> bool {
+    use ::windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use ::windows::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TokenIsAppContainer};
+    use ::windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    // SAFETY: the token handle is opened on this very process and closed
+    // before returning; the out-buffer is a plain local.
+    unsafe {
+        let mut token = HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+            return false;
+        }
+        let mut value = 0u32;
+        let mut length = 0u32;
+        let asked = GetTokenInformation(
+            token,
+            TokenIsAppContainer,
+            Some(&raw mut value as *mut core::ffi::c_void),
+            size_of::<u32>() as u32,
+            &mut length,
+        );
+        let _ = CloseHandle(token);
+        asked.is_ok() && value != 0
+    }
+}
+
+#[cfg(not(windows))]
+fn running_in_container() -> bool {
+    false
 }
 
 /// Off Windows there is no sandbox yet, so the decode happens in-process.
@@ -125,15 +192,39 @@ pub fn run_as_decoder() -> Result<()> {
         }
     }
 
-    let request = protocol::read_request(&input[..]).context("reading the request")?;
+    let (request, section_handle) = protocol::read_request(&input[..]).context("reading the request")?;
 
     let stdout = io::stdout();
     let mut out = stdout.lock();
 
+    // A decoder taught to try the network, on request. This is how "the
+    // container closes the network" is a measurement rather than a belief —
+    // the same probe is what proved a low integrity token does *not* close
+    // it. Two shapes: an address means "try to reach it" (the exfiltration
+    // direction), and `accept:PORT` means "listen on that port and say
+    // whether anyone got through" (the command-and-control direction; binding
+    // succeeds even inside a container, so the honest question is whether a
+    // connection ever arrives). Nothing in normal use sets this.
+    if let Ok(target) = std::env::var("NITID_DECODER_PROBES_NETWORK") {
+        let report = if let Some(port) = target.strip_prefix("accept:") {
+            format!("network probe: container={} accepted={}", running_in_container(), connection_arrives_on(port))
+        } else {
+            let listen = std::net::TcpListener::bind("127.0.0.1:0").is_ok();
+            let connect = target
+                .parse()
+                .ok()
+                .map(|address| std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_secs(3)).is_ok())
+                .unwrap_or(false);
+            format!("network probe: container={} listen={listen} connect={connect}", running_in_container())
+        };
+        protocol::write_failure(&mut out, &report).context("answering the probe")?;
+        out.flush().context("flushing the reply")?;
+        return Ok(());
+    }
+
     match decode_in_this_process(&request) {
-        Ok(loaded) => protocol::write_image(
-            &mut out,
-            &protocol::RawImage {
+        Ok(loaded) => {
+            let image = protocol::RawImage {
                 width: loaded.image.width,
                 height: loaded.image.height,
                 pixels: loaded.image.pixels,
@@ -142,14 +233,49 @@ pub fn run_as_decoder() -> Result<()> {
                 // than failing the decode: the picture is worth more than the
                 // colour management on it.
                 profile: loaded.profile.and_then(|profile| profile.encode().ok()).unwrap_or_default(),
-            },
-        ),
+            };
+            answer_with_image(&mut out, &image, section_handle)
+        }
         Err(error) => protocol::write_failure(&mut out, &format!("{error:#}")),
     }
     .context("answering the request")?;
 
     out.flush().context("flushing the reply")?;
     Ok(())
+}
+
+/// Send the image back — through the shared section when the viewer offered
+/// one, inline down the pipe when it did not or the section will not take
+/// the pixels.
+///
+/// The fallback is not an edge case to apologise for: it is the whole reply
+/// path on a viewer that could not create a section, and it is what the
+/// protocol tests exercise directly.
+#[cfg(windows)]
+fn answer_with_image(out: impl io::Write, image: &protocol::RawImage, section_handle: u64) -> Result<()> {
+    if let Some(mut view) = section::DecoderView::open(section_handle)
+        && view.write(&image.pixels).is_ok()
+    {
+        return protocol::write_shared_image(out, image);
+    }
+
+    // A test lever: with this set, falling back would let a broken section
+    // path hide behind the pipe — every decode would still succeed and no
+    // test could tell the difference. Refusing instead makes "the pixels
+    // crossed through the section" an assertable fact. Nothing in normal use
+    // sets this.
+    if std::env::var_os("NITID_SHM_REQUIRED").is_some() {
+        return protocol::write_failure(out, "the section was required but could not be written");
+    }
+
+    protocol::write_image(out, image)
+}
+
+/// Off Windows there is no child and no section; the inline path is the only
+/// one.
+#[cfg(not(windows))]
+fn answer_with_image(out: impl io::Write, image: &protocol::RawImage, _section_handle: u64) -> Result<()> {
+    protocol::write_image(out, image)
 }
 
 /// Decode without a sandbox, in whichever process calls this.

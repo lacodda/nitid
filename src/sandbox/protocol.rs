@@ -6,14 +6,22 @@
 //! untrusted — every field arriving from it is bounds-checked here rather than
 //! believed.
 //!
-//! A request is: magic, version, length, then that many bytes of image file.
-//! A reply is: magic, version, tag, then a payload the tag describes.
+//! A request is: magic, version, a section handle, length, then that many
+//! bytes of image file. A reply is: magic, version, tag, then a payload the
+//! tag describes.
 //!
 //! The reply carries what the decoder learned about the file as well as its
 //! pixels — the orientation to apply and the colour profile, if any. Reading
 //! those in the parent instead would work for a format whose profile sits in
 //! the container, and quietly lose it for one like AVIF, where the colour
 //! description lives in the bitstream and only the decoder ever sees it.
+//!
+//! The pixels themselves are the one thing that may not travel down the pipe:
+//! when the viewer hands the decoder a shared memory section, the decoder
+//! writes them there and replies with only their length. A 12-megapixel image
+//! is 48 MB of pixels, and pushing that through a pipe was measured to cost a
+//! quarter of the decode time. The metadata stays on the pipe either way — it
+//! is small, and the pipe is also the signal that the reply is complete.
 
 use std::io::{Read, Write};
 
@@ -30,7 +38,10 @@ const MAGIC: [u8; 4] = *b"NTDS";
 /// negotiate.
 ///
 /// Version 2 added the orientation and the colour profile to an image reply.
-const VERSION: u16 = 2;
+/// Version 3 added the shared memory section: a request names the handle the
+/// decoder may write pixels into, and a reply may point at it instead of
+/// carrying the pixels inline.
+const VERSION: u16 = 3;
 
 /// The largest file the decoder will be handed, and the largest reply it may
 /// send back.
@@ -58,6 +69,26 @@ pub struct RawImage {
     pub profile: Vec<u8>,
 }
 
+/// A reply as it arrives from the decoder: pixels inline, or a length naming
+/// how many pixel bytes sit in the shared section.
+pub enum Reply {
+    Inline(RawImage),
+    Shared(SharedImage),
+}
+
+/// An image whose pixels the decoder wrote into the shared section.
+///
+/// Everything but the pixels; the caller reads those from the section it
+/// created, after checking this length against it.
+pub struct SharedImage {
+    pub width: u32,
+    pub height: u32,
+    pub orientation: u8,
+    pub profile: Vec<u8>,
+    /// How many bytes of RGBA8 the decoder wrote at the start of the section.
+    pub pixel_bytes: usize,
+}
+
 /// The largest colour profile that will cross the boundary.
 ///
 /// Real profiles run to a few kilobytes; a CMYK press profile with a large
@@ -66,22 +97,32 @@ pub struct RawImage {
 pub const MAX_PROFILE: usize = 4 * 1024 * 1024;
 
 /// Ask the decoder to decode `bytes`.
-pub fn write_request(mut to: impl Write, bytes: &[u8]) -> Result<()> {
+///
+/// `section_handle` is the decoder-side value of the shared section it may
+/// write pixels into, or zero when there is none and the pixels must come
+/// back inline. The handle travels in the request because the child is
+/// created before the request is written, and a suspended process cannot be
+/// told anything on its command line any more.
+pub fn write_request(mut to: impl Write, bytes: &[u8], section_handle: u64) -> Result<()> {
     if bytes.len() > MAX_PAYLOAD {
         bail!("the file is {} bytes, past the {MAX_PAYLOAD} this build will decode", bytes.len());
     }
 
     to.write_all(&MAGIC)?;
     to.write_all(&VERSION.to_le_bytes())?;
+    to.write_all(&section_handle.to_le_bytes())?;
     to.write_all(&(bytes.len() as u64).to_le_bytes())?;
     to.write_all(bytes)?;
     to.flush()?;
     Ok(())
 }
 
-/// Read a request in the decoder process.
-pub fn read_request(mut from: impl Read) -> Result<Vec<u8>> {
+/// Read a request in the decoder process: the file bytes and the section
+/// handle, zero when the viewer offered none.
+pub fn read_request(mut from: impl Read) -> Result<(Vec<u8>, u64)> {
     expect_header(&mut from)?;
+
+    let section_handle = read_u64(&mut from)?;
 
     let length = read_u64(&mut from)? as usize;
     if length > MAX_PAYLOAD {
@@ -90,7 +131,7 @@ pub fn read_request(mut from: impl Read) -> Result<Vec<u8>> {
 
     let mut bytes = vec![0u8; length];
     from.read_exact(&mut bytes)?;
-    Ok(bytes)
+    Ok((bytes, section_handle))
 }
 
 /// Send a decoded image back to the viewer.
@@ -109,6 +150,28 @@ pub fn write_image(mut to: impl Write, image: &RawImage) -> Result<()> {
     to.write_all(&image.profile)?;
     to.write_all(&(image.pixels.len() as u64).to_le_bytes())?;
     to.write_all(&image.pixels)?;
+    to.flush()?;
+    Ok(())
+}
+
+/// Send an image whose pixels are already in the shared section.
+///
+/// The same shape as an inline image up to the pixel length — and then no
+/// pixels, because they are sitting in the section the viewer handed over.
+pub fn write_shared_image(mut to: impl Write, image: &RawImage) -> Result<()> {
+    if image.profile.len() > MAX_PROFILE {
+        bail!("the profile is {} bytes, past the {MAX_PROFILE} this build will carry", image.profile.len());
+    }
+
+    to.write_all(&MAGIC)?;
+    to.write_all(&VERSION.to_le_bytes())?;
+    to.write_all(&[TAG_SHARED_IMAGE])?;
+    to.write_all(&image.width.to_le_bytes())?;
+    to.write_all(&image.height.to_le_bytes())?;
+    to.write_all(&[image.orientation])?;
+    to.write_all(&(image.profile.len() as u64).to_le_bytes())?;
+    to.write_all(&image.profile)?;
+    to.write_all(&(image.pixels.len() as u64).to_le_bytes())?;
     to.flush()?;
     Ok(())
 }
@@ -135,15 +198,18 @@ pub fn write_failure(mut to: impl Write, message: &str) -> Result<()> {
 /// Read whatever the decoder sent.
 ///
 /// Everything here comes from the process that touched the hostile file, so
-/// every number is checked before it is used to size an allocation.
-pub fn read_reply(mut from: impl Read) -> Result<Result<RawImage, String>> {
+/// every number is checked before it is used to size an allocation. A shared
+/// reply's pixel length is checked against the dimensions here for the same
+/// reason an inline one's is: the caller reads that many bytes out of the
+/// section, and a lying length must be refused before it sizes anything.
+pub fn read_reply(mut from: impl Read) -> Result<Result<Reply, String>> {
     expect_header(&mut from)?;
 
     let mut tag = [0u8; 1];
     from.read_exact(&mut tag)?;
 
     match tag[0] {
-        TAG_IMAGE => {
+        TAG_IMAGE | TAG_SHARED_IMAGE => {
             let width = read_u32(&mut from)?;
             let height = read_u32(&mut from)?;
 
@@ -173,15 +239,25 @@ pub fn read_reply(mut from: impl Read) -> Result<Result<RawImage, String>> {
                 bail!("the decoder returned {length} bytes, past the {MAX_PAYLOAD} limit");
             }
 
+            if tag[0] == TAG_SHARED_IMAGE {
+                return Ok(Ok(Reply::Shared(SharedImage {
+                    width,
+                    height,
+                    orientation,
+                    profile,
+                    pixel_bytes: length,
+                })));
+            }
+
             let mut pixels = vec![0u8; length];
             from.read_exact(&mut pixels)?;
-            Ok(Ok(RawImage {
+            Ok(Ok(Reply::Inline(RawImage {
                 width,
                 height,
                 pixels,
                 orientation,
                 profile,
-            }))
+            })))
         }
         TAG_FAILURE => {
             let length = read_u64(&mut from)? as usize;
@@ -200,6 +276,8 @@ pub fn read_reply(mut from: impl Read) -> Result<Result<RawImage, String>> {
 const TAG_IMAGE: u8 = 1;
 /// The reply carries a reason the file would not decode.
 const TAG_FAILURE: u8 = 2;
+/// The reply carries an image whose pixels are in the shared section.
+const TAG_SHARED_IMAGE: u8 = 3;
 
 fn expect_header(mut from: impl Read) -> Result<()> {
     let mut magic = [0u8; 4];
@@ -237,8 +315,21 @@ mod tests {
     #[test]
     fn a_request_survives_the_round_trip() {
         let mut wire = Vec::new();
-        write_request(&mut wire, b"the file bytes").unwrap();
-        assert_eq!(read_request(&wire[..]).unwrap(), b"the file bytes");
+        write_request(&mut wire, b"the file bytes", 0).unwrap();
+        let (bytes, section) = read_request(&wire[..]).unwrap();
+        assert_eq!(bytes, b"the file bytes");
+        assert_eq!(section, 0);
+    }
+
+    /// The section handle is how the decoder learns where to put the pixels;
+    /// a value mangled in transit would mean pixels written to a random
+    /// handle, so the exact number must survive.
+    #[test]
+    fn the_section_handle_survives_the_round_trip() {
+        let mut wire = Vec::new();
+        write_request(&mut wire, b"bytes", 0xDEAD_BEEF_CAFE).unwrap();
+        let (_, section) = read_request(&wire[..]).unwrap();
+        assert_eq!(section, 0xDEAD_BEEF_CAFE);
     }
 
     #[test]
@@ -254,11 +345,53 @@ mod tests {
         let mut wire = Vec::new();
         write_image(&mut wire, &image).unwrap();
 
-        let Ok(Ok(decoded)) = read_reply(&wire[..]) else {
+        let Ok(Ok(Reply::Inline(decoded))) = read_reply(&wire[..]) else {
             panic!("the image did not survive the round trip");
         };
         assert_eq!((decoded.width, decoded.height), (2, 1));
         assert_eq!(decoded.pixels, image.pixels);
+    }
+
+    /// A shared reply carries everything but the pixels, and its claimed
+    /// length is held to the dimensions exactly as an inline one's is.
+    #[test]
+    fn a_shared_image_carries_its_metadata_and_no_pixels() {
+        let image = RawImage {
+            width: 2,
+            height: 2,
+            pixels: vec![9; 16],
+            orientation: 6,
+            profile: vec![1, 2, 3],
+        };
+
+        let mut wire = Vec::new();
+        write_shared_image(&mut wire, &image).unwrap();
+
+        let Ok(Ok(Reply::Shared(shared))) = read_reply(&wire[..]) else {
+            panic!("the shared image did not survive the round trip");
+        };
+        assert_eq!((shared.width, shared.height), (2, 2));
+        assert_eq!(shared.orientation, 6);
+        assert_eq!(shared.profile, vec![1, 2, 3]);
+        assert_eq!(shared.pixel_bytes, 16);
+    }
+
+    /// A shared length that does not match the dimensions is the decoder
+    /// lying about what it wrote, and is refused before anything reads it.
+    #[test]
+    fn a_shared_length_that_does_not_match_the_dimensions_is_refused() {
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&MAGIC);
+        wire.extend_from_slice(&VERSION.to_le_bytes());
+        wire.push(TAG_SHARED_IMAGE);
+        wire.extend_from_slice(&2u32.to_le_bytes());
+        wire.extend_from_slice(&2u32.to_le_bytes());
+        wire.push(1);
+        wire.extend_from_slice(&0u64.to_le_bytes());
+        // Four bytes claimed for a sixteen-byte image.
+        wire.extend_from_slice(&4u64.to_le_bytes());
+
+        assert!(read_reply(&wire[..]).is_err());
     }
 
     #[test]
@@ -289,7 +422,7 @@ mod tests {
         let mut wire = Vec::new();
         write_image(&mut wire, &image).unwrap();
 
-        let Ok(Ok(decoded)) = read_reply(&wire[..]) else {
+        let Ok(Ok(Reply::Inline(decoded))) = read_reply(&wire[..]) else {
             panic!("the image did not survive the round trip");
         };
         assert_eq!(decoded.orientation, 6);
@@ -312,7 +445,7 @@ mod tests {
         let mut wire = Vec::new();
         write_image(&mut wire, &image).unwrap();
 
-        let Ok(Ok(decoded)) = read_reply(&wire[..]) else {
+        let Ok(Ok(Reply::Inline(decoded))) = read_reply(&wire[..]) else {
             panic!("the image did not survive the round trip");
         };
         assert!(decoded.profile.is_empty());

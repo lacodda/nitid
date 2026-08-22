@@ -129,18 +129,21 @@ HEIC and AVIF decode in a **separate process** — not because they are unsafe
 any more, but because a process can be stopped and a thread cannot. Navigate
 away from a large image and the decode is abandoned rather than finished for
 nobody; hand the viewer a file that wedges a decoder and the child is killed on
-a timeout rather than taking a worker with it. The child is created suspended,
-stripped of every privilege, dropped to low integrity, and held in a job object
-that caps its memory and kills it with the viewer; it is handed the file's
-bytes on a pipe and never its path. See
-[ADR 0009](docs/adr/0009-heavy-decodes-run-in-a-child.md).
+a timeout rather than taking a worker with it. The child is created suspended
+inside an **AppContainer with no capabilities**, held in a job object that caps
+its memory and kills it with the viewer, and handed the file's bytes on stdin
+and never its path; the pixels come home through shared memory. See
+[ADR 0009](docs/adr/0009-heavy-decodes-run-in-a-child.md) and
+[ADR 0011](docs/adr/0011-the-decoder-loses-the-network.md).
 
-One thing that boundary does **not** do is close the network, and this is
-measured rather than assumed: a decoder taught to try reaches the internet from
-inside it. A low integrity token does not close a socket, whatever the common
-belief. Nothing behind the boundary opens one — every decoder is Rust and none
-has any use for a socket — but closing it properly needs an AppContainer, and
-that has its own version ahead.
+The container is what closes the **network**, and closed is measured rather
+than assumed, in both directions: a decoder taught to try cannot reach a live
+listener waiting just outside the sandbox, and a listener it binds inside
+accepts nothing while the same test hammers the port from outside. The
+previous arrangement — a restricted token at low integrity — demonstrably
+does not close a socket, whatever the common belief; it remains only as the
+fallback for a machine that cannot register a container profile, and falling
+back is reported rather than silent.
 
 SVG is drawn for the size it is shown at, and drawn again when that changes, so
 zooming in sharpens the picture instead of enlarging pixels. A document that
@@ -151,10 +154,11 @@ has no size limit to hide behind.
 
 ## Status
 
-Early development — v0.10.0 is out. Startup, colour and format coverage hold:
+Early development — v0.11.0 is out. Startup, colour and format coverage hold:
 every modern still format opens, a phone's photographs included, and every one
-of them reaches the screen without a wait. HDR is still ahead. Development runs in small versions, each
-one theme; the road to 1.0 is fixed:
+of them reaches the screen without a wait — and the process that decodes the
+heavy ones now runs with no network in either direction. HDR is still ahead.
+Development runs in small versions, each one theme; the road to 1.0 is fixed:
 
 | Version | What lands |
 | --- | --- |
@@ -170,7 +174,7 @@ one theme; the road to 1.0 is fixed:
 | ✅ v0.8.0 | AVIF, decoded with `rav1d` |
 | ✅ v0.9.0 | Decodes that can be stopped: cancelled on navigation, killed on a timeout |
 | ✅ v0.10.0 | HEIC from its thumbnail, and its ICC colour on the GPU |
-| v0.11.0 | Format tails, and the network closed to the decoder |
+| ✅ v0.11.0 | The network closed to the decoder, and a cheaper bridge |
 | v0.12.0 | Animation: GIF, WebP, APNG |
 | v0.13.0 | HDR output on Windows (`Bt2100Pq` on `Rgb10a2Unorm`) |
 | v0.14.0 | Gigapixel images via tiled rendering |

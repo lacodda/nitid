@@ -1,29 +1,25 @@
 //! Confining the decoder process on Windows.
 //!
-//! Three mechanisms, each covering what the others do not:
+//! The first choice is an **AppContainer with no capabilities**: an identity
+//! that closes the network as well — a low integrity token demonstrably does
+//! not, a decoder taught to try reported `listen=true connect=true` from
+//! behind one. Should the container profile be unavailable on a machine, the
+//! launch falls back to the previous arrangement, a **restricted token**
+//! with every removable privilege deleted and **low integrity**, so nothing
+//! is ever weaker than it was before the container existed — and the
+//! fallback says so on stderr rather than weakening the boundary silently.
 //!
-//! - **A job object** with kill-on-close, so the child cannot outlive the
-//!   viewer however it exits, plus a memory cap and a process count of one, so
-//!   it cannot allocate the machine to death or launch anything.
-//! - **A low integrity level**, so it cannot write to the user's files or open
-//!   a handle to any process above it.
-//! - **A restricted token** with every removable privilege deleted, so nothing
-//!   it inherited from the viewer is available to it.
+//! Either way the child sits in **a job object** with kill-on-close, so it
+//! cannot outlive the viewer however it exits, plus a memory cap and a
+//! process count of one, so it cannot allocate the machine to death or
+//! launch anything.
 //!
 //! The order matters: the process is created suspended, confined while it
 //! cannot run a single instruction, and only then resumed. Confining a running
 //! process is a race, not a boundary.
-//!
-//! What this deliberately does *not* claim is network isolation. A low
-//! integrity process can still open a socket — that is a common
-//! misconception, and pretending otherwise in a comment would be worse than
-//! the gap itself. Shutting the network needs an AppContainer or a firewall
-//! rule; see the note at the end of this module.
 
 use std::io::Read;
-use std::os::windows::io::AsRawHandle;
-use std::os::windows::process::CommandExt;
-use std::process::{Child, Command, Stdio};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -39,10 +35,12 @@ use windows::Win32::System::JobObjects::{
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
     SetInformationJobObject, TerminateJobObject,
 };
-use windows::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED, OpenProcessToken, ResumeThread, WaitForSingleObject};
+use windows::Win32::System::Threading::{OpenProcessToken, ResumeThread, TerminateProcess, WaitForSingleObject};
 use windows::core::{PCWSTR, w};
 
 use super::protocol;
+use super::section::Section;
+use super::spawn::{AppContainer, SpawnedChild};
 use crate::image_source::{DecodedImage, Fidelity, LoadedImage, Orientation};
 
 /// The attribute marking a token's mandatory label group.
@@ -57,58 +55,156 @@ const SE_GROUP_INTEGRITY: u32 = 0x20;
 /// the cap turns that from a machine-wide problem into a dead child process.
 const MEMORY_LIMIT: usize = 1024 * 1024 * 1024;
 
+/// The container identity, prepared once per process.
+///
+/// `None` when the profile could not be registered at all; the failure is
+/// reported once rather than per decode.
+fn container() -> Option<&'static AppContainer> {
+    static CONTAINER: OnceLock<Option<AppContainer>> = OnceLock::new();
+    CONTAINER
+        .get_or_init(|| {
+            AppContainer::prepare()
+                .map_err(|error| eprintln!("nitid: no container profile for the decoder, running it with a restricted token: {error:#}"))
+                .ok()
+        })
+        .as_ref()
+}
+
+/// Launch the decoder: in an AppContainer when the machine allows it, behind
+/// a restricted token when it does not.
+///
+/// The container needs no granting anywhere: `CreateProcessW` maps the
+/// executable image with the *viewer's* access, so the child never opens its
+/// own path — measured by running one from a directory whose ACLs never
+/// heard of the container. (v0.9.0 recorded the opposite belief — that the
+/// SID needed access along the whole directory chain — but the "file not
+/// found" behind it was in all likelihood that attempt's own fat-pointer
+/// bug, which it also recorded.) The fallback exists for a machine where the
+/// profile cannot be registered at all, and is reported once: silently
+/// weakening a boundary is how gaps become surprises.
+fn launch(exe: &std::path::Path) -> Result<SpawnedChild> {
+    // The lever the fallback tests pull: without a way to refuse the
+    // container on purpose, the restricted-token path would only ever run on
+    // the machine where something already went wrong. Nothing in normal use
+    // sets this.
+    let refused = std::env::var_os("NITID_NO_CONTAINER").is_some();
+
+    if !refused && let Some(container) = container() {
+        match super::spawn::spawn(exe, super::DECODE_ARGUMENT, Some(container)) {
+            Ok(child) => return Ok(child),
+            Err(error) => {
+                static REPORTED: OnceLock<()> = OnceLock::new();
+                REPORTED.get_or_init(|| {
+                    eprintln!("nitid: the decoder's container will not start here, running it with a restricted token: {error:#}");
+                });
+            }
+        }
+    }
+
+    let child = super::spawn::spawn(exe, super::DECODE_ARGUMENT, None)?;
+    if let Err(error) = restrict_token(child.process) {
+        eprintln!("nitid: the decoder could not be restricted: {error:#}");
+    }
+    Ok(child)
+}
+
 /// Decode `bytes` in a confined child process.
 pub fn decode(bytes: &[u8], timeout: Duration) -> Result<LoadedImage> {
-    let mut child = Command::new(super::decoder_executable()?)
-        .arg(super::DECODE_ARGUMENT)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        // Suspended, so the confinement below is in place before the child
-        // runs anything at all; no window, so a decode does not flash a
-        // console over the picture.
-        .creation_flags(CREATE_SUSPENDED.0 | CREATE_NO_WINDOW.0)
-        .spawn()
-        .context("starting the decoder process")?;
+    // Created suspended, so the confinement is in place before the child runs
+    // a single instruction; no window, so a decode does not flash a console
+    // over the picture.
+    let mut child = launch(&super::decoder_executable()?)?;
 
     // From here on the child must not be left suspended and running loose: a
     // guard kills it on every path out, including a panic.
     let job = confine(&child);
     let guard = ChildGuard { child: &mut child, job };
 
+    // The pixels come home through shared memory when a section can be had;
+    // when it cannot, the decoder is told nothing about one and answers down
+    // the pipe. The handle is duplicated into the still-suspended child —
+    // never inherited, because inheritance is process-wide and two decodes
+    // spawning concurrently would each leak their section into the other's
+    // child.
+    let section = if std::env::var_os("NITID_SHM_DISABLED").is_none() {
+        Section::reserve()
+            .map_err(|error| eprintln!("nitid: the pixels will cross the pipe instead of shared memory: {error:#}"))
+            .ok()
+    } else {
+        None
+    };
+    let section_handle = section
+        .as_ref()
+        .map(|section| duplicate_into(guard.child.process, section.handle()).unwrap_or(0))
+        .unwrap_or(0);
+
     guard.resume().context("resuming the decoder process")?;
 
-    let reply = exchange(guard.child, bytes, timeout);
+    let reply = exchange(guard.child, bytes, section_handle, timeout);
 
     // The child has answered or been killed; either way it is finished with.
     drop(guard);
 
-    match reply? {
-        Ok(image) => Ok(LoadedImage {
-            orientation: Orientation::from_exif(u16::from(image.orientation)),
-            // A profile the decoder sent that will not parse here is treated
-            // as no profile, the same as anywhere else: broken colour metadata
-            // is not a reason to refuse an image.
-            profile: (!image.profile.is_empty()).then(|| ColorProfile::new_from_slice(&image.profile).ok()).flatten(),
-            image: DecodedImage {
-                width: image.width,
-                height: image.height,
-                pixels: image.pixels,
-            },
-            fidelity: Fidelity::Full,
-            // A vector document does not cross the boundary: the formats that
-            // need a sandbox are all raster, and re-rasterising on zoom would
-            // mean a round trip per frame.
-            vector: None,
-        }),
+    let image = match reply? {
+        Ok(protocol::Reply::Inline(image)) => image,
+        Ok(protocol::Reply::Shared(shared)) => {
+            // A decoder that answers "the pixels are in the section" when it
+            // was never handed one is lying, not confused.
+            let section = section.as_ref().context("the decoder answered through a section it was never given")?;
+            let pixels = section.read(shared.pixel_bytes)?;
+            protocol::RawImage {
+                width: shared.width,
+                height: shared.height,
+                pixels,
+                orientation: shared.orientation,
+                profile: shared.profile,
+            }
+        }
         // A file the decoder could not read is an ordinary failure carrying
         // the decoder's own words, not a sandbox event.
         Err(message) => bail!("{message}"),
+    };
+
+    Ok(LoadedImage {
+        orientation: Orientation::from_exif(u16::from(image.orientation)),
+        // A profile the decoder sent that will not parse here is treated
+        // as no profile, the same as anywhere else: broken colour metadata
+        // is not a reason to refuse an image.
+        profile: (!image.profile.is_empty()).then(|| ColorProfile::new_from_slice(&image.profile).ok()).flatten(),
+        image: DecodedImage {
+            width: image.width,
+            height: image.height,
+            pixels: image.pixels,
+        },
+        fidelity: Fidelity::Full,
+        // A vector document does not cross the boundary: the formats that
+        // need a sandbox are all raster, and re-rasterising on zoom would
+        // mean a round trip per frame.
+        vector: None,
+    })
+}
+
+/// Duplicate `handle` into the child, returning the value it has over there.
+///
+/// The child is still suspended, so the handle is in place before its first
+/// instruction. A duplication that fails degrades to the pipe rather than
+/// failing the decode — the caller maps a zero to "no section offered".
+fn duplicate_into(child: HANDLE, handle: HANDLE) -> Result<u64> {
+    use windows::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle};
+    use windows::Win32::System::Threading::GetCurrentProcess;
+
+    let mut duplicated = HANDLE::default();
+    // SAFETY: both process handles are live — ours by definition, the child's
+    // because it has not been reaped — and the duplicated handle belongs to
+    // the child, which closes it when it exits.
+    unsafe {
+        DuplicateHandle(GetCurrentProcess(), handle, child, &mut duplicated, 0, false, DUPLICATE_SAME_ACCESS).context("handing the section to the decoder")?;
     }
+    Ok(duplicated.0 as u64)
 }
 
 /// Write the request, read the reply, and kill the child if it takes too long.
-fn exchange(child: &mut Child, bytes: &[u8], timeout: Duration) -> Result<Result<protocol::RawImage, String>> {
+fn exchange(child: &mut SpawnedChild, bytes: &[u8], section_handle: u64, timeout: Duration) -> Result<Result<protocol::Reply, String>> {
     let mut stdin = child.stdin.take().context("the decoder has no standard input")?;
     let mut stdout = child.stdout.take().context("the decoder has no standard output")?;
 
@@ -116,7 +212,7 @@ fn exchange(child: &mut Child, bytes: &[u8], timeout: Duration) -> Result<Result
     // would otherwise block the viewer forever on a full pipe.
     let request = bytes.to_vec();
     let writer = std::thread::spawn(move || {
-        let _ = protocol::write_request(&mut stdin, &request);
+        let _ = protocol::write_request(&mut stdin, &request, section_handle);
         // Dropping stdin closes the pipe, which is how the child sees the end
         // of the request.
     });
@@ -135,10 +231,9 @@ fn exchange(child: &mut Child, bytes: &[u8], timeout: Duration) -> Result<Result
         reply
     });
 
-    let handle = HANDLE(child.as_raw_handle());
     // SAFETY: the handle belongs to a child this process owns and has not yet
     // been reaped, so it stays valid for the wait.
-    let wait = unsafe { WaitForSingleObject(handle, timeout.as_millis().min(u32::MAX as u128) as u32) };
+    let wait = unsafe { WaitForSingleObject(child.process, timeout.as_millis().min(u32::MAX as u128) as u32) };
     let _ = writer.join();
 
     if wait == WAIT_TIMEOUT {
@@ -160,22 +255,16 @@ fn exchange(child: &mut Child, bytes: &[u8], timeout: Duration) -> Result<Result
     protocol::read_reply(&reply[..])
 }
 
-/// Put the child in a job object and drop what its token can do.
+/// Put the child in a job object.
 ///
-/// Failures here are reported and the decode continues: a viewer that refuses
+/// A failure here is reported and the decode continues: a viewer that refuses
 /// to open images because a hardening step was unavailable is worse than one
 /// that opens them slightly less safely, and the pure-Rust decoders behind
 /// this boundary are not the reason it exists. The one thing never skipped is
 /// the job's kill-on-close, because without it a hung child could outlive the
 /// viewer — and that failure is loud.
-fn confine(child: &Child) -> Option<Job> {
-    let handle = HANDLE(child.as_raw_handle());
-
-    if let Err(error) = restrict_token(handle) {
-        eprintln!("nitid: the decoder could not be restricted: {error:#}");
-    }
-
-    match Job::holding(handle) {
+fn confine(child: &SpawnedChild) -> Option<Job> {
+    match Job::holding(child.process) {
         Ok(job) => Some(job),
         Err(error) => {
             eprintln!("nitid: the decoder could not be confined to a job: {error:#}");
@@ -303,19 +392,25 @@ impl Drop for OwnedHandle {
 
 /// Makes sure the child never outlives this scope, however it is left.
 struct ChildGuard<'a> {
-    child: &'a mut Child,
+    child: &'a mut SpawnedChild,
     job: Option<Job>,
 }
 
 impl ChildGuard<'_> {
     /// Let the confined child start running.
+    ///
+    /// The thread handle came back from `CreateProcessW` and was kept for
+    /// exactly this call. The previous arrangement — `std::process::Command`
+    /// discards that handle — meant finding the thread again through a
+    /// system-wide Toolhelp snapshot, which cost 35–45 ms per decode: seven
+    /// times the spawn itself.
     fn resume(&self) -> Result<()> {
         // `ResumeThread` reports failure by returning `u32::MAX` rather than
         // through the type system, so it is the one call here that would fail
         // silently if the result went unchecked.
         //
         // SAFETY: the thread handle belongs to the suspended child.
-        let previous = unsafe { ResumeThread(main_thread(self.child)?) };
+        let previous = unsafe { ResumeThread(self.child.thread) };
         if previous == u32::MAX {
             bail!("the decoder process would not start");
         }
@@ -328,67 +423,23 @@ impl Drop for ChildGuard<'_> {
         if let Some(job) = &self.job {
             job.terminate();
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-/// The handle of the child's initial thread.
-///
-/// `std` keeps the process handle but closes the thread handle it was given,
-/// so the thread is reopened by identifier to resume it.
-fn main_thread(child: &Child) -> Result<HANDLE> {
-    use windows::Win32::System::Threading::{OpenThread, THREAD_SUSPEND_RESUME};
-
-    // The initial thread of a process created suspended is the only one it
-    // has, so the first thread of that process is the one to resume.
-    let thread_id = first_thread_of(child.id()).context("finding the decoder's thread")?;
-
-    // SAFETY: the identifier names a thread of a child this process owns.
-    let handle = unsafe { OpenThread(THREAD_SUSPEND_RESUME, false, thread_id) }.context("opening the decoder's thread")?;
-    Ok(handle)
-}
-
-/// The first thread identifier belonging to `process_id`.
-fn first_thread_of(process_id: u32) -> Result<u32> {
-    use windows::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next};
-
-    // SAFETY: the snapshot handle is closed before returning on every path.
-    unsafe {
-        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0).context("listing threads")?;
-        let snapshot = OwnedHandle(snapshot);
-
-        let mut entry = THREADENTRY32 {
-            dwSize: size_of::<THREADENTRY32>() as u32,
-            ..Default::default()
-        };
-
-        if Thread32First(snapshot.0, &mut entry).is_ok() {
-            loop {
-                if entry.th32OwnerProcessID == process_id {
-                    return Ok(entry.th32ThreadID);
-                }
-                if Thread32Next(snapshot.0, &mut entry).is_err() {
-                    break;
-                }
-            }
+        // SAFETY: the process handle is live until the `SpawnedChild` closes
+        // it; killing an already exited process is a harmless error, and the
+        // wait afterwards is what makes the kill observable before the pipes
+        // are torn down.
+        unsafe {
+            let _ = TerminateProcess(self.child.process, 1);
+            let _ = WaitForSingleObject(self.child.process, u32::MAX);
         }
     }
-
-    bail!("the decoder process has no threads")
 }
 
-// Not done here, and worth saying plainly rather than leaving to be assumed:
-// the network is still reachable from the decoder. That is no longer a
-// suspicion — a decoder taught to try reported `listen=true connect=true` from
-// inside this boundary, so a low integrity token demonstrably does not close a
-// socket.
-//
-// Closing it needs an AppContainer with no capabilities, which was attempted
-// in v0.9.0 and turned out to be a stage of its own: the container needs its
-// own SID granted access not only to the executable but along every directory
-// leading to it, which means the viewer editing permissions on folders it does
-// not own. That work has its own version in the plan. Until then the gap costs
-// nothing measurable — every decoder behind this boundary is Rust and none
-// opens a socket — but it is a gap, and it is written down rather than papered
-// over.
+// What "the network is closed" rests on, so nobody has to take it on faith:
+// `tests/sandbox.rs` runs the decoder inside the container and has it try
+// both directions. Outward, a live listener just outside the sandbox is
+// unreachable (`connect=false`). Inward, a listener the decoder binds — the
+// bind itself succeeds even in a container, which alone would read as a hole —
+// accepts nothing while the test hammers its port from outside
+// (`accepted=false`). And the same probe run behind the restricted-token
+// fallback sees an open network, which is what makes the closed readings the
+// container's doing rather than a broken probe's.
