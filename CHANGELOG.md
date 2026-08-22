@@ -2,6 +2,11 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.11.0] - 2026-08-22
+
+### Features
+- Close the network to the decoder and cheapen the bridge
+
 ## [0.10.0] - 2026-08-21
 
 ### Features
