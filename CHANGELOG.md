@@ -2,6 +2,11 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.12.0] - 2026-08-23
+
+### Features
+- Play GIF, APNG and animated WebP
+
 ## [0.11.0] - 2026-08-22
 
 ### Features
