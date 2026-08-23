@@ -113,6 +113,10 @@ impl ColourUniform {
 /// The image currently resident on the GPU.
 struct Upload {
     bind_group: wgpu::BindGroup,
+    /// Kept so an animation can write its next frame into the same texture
+    /// rather than building a texture and bind group per frame.
+    texture: wgpu::Texture,
+    size: (u32, u32),
 }
 
 /// Device, surface, pipeline, and the texture being shown.
@@ -447,7 +451,45 @@ impl Renderer {
             ],
         });
 
-        self.upload = Some(Upload { bind_group });
+        self.upload = Some(Upload {
+            bind_group,
+            texture,
+            size: (image.width, image.height),
+        });
+    }
+
+    /// Write new pixels into the texture already on screen.
+    ///
+    /// This is the frame tick of an animation: the texture, its format, the
+    /// colour transform and the bind group all stand — the frames of one file
+    /// share a size and a profile — so a frame costs one upload rather than
+    /// the full `set_image`. False when nothing is up yet or the size does
+    /// not match, in which case the caller's picture is wrong enough that a
+    /// full `set_image` is the answer.
+    pub fn update_pixels(&mut self, image: &DecodedImage) -> bool {
+        let Some(upload) = &self.upload else {
+            return false;
+        };
+        if upload.size != (image.width, image.height) {
+            return false;
+        }
+
+        let extent = wgpu::Extent3d {
+            width: image.width.max(1),
+            height: image.height.max(1),
+            depth_or_array_layers: 1,
+        };
+        self.queue.write_texture(
+            upload.texture.as_image_copy(),
+            &image.pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(image.bytes_per_row()),
+                rows_per_image: Some(extent.height),
+            },
+            extent,
+        );
+        true
     }
 
     /// Upload the sampled tone curves the shader reads.

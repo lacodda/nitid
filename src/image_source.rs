@@ -125,6 +125,13 @@ pub struct LoadedImage {
     /// size instead of scaling what it already has — which is the whole reason
     /// to open a vector format at all.
     pub vector: Option<VectorImage>,
+    /// Every frame of an animated image, when there is more than one.
+    ///
+    /// `image` above is the first of these frames, so a caller that ignores
+    /// this field shows exactly what earlier versions showed. Behind an `Arc`
+    /// because the loader clones `LoadedImage` out of its prefetch cache, and
+    /// an animation is the one part worth not copying.
+    pub animation: Option<std::sync::Arc<crate::animation::Animation>>,
 }
 
 impl LoadedImage {
@@ -192,6 +199,26 @@ fn decode_with(bytes: &[u8], confinement: Confinement) -> Result<LoadedImage> {
 
     let malformed = || format!("the {} data is malformed", format.name());
 
+    // The formats that animate are asked for their frames first. `Some` here
+    // covers even a single-frame GIF — the frame is already decoded, and
+    // decoding the same bytes twice to call it a still would be waste. A
+    // still PNG or WebP comes back `None` and takes the ordinary path.
+    if matches!(format, Format::Gif | Format::Png | Format::WebP)
+        && let Some(animation) = crate::animation::decode(format, bytes)
+    {
+        let image = animation.frames[0].image.clone();
+        return Ok(LoadedImage {
+            image,
+            // None of the three formats states an EXIF orientation in
+            // practice, and their decoders deliver the canvas as shown.
+            orientation: Orientation::Normal,
+            fidelity: Fidelity::Full,
+            profile: color::profile_from(bytes),
+            vector: None,
+            animation: (animation.frames.len() > 1).then(|| std::sync::Arc::new(animation)),
+        });
+    }
+
     // A vector image is parsed rather than decoded, and the result is kept:
     // the pixels here are only the first rasterisation, at the size the
     // document declares, and the viewer draws it again whenever the size on
@@ -207,6 +234,7 @@ fn decode_with(bytes: &[u8], confinement: Confinement) -> Result<LoadedImage> {
             fidelity: Fidelity::Full,
             profile: None,
             vector: Some(vector),
+            animation: None,
         });
     }
 
@@ -250,6 +278,7 @@ fn decode_with(bytes: &[u8], confinement: Confinement) -> Result<LoadedImage> {
         profile,
         // A raster format is its pixels; there is nothing to redraw from.
         vector: None,
+        animation: None,
     })
 }
 
@@ -303,6 +332,7 @@ pub fn decode_thumbnail(bytes: &[u8]) -> Option<LoadedImage> {
         profile: color::profile_from(bytes),
         // Thumbnails come from EXIF, which only raster formats carry.
         vector: None,
+        animation: None,
     })
 }
 
@@ -348,6 +378,7 @@ fn decode_heic_thumbnail(bytes: &[u8]) -> Option<LoadedImage> {
         // profile would convert them twice (ADR 0007).
         profile: None,
         vector: None,
+        animation: None,
     })
 }
 
@@ -584,7 +615,7 @@ fn grey_to_rgba8(samples: impl Iterator<Item = (u8, u8)>, expected: usize) -> Ve
 }
 
 /// Widen opaque RGB samples to the RGBA8 the renderer uploads.
-fn rgb_to_rgba8(rgb: &[u8], expected: usize) -> Vec<u8> {
+pub(crate) fn rgb_to_rgba8(rgb: &[u8], expected: usize) -> Vec<u8> {
     let mut pixels = vec![0xFFu8; expected];
     for (target, source) in pixels.as_chunks_mut::<4>().0.iter_mut().zip(rgb.as_chunks::<3>().0) {
         target[..3].copy_from_slice(source);
@@ -1219,6 +1250,132 @@ mod tests {
         assert_eq!(Orientation::from_exif(99), Orientation::Normal);
     }
 
+    /// Three 4x4 frames — red, green, blue — written by Pillow, an encoder
+    /// independent of every decoder under test. 200 ms per frame.
+    const ANIMATED_GIF: &str = concat!(
+        "R0lGODlhBAAEAIEAAP8AAAAAAAAAAAAAACH/C05FVFNDQVBFMi4wAwEAAAAh+QQAFAAAACwAAAAABAAEAAAICQABCBxIsCCA",
+        "gAAh+QQBFAABACwAAAAABAAEAIEA/wAAAAAAAAAAAAAICQABCBxIsCCAgAAh+QQBFAABACwAAAAABAAEAIEAAP8AAAAAAAAA",
+        "AAAICQABCBxIsCCAgAA7",
+    );
+
+    /// The same three frames with a stated delay of zero, which files use to
+    /// mean "you pick" and browsers read as 100 ms.
+    const ANIMATED_GIF_ZERO_DELAY: &str = concat!(
+        "R0lGODlhBAAEAIEAAP8AAAAAAAAAAAAAACH/C05FVFNDQVBFMi4wAwEAAAAsAAAAAAQABAAACAkAAQgcSLAggIAAIfkEAQAA",
+        "AQAsAAAAAAQABACBAP8AAAAAAAAAAAAACAkAAQgcSLAggIAAIfkEAQAAAQAsAAAAAAQABACBAAD/AAAAAAAAAAAACAkAAQgc",
+        "SLAggIAAOw==",
+    );
+
+    /// The same three frames as an APNG, 100 ms per frame, from Pillow.
+    const ANIMATED_APNG: &str = concat!(
+        "iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAACGFjVEwAAAADAAAAAM7tusAAAAAaZmNUTAAAAAAAAAAEAAAA",
+        "BAAAAAAAAAAAAAEACgAAV3ID4QAAABFJREFUeJxj/M+AAExIbDwcADPRAQcw5+FMAAAAGmZjVEwAAAABAAAABAAAAAQAAAAA",
+        "AAAAAAABAAoAAMwB6TUAAAAWZmRBVAAAAAJ4nGNk+M8AB0wIJj4OADLSAQcatUejAAAAGmZjVEwAAAADAAAABAAAAAQAAAAA",
+        "AAAAAAABAAoAACGXOtwAAAAXZmRBVAAAAAR4nGNkYPjPAANMcBZeDgAx0wEH5WGlLAAAAABJRU5ErkJggg==",
+    );
+
+    /// The same three frames as a lossless animated WebP, 150 ms per frame,
+    /// from Pillow.
+    const ANIMATED_WEBP: &str = concat!(
+        "UklGRrQAAABXRUJQVlA4WAoAAAACAAAAAwAAAwAAQU5JTQYAAAAAAAAAAABBTk1GKAAAAAAAAAAAAAMAAAMAAJYAAAJWUDhM",
+        "DwAAAC8DwAAABxD9j/4HIqL/AQBBTk1GKAAAAAAAAAAAAAMAAAMAAJYAAABWUDhMDwAAAC8DwAAAB9D/iP4HIqL/AQBBTk1G",
+        "KAAAAAAAAAAAAAMAAAMAAJYAAABWUDhMDwAAAC8DwAAABxDR//4HIqL/AQA=",
+    );
+
+    /// Every pixel of a frame, asserted against one flat colour.
+    fn assert_flat(image: &DecodedImage, expected: [u8; 3], which: &str) {
+        for pixel in image.pixels.as_chunks::<4>().0.iter() {
+            assert_eq!(&pixel[..3], &expected, "the {which} frame is not the flat colour it was encoded as");
+        }
+    }
+
+    /// An animated GIF plays: every frame decoded, in order, with its delay.
+    /// Red, green, blue is the order the file was written in, so a decoder
+    /// that shuffled or recomposited frames wrongly fails on colour.
+    #[test]
+    fn an_animated_gif_carries_every_frame() {
+        let loaded = decode(&from_base64(ANIMATED_GIF)).unwrap();
+        let animation = loaded.animation.as_ref().expect("an animated GIF should carry its frames");
+
+        assert_eq!(animation.frames.len(), 3);
+        assert_flat(&animation.frames[0].image, [255, 0, 0], "first");
+        assert_flat(&animation.frames[1].image, [0, 255, 0], "second");
+        assert_flat(&animation.frames[2].image, [0, 0, 255], "third");
+        for frame in &animation.frames {
+            assert_eq!(frame.delay, std::time::Duration::from_millis(200));
+        }
+
+        // The still `image` is the first frame: a caller that ignores the
+        // animation shows exactly what earlier versions showed.
+        assert_eq!(loaded.image.pixels, animation.frames[0].image.pixels);
+    }
+
+    /// A zero delay means "unspecified", and plays at the 100 ms every
+    /// browser settled on — not as fast as the machine can flip frames.
+    #[test]
+    fn a_zero_gif_delay_plays_at_the_browser_default() {
+        let loaded = decode(&from_base64(ANIMATED_GIF_ZERO_DELAY)).unwrap();
+        let animation = loaded.animation.expect("the GIF should carry its frames");
+        for frame in &animation.frames {
+            assert_eq!(frame.delay, std::time::Duration::from_millis(100));
+        }
+    }
+
+    #[test]
+    fn an_animated_png_carries_every_frame() {
+        let loaded = decode(&from_base64(ANIMATED_APNG)).unwrap();
+        let animation = loaded.animation.as_ref().expect("an APNG should carry its frames");
+
+        assert_eq!(animation.frames.len(), 3);
+        assert_flat(&animation.frames[0].image, [255, 0, 0], "first");
+        assert_flat(&animation.frames[2].image, [0, 0, 255], "third");
+        for frame in &animation.frames {
+            assert_eq!(frame.delay, std::time::Duration::from_millis(100));
+        }
+    }
+
+    /// Every pixel of a frame, within `tolerance` of one flat colour.
+    fn assert_flat_within(image: &DecodedImage, expected: [u8; 3], tolerance: u8, which: &str) {
+        for pixel in image.pixels.as_chunks::<4>().0.iter() {
+            for (channel, want) in pixel[..3].iter().zip(expected) {
+                assert!(
+                    channel.abs_diff(want) <= tolerance,
+                    "the {which} frame decoded to {pixel:?}, not the flat {expected:?} it was encoded as"
+                );
+            }
+        }
+    }
+
+    /// Off by one, not exact, and the reason is named: `image-webp` blends a
+    /// frame onto the canvas with a scale of 2^24/255 rounded down, so a
+    /// fully opaque blended frame loses one part in 255 — a 255 channel
+    /// comes back 254 (`alpha_blending.rs::blend_channel_nonpremult`).
+    /// Pillow reads the same file exactly, so the file is right and the
+    /// decoder is a hair dark. Invisible in practice; recorded here rather
+    /// than hidden behind a looser assertion without a reason.
+    #[test]
+    fn an_animated_webp_carries_every_frame() {
+        let loaded = decode(&from_base64(ANIMATED_WEBP)).unwrap();
+        let animation = loaded.animation.as_ref().expect("an animated WebP should carry its frames");
+
+        assert_eq!(animation.frames.len(), 3);
+        assert_flat(&animation.frames[0].image, [255, 0, 0], "first");
+        assert_flat_within(&animation.frames[1].image, [0, 255, 0], 1, "second");
+        assert_flat_within(&animation.frames[2].image, [0, 0, 255], 1, "third");
+        for frame in &animation.frames {
+            assert_eq!(frame.delay, std::time::Duration::from_millis(150));
+        }
+    }
+
+    /// Stills stay stills: a one-frame GIF, an ordinary PNG and an ordinary
+    /// WebP carry no animation, so nothing ever ticks for them.
+    #[test]
+    fn still_images_carry_no_animation() {
+        assert!(decode(&encode(image::ImageFormat::Gif, 4, 4)).unwrap().animation.is_none());
+        assert!(decode(&encode(image::ImageFormat::Png, 4, 4)).unwrap().animation.is_none());
+        assert!(decode(&encode_webp(4, 4, None)).unwrap().animation.is_none());
+    }
+
     #[test]
     fn display_size_follows_orientation() {
         let loaded = LoadedImage {
@@ -1231,6 +1388,7 @@ mod tests {
             fidelity: Fidelity::Full,
             profile: None,
             vector: None,
+            animation: None,
         };
         assert_eq!(loaded.display_size(), (50, 100));
     }

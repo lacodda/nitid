@@ -104,6 +104,13 @@ code execution.
 The format is decided by the bytes, not the extension: a `.png` that is really
 a JPEG opens rather than erroring.
 
+GIF, APNG and animated WebP **play**: every frame is decoded up front, the
+space bar pauses and resumes, and the title carries the frame counter. Frame
+delays of 10 ms and under are read as 100 ms — the convention browsers apply,
+which the files were written against. A still image costs no GPU time and no
+wakeups; a playing animation wakes the event loop for its next frame and for
+nothing else, so pausing restores the silence.
+
 HEIC — the format a modern phone photographs in — decodes in Rust like the
 rest, container and HEVC alike, and reaches the screen as fast as a JPEG: it
 carries a thumbnail as a second image inside its container, and nitid shows
@@ -154,11 +161,12 @@ has no size limit to hide behind.
 
 ## Status
 
-Early development — v0.11.0 is out. Startup, colour and format coverage hold:
-every modern still format opens, a phone's photographs included, and every one
-of them reaches the screen without a wait — and the process that decodes the
-heavy ones now runs with no network in either direction. HDR is still ahead.
-Development runs in small versions, each one theme; the road to 1.0 is fixed:
+Early development — v0.12.0 is out. Startup, colour and format coverage hold:
+every modern still format opens, a phone's photographs included, every one of
+them reaches the screen without a wait, and the ones that animate now play.
+The process that decodes the heavy formats runs with no network in either
+direction. HDR is still ahead. Development runs in small versions, each one
+theme; the road to 1.0 is fixed:
 
 | Version | What lands |
 | --- | --- |
@@ -175,7 +183,7 @@ Development runs in small versions, each one theme; the road to 1.0 is fixed:
 | ✅ v0.9.0 | Decodes that can be stopped: cancelled on navigation, killed on a timeout |
 | ✅ v0.10.0 | HEIC from its thumbnail, and its ICC colour on the GPU |
 | ✅ v0.11.0 | The network closed to the decoder, and a cheaper bridge |
-| v0.12.0 | Animation: GIF, WebP, APNG |
+| ✅ v0.12.0 | Animation: GIF, APNG and animated WebP play |
 | v0.13.0 | HDR output on Windows (`Bt2100Pq` on `Rgb10a2Unorm`) |
 | v0.14.0 | Gigapixel images via tiled rendering |
 | v0.15.0 – v0.34.0 | The everyday viewer: single instance, toolbar, EXIF panel, clipboard, file operations, culling, comparison, settings |
@@ -234,6 +242,7 @@ Opening a file opens its folder: the arrow keys walk the images beside it.
 | --- | --- |
 | `←` `→` | previous / next image in the folder |
 | `Home` `End` | first / last image |
+| `Space` | pause / resume an animation; next image on a still |
 | Wheel | zoom around the cursor |
 | Drag | pan |
 | Middle click | toggle fit and 100% |

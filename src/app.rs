@@ -1,10 +1,13 @@
 //! The window and the event loop.
 //!
 //! Redraws are event-driven: a still image costs no GPU time, which is what
-//! lets a viewer sit open on a laptop without draining the battery.
+//! lets a viewer sit open on a laptop without draining the battery. A playing
+//! animation is the one exception, and a bounded one — the loop wakes for its
+//! next frame and for nothing else, and pausing restores the silence.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use winit::application::ApplicationHandler;
@@ -16,6 +19,7 @@ use winit::window::{Window, WindowId};
 
 use moxcms::ColorProfile;
 
+use crate::animation::Player;
 use crate::color::{self, ColorTransform};
 use crate::config::Config;
 use crate::folder::Folder;
@@ -67,6 +71,9 @@ struct Shown {
     /// Compared against the size the current zoom asks for, so a redraw only
     /// happens when it would actually show more detail.
     rasterised_at: (u32, u32),
+    /// The clock of an animated image. `None` for a still, which is to say
+    /// nearly always.
+    player: Option<Player>,
 }
 
 struct App {
@@ -180,6 +187,9 @@ impl App {
             fidelity: loaded.fidelity,
             vector: loaded.vector.clone(),
             rasterised_at: (loaded.image.width, loaded.image.height),
+            // An animated image starts playing the moment it is up; the
+            // event loop reads the player's clock in `about_to_wait`.
+            player: loaded.animation.clone().map(|animation| Player::new(animation, Instant::now())),
         });
     }
 
@@ -258,6 +268,15 @@ impl App {
             && shown.view.mode() == FitMode::Free
         {
             title.push_str(&format!(" — {:.0}%", shown.view.scale() * 100.0));
+        }
+        // The frame counter is the status line this stage has: the toolbar
+        // and a real status row arrive with the interface stage.
+        if let Some(player) = self.shown.as_ref().and_then(|shown| shown.player.as_ref()) {
+            let (frame, count) = player.position();
+            title.push_str(&format!(" — frame {frame}/{count}"));
+            if player.paused() {
+                title.push_str(" — paused");
+            }
         }
         title.push_str(" — nitid");
 
@@ -370,7 +389,16 @@ impl App {
     fn handle_key(&mut self, key: &Key, event_loop: &ActiveEventLoop) {
         match key {
             Key::Named(NamedKey::Escape) => event_loop.exit(),
-            Key::Named(NamedKey::ArrowRight | NamedKey::PageDown | NamedKey::Space) => {
+            // On an animated image the space bar is its pause; everywhere
+            // else it steps to the next file, as it always has.
+            Key::Named(NamedKey::Space) => match self.shown.as_mut().and_then(|shown| shown.player.as_mut()) {
+                Some(player) => {
+                    player.toggle_paused(Instant::now());
+                    self.set_title();
+                }
+                None => self.navigate(Step::Next),
+            },
+            Key::Named(NamedKey::ArrowRight | NamedKey::PageDown) => {
                 self.navigate(Step::Next);
             }
             Key::Named(NamedKey::ArrowLeft | NamedKey::PageUp | NamedKey::Backspace) => {
@@ -485,6 +513,37 @@ fn worth_redrawing(drawn: u32, wanted: u32) -> bool {
 impl ApplicationHandler<Decoded> for App {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: Decoded) {
         self.decoded(event);
+    }
+
+    /// The animation tick. Runs after every batch of events, which is where
+    /// the wake this handler itself scheduled comes back in.
+    ///
+    /// A still image asks for `Wait` and the loop sleeps until real input —
+    /// the event-driven redraw promise at the top of this file stands. Only a
+    /// playing animation asks to be woken, and only for its next frame.
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let advanced = match self.shown.as_mut().and_then(|shown| shown.player.as_mut()) {
+            Some(player) => player.advance_to(Instant::now()),
+            None => {
+                event_loop.set_control_flow(ControlFlow::Wait);
+                return;
+            }
+        };
+
+        if advanced {
+            if let (Some(renderer), Some(shown)) = (self.renderer.as_mut(), self.shown.as_ref())
+                && let Some(player) = shown.player.as_ref()
+            {
+                renderer.update_pixels(player.frame());
+            }
+            self.set_title();
+            self.request_redraw();
+        }
+
+        match self.shown.as_ref().and_then(|shown| shown.player.as_ref()).and_then(Player::wake_at) {
+            Some(due) => event_loop.set_control_flow(ControlFlow::WaitUntil(due)),
+            None => event_loop.set_control_flow(ControlFlow::Wait),
+        }
     }
 
     /// The loop is finishing: write down where the window ended up.

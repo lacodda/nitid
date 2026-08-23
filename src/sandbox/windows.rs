@@ -181,6 +181,8 @@ pub fn decode(bytes: &[u8], timeout: Duration) -> Result<LoadedImage> {
         // need a sandbox are all raster, and re-rasterising on zoom would
         // mean a round trip per frame.
         vector: None,
+        // Neither does an animation: the sandboxed formats are stills.
+        animation: None,
     })
 }
 

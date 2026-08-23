@@ -9,6 +9,7 @@
 //! which Windows subsystem they are linked for. See
 //! `docs/adr/0004-two-binaries-console-and-windowed.md`.
 
+mod animation;
 mod app;
 mod avif;
 mod color;
@@ -175,6 +176,7 @@ Options:
 Keys:
   Left/Right    previous / next image in the folder
   Home/End      first / last image
+  Space         pause / resume an animation; next image on a still
   Wheel         zoom around the cursor
   Drag          pan
   Middle click  toggle fit and 100%
