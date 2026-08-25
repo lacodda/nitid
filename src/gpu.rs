@@ -1,10 +1,10 @@
 //! The GPU side: device, swapchain, and the single pass that draws the image.
 //!
 //! nitid configures its own surface rather than delegating to a GUI framework,
-//! because HDR output on Windows is only reachable through `Bt2100Pq` on
-//! `Rgb10a2Unorm` — a configuration a framework-managed surface cannot express.
-//! See `docs/adr/0001-own-the-swapchain.md`. HDR itself lands in v0.10.0; what
-//! matters here is that the choice of format stays ours.
+//! because HDR output needs a surface format and colour space a framework
+//! chooses for itself. See `docs/adr/0001-own-the-swapchain.md`. Which pair is
+//! chosen, and when, lives in `hdr.rs`; this module holds it and follows the
+//! display when it changes.
 
 use std::sync::Arc;
 
@@ -12,6 +12,7 @@ use anyhow::{Context, Result};
 use wgpu::util::DeviceExt;
 
 use crate::color::{CURVE_SAMPLES, ColorTransform};
+use crate::hdr::{self, Output};
 use crate::image_source::{DecodedImage, Orientation};
 use crate::view::View;
 
@@ -87,11 +88,15 @@ struct ColourUniform {
     /// `active` turned out to be a reserved WGSL keyword.
     convert: u32,
     encode_srgb: u32,
-    _padding: [u32; 2],
+    /// Non-zero when the surface carries extended-range linear light, where
+    /// values above 1.0 are brighter than SDR white rather than an overflow to
+    /// be clipped.
+    extended_range: u32,
+    _padding: u32,
 }
 
 impl ColourUniform {
-    fn new(transform: &ColorTransform, surface_is_srgb: bool) -> Self {
+    fn new(transform: &ColorTransform, output: Output) -> Self {
         let mut matrix = [[0.0; 4]; 3];
         for (row, values) in transform.matrix.iter().enumerate() {
             matrix[row][..3].copy_from_slice(values);
@@ -100,12 +105,12 @@ impl ColourUniform {
         Self {
             matrix,
             convert: u32::from(!transform.is_identity),
-            // An sRGB surface encodes for us on write. Anything else — the
-            // 10-bit HDR surface of v0.10.0, for instance — expects the shader
-            // to have done it, but only when the shader produced linear light
-            // in the first place.
-            encode_srgb: u32::from(!transform.is_identity && !surface_is_srgb),
-            _padding: [0; 2],
+            // An sRGB surface format encodes for us on write. Anything else
+            // expects the shader to have done it — except an extended-range
+            // linear surface, which wants the light itself.
+            encode_srgb: u32::from(!output.encodes_srgb() && !output.is_hdr()),
+            extended_range: u32::from(output.is_hdr()),
+            _padding: 0,
         }
     }
 }
@@ -122,10 +127,21 @@ struct Upload {
 /// Device, surface, pipeline, and the texture being shown.
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
+    /// Kept so the display's live HDR state can be asked again: the Windows
+    /// HDR toggle moves while the viewer is open, and both the query and the
+    /// surface capabilities need the adapter.
+    adapter: wgpu::Adapter,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
+    /// The format and colour space the swapchain is configured with, and what
+    /// the pipeline was built to write.
+    output: Output,
     pipeline: wgpu::RenderPipeline,
+    /// Kept so the pipeline can be rebuilt when the surface format changes:
+    /// a render pipeline is bound to the format of the target it writes.
+    shader: wgpu::ShaderModule,
+    pipeline_layout: wgpu::PipelineLayout,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     uniforms: wgpu::Buffer,
@@ -134,6 +150,10 @@ pub struct Renderer {
     curves_view: wgpu::TextureView,
     curve_sampler: wgpu::Sampler,
     colour: wgpu::Buffer,
+    /// The transform of the image currently up, kept so the colour uniform can
+    /// be rewritten when the surface changes under it — the same picture needs
+    /// different encoding on an SDR and an HDR surface.
+    transform: ColorTransform,
     upload: Option<Upload>,
 }
 
@@ -142,8 +162,9 @@ impl Renderer {
     pub fn new(window: Arc<winit::window::Window>, size: (u32, u32)) -> Result<Self> {
         // Enumerating every backend costs over a hundred milliseconds of
         // startup, because each one loads its driver before being rejected.
-        // On Windows only DX12 matters: it is the backend HDR output requires
-        // (ADR 0001), so the others are work that can never pay off.
+        // On Windows only DX12 matters: it is the backend that reports the
+        // HDR surface pairs (ADR 0013), so the others are work that can never
+        // pay off.
         let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
         descriptor.backends = if cfg!(windows) { wgpu::Backends::DX12 } else { wgpu::Backends::PRIMARY };
         let instance = wgpu::Instance::new(descriptor);
@@ -171,66 +192,13 @@ impl Renderer {
         crate::startup::milestone("device created");
 
         let capabilities = surface.get_capabilities(&adapter);
-        let config = configure(&capabilities, size);
+        let headroom = surface.display_hdr_info(&adapter).tone_map_headroom();
+        let output = hdr::choose(&capabilities, headroom);
+        report(output, headroom);
+        let config = configure(&capabilities, output, size);
         surface.configure(&device, &config);
 
-        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("nitid image bindings"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 5,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
-        });
+        let layout = bind_group_layout(&device);
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("nitid image shader"),
@@ -245,34 +213,7 @@ impl Renderer {
 
         crate::startup::milestone("shader compiled");
 
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("nitid image pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleStrip,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        let pipeline = build_pipeline(&device, &pipeline_layout, &shader, output.format);
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("nitid image sampler"),
@@ -332,16 +273,20 @@ impl Renderer {
 
         let colour = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("nitid colour"),
-            contents: bytemuck::bytes_of(&ColourUniform::new(&ColorTransform::identity(), config.format.is_srgb())),
+            contents: bytemuck::bytes_of(&ColourUniform::new(&ColorTransform::identity(), output)),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
         Ok(Self {
             surface,
+            adapter,
             device,
             queue,
             config,
+            output,
             pipeline,
+            shader,
+            pipeline_layout,
             layout,
             sampler,
             uniforms,
@@ -349,6 +294,7 @@ impl Renderer {
             curves_view,
             curve_sampler,
             colour,
+            transform: ColorTransform::identity(),
             upload: None,
         })
     }
@@ -366,6 +312,48 @@ impl Renderer {
         self.config.width = size.0;
         self.config.height = size.1;
         self.surface.configure(&self.device, &self.config);
+    }
+
+    /// Whether the surface is currently configured for high dynamic range.
+    ///
+    /// The viewer polls the display only in this state: it is the one that can
+    /// go stale without being announced, because turning HDR off in Windows
+    /// sends no event to anybody.
+    pub fn is_hdr(&self) -> bool {
+        self.output.is_hdr()
+    }
+
+    /// Ask the display what it is doing now, and follow it.
+    ///
+    /// The HDR toggle in Windows moves while the viewer is open, and a window
+    /// dragged to another monitor lands on a display with its own answer. Both
+    /// arrive as ordinary window events rather than as anything the graphics
+    /// API announces, so the question is asked again at those moments instead
+    /// of being settled once at startup.
+    ///
+    /// Returns true when the swapchain was reconfigured, which is the caller's
+    /// cue to redraw: the frames already queued were encoded for the old
+    /// surface.
+    pub fn follow_display(&mut self) -> bool {
+        let capabilities = self.surface.get_capabilities(&self.adapter);
+        let headroom = self.surface.display_hdr_info(&self.adapter).tone_map_headroom();
+        let output = hdr::choose(&capabilities, headroom);
+        if output == self.output {
+            return false;
+        }
+
+        report(output, headroom);
+        self.output = output;
+        self.config = configure(&capabilities, output, (self.config.width, self.config.height));
+        self.surface.configure(&self.device, &self.config);
+        // A pipeline is built against the format it writes, so the format
+        // changing means this one no longer applies.
+        self.pipeline = build_pipeline(&self.device, &self.pipeline_layout, &self.shader, output.format);
+        // The picture on screen was encoded for the surface that just went
+        // away; the uniform says how, so it is rewritten for the new one.
+        self.queue
+            .write_buffer(&self.colour, 0, bytemuck::bytes_of(&ColourUniform::new(&self.transform, output)));
+        true
     }
 
     /// Upload a decoded image, replacing whatever was shown before.
@@ -412,12 +400,10 @@ impl Renderer {
             extent,
         );
 
+        self.transform = transform.clone();
         self.write_curves(transform);
-        self.queue.write_buffer(
-            &self.colour,
-            0,
-            bytemuck::bytes_of(&ColourUniform::new(transform, self.config.format.is_srgb())),
-        );
+        self.queue
+            .write_buffer(&self.colour, 0, bytemuck::bytes_of(&ColourUniform::new(transform, self.output)));
 
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -575,35 +561,130 @@ impl Renderer {
     }
 }
 
-/// Choose a swapchain configuration.
-///
-/// An sRGB surface format is preferred so the shader can write linear values
-/// and let the display hardware encode them. v0.10.0 replaces this choice with
-/// an HDR-aware one; keeping the selection here is what makes that possible.
-fn configure(capabilities: &wgpu::SurfaceCapabilities, size: (u32, u32)) -> wgpu::SurfaceConfiguration {
-    let format = capabilities
-        .formats
-        .iter()
-        .copied()
-        .find(|format| format.is_srgb())
-        .unwrap_or(capabilities.formats[0]);
+/// The bindings one image draw needs: the texture and its sampler, placement,
+/// the tone curves and theirs, and the colour uniform.
+fn bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("nitid image bindings"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 4,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 5,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    })
+}
 
+/// State the output signal for the startup report.
+///
+/// A screenshot of an HDR window is a standard-range image, so the one thing a
+/// person cannot check by looking is whether high dynamic range is actually on.
+fn report(output: Output, headroom: Option<f32>) {
+    crate::startup::surface(&format!("{:?}", output.format), &format!("{:?}", output.color_space), headroom);
+}
+
+/// Build the swapchain configuration for a chosen output.
+///
+/// The `format` and `color_space` pair is the whole reason nitid configures
+/// its own surface: `hdr::choose` picks it, and a framework-managed surface
+/// would pick something else.
+fn configure(capabilities: &wgpu::SurfaceCapabilities, output: Output, size: (u32, u32)) -> wgpu::SurfaceConfiguration {
     wgpu::SurfaceConfiguration {
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-        format,
-        // This field is the whole reason nitid configures its own surface:
-        // v0.10.0 replaces `Auto` with `Bt2100Pq` on `Rgb10a2Unorm` after
-        // querying `SurfaceCapabilities::format_capabilities`.
-        color_space: wgpu::SurfaceColorSpace::Auto,
+        format: output.format,
+        color_space: output.color_space,
         width: size.0.max(1),
         height: size.1.max(1),
         // Vsync: a viewer showing a still image has no reason to tear or to
         // spend a GPU budget racing the display.
         present_mode: wgpu::PresentMode::AutoVsync,
         desired_maximum_frame_latency: 2,
-        alpha_mode: capabilities.alpha_modes[0],
+        alpha_mode: capabilities.alpha_modes.first().copied().unwrap_or(wgpu::CompositeAlphaMode::Auto),
         view_formats: vec![],
     }
+}
+
+/// Build the render pipeline for a target format.
+///
+/// A pipeline is bound to the format it writes, so switching the surface
+/// between standard and high dynamic range means building this again.
+fn build_pipeline(device: &wgpu::Device, layout: &wgpu::PipelineLayout, shader: &wgpu::ShaderModule, format: wgpu::TextureFormat) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("nitid image pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleStrip,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
 }
 
 #[cfg(test)]
@@ -631,17 +712,46 @@ mod tests {
         assert_eq!(std::mem::size_of::<ColourUniform>(), 64);
     }
 
+    /// The surface an SDR display gets: the hardware encodes on write.
+    fn srgb_surface() -> Output {
+        Output {
+            format: wgpu::TextureFormat::Bgra8UnormSrgb,
+            color_space: wgpu::SurfaceColorSpace::Auto,
+        }
+    }
+
+    /// The surface an HDR display gets: extended-range linear light.
+    fn hdr_surface() -> Output {
+        Output {
+            format: wgpu::TextureFormat::Rgba16Float,
+            color_space: wgpu::SurfaceColorSpace::ExtendedSrgbLinear,
+        }
+    }
+
+    /// A surface with neither an sRGB format nor an HDR colour space, which
+    /// leaves the encoding to the shader.
+    fn plain_surface() -> Output {
+        Output {
+            format: wgpu::TextureFormat::Bgra8Unorm,
+            color_space: wgpu::SurfaceColorSpace::Srgb,
+        }
+    }
+
+    fn wide_gamut_transform() -> ColorTransform {
+        ColorTransform::new(&moxcms::ColorProfile::new_display_p3(), &moxcms::ColorProfile::new_srgb())
+    }
+
     #[test]
     fn an_identity_transform_asks_the_shader_to_do_nothing() {
-        let uniform = ColourUniform::new(&ColorTransform::identity(), true);
+        let uniform = ColourUniform::new(&ColorTransform::identity(), srgb_surface());
         assert_eq!(uniform.convert, 0);
         assert_eq!(uniform.encode_srgb, 0);
+        assert_eq!(uniform.extended_range, 0);
     }
 
     #[test]
     fn a_conversion_onto_an_srgb_surface_leaves_encoding_to_the_hardware() {
-        let transform = ColorTransform::new(&moxcms::ColorProfile::new_display_p3(), &moxcms::ColorProfile::new_srgb());
-        let uniform = ColourUniform::new(&transform, true);
+        let uniform = ColourUniform::new(&wide_gamut_transform(), srgb_surface());
 
         assert_eq!(uniform.convert, 1);
         // An sRGB surface encodes on write; doing it in the shader too would
@@ -650,12 +760,26 @@ mod tests {
     }
 
     #[test]
-    fn a_conversion_onto_a_linear_surface_encodes_in_the_shader() {
-        let transform = ColorTransform::new(&moxcms::ColorProfile::new_display_p3(), &moxcms::ColorProfile::new_srgb());
-        let uniform = ColourUniform::new(&transform, false);
+    fn a_plain_surface_is_encoded_by_the_shader() {
+        // Neither the format nor the colour space encodes, so the shader must.
+        // This holds for an untouched image too: before HDR the flag was tied
+        // to the conversion, which would have written linear light to a
+        // surface expecting sRGB — dark, and only on hardware nitid had not
+        // met.
+        assert_eq!(ColourUniform::new(&wide_gamut_transform(), plain_surface()).encode_srgb, 1);
+        assert_eq!(ColourUniform::new(&ColorTransform::identity(), plain_surface()).encode_srgb, 1);
+    }
 
-        assert_eq!(uniform.convert, 1);
-        assert_eq!(uniform.encode_srgb, 1);
+    #[test]
+    fn an_extended_range_surface_is_given_light_rather_than_an_encoding() {
+        for transform in [ColorTransform::identity(), wide_gamut_transform()] {
+            let uniform = ColourUniform::new(&transform, hdr_surface());
+
+            assert_eq!(uniform.extended_range, 1);
+            // Encoding here would apply a transfer function the surface does
+            // not expect; it wants the linear light itself.
+            assert_eq!(uniform.encode_srgb, 0, "an HDR surface must not be handed encoded values");
+        }
     }
 
     #[test]
@@ -712,5 +836,299 @@ mod tests {
         let m = orientation_matrix(Orientation::Rotate90);
         assert_eq!(m[0], [0.0, 1.0]);
         assert_eq!(m[1], [-1.0, 0.0]);
+    }
+
+    /// Undo the sRGB transfer function, so a value read back from an `*Srgb`
+    /// target can be compared with the light an HDR target holds directly.
+    fn srgb_to_linear(value: f32) -> f32 {
+        if value <= 0.04045 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    /// Draw one image through the real pipeline into a texture of `format`,
+    /// and read the result back as linear light.
+    ///
+    /// This is the shader itself, on a device, with the bindings the viewer
+    /// uses — the arithmetic that decides whether an HDR surface shows the
+    /// same picture an SDR one does. Nothing else in the suite would catch a
+    /// transfer function applied once too often: the frame buffer is the only
+    /// place that mistake becomes visible.
+    ///
+    /// `None` when no adapter can be had, which is a fact about the machine
+    /// rather than a regression in the viewer.
+    fn draw_offscreen(output: Output, transform: &ColorTransform, pixel: [u8; 4]) -> Option<[f32; 4]> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("nitid offscreen test device"),
+            ..Default::default()
+        }))
+        .ok()?;
+
+        let layout = bind_group_layout(&device);
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: None,
+            source: wgpu::ShaderSource::Wgsl(include_str!("gpu/shader.wgsl").into()),
+        });
+        let pipeline = build_pipeline(&device, &pipeline_layout, &shader, output.format);
+
+        let extent = wgpu::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        };
+
+        // One pixel of image, in the texture format `set_image` would choose.
+        let image = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: if transform.is_identity {
+                wgpu::TextureFormat::Rgba8UnormSrgb
+            } else {
+                wgpu::TextureFormat::Rgba8Unorm
+            },
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            image.as_image_copy(),
+            &pixel,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4),
+                rows_per_image: Some(1),
+            },
+            extent,
+        );
+
+        let curve_extent = wgpu::Extent3d {
+            width: CURVE_SAMPLES as u32,
+            height: 3,
+            depth_or_array_layers: 1,
+        };
+        let curves = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: curve_extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let halves: Vec<half::f16> = transform.decode.iter().map(|value| half::f16::from_f32(*value)).collect();
+        queue.write_texture(
+            curves.as_image_copy(),
+            bytemuck::cast_slice(&halves),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some((CURVE_SAMPLES * 2) as u32),
+                rows_per_image: Some(3),
+            },
+            curve_extent,
+        );
+
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor::default());
+        let placement = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: Placement {
+                half_size: [1.0, 1.0],
+                centre: [0.0, 0.0],
+                orientation: orientation_matrix(Orientation::Normal),
+            }
+            .as_bytes(),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let colour = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::bytes_of(&ColourUniform::new(transform, output)),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+        let image_view = image.create_view(&wgpu::TextureViewDescriptor::default());
+        let curves_view = curves.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&image_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: placement.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&curves_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: colour.as_entire_binding(),
+                },
+            ],
+        });
+
+        // The target stands in for the swapchain texture.
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: output.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // 256 bytes is the row alignment a texture-to-buffer copy requires.
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 256,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(BACKGROUND),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.draw(0..4, 0..1);
+        }
+        encoder.copy_texture_to_buffer(
+            target.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(256),
+                    rows_per_image: Some(1),
+                },
+            },
+            extent,
+        );
+        queue.submit(Some(encoder.finish()));
+
+        readback.map_async(wgpu::MapMode::Read, .., |_| {});
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            })
+            .ok()?;
+        let bytes = readback.slice(..).get_mapped_range().ok()?.to_vec();
+
+        // Whatever the surface format holds, the answer comes back as linear
+        // light, so the two paths can be compared with each other.
+        Some(match output.format {
+            wgpu::TextureFormat::Rgba16Float => {
+                let halves: &[half::f16] = bytemuck::cast_slice(&bytes[..8]);
+                [halves[0].to_f32(), halves[1].to_f32(), halves[2].to_f32(), halves[3].to_f32()]
+            }
+            // An `*Srgb` target holds encoded values; undoing the encoding
+            // gets back to the light the shader was working in.
+            format if format.is_srgb() => std::array::from_fn(|index| {
+                let value = f32::from(bytes[index]) / 255.0;
+                if index == 3 { value } else { srgb_to_linear(value) }
+            }),
+            _ => std::array::from_fn(|index| f32::from(bytes[index]) / 255.0),
+        })
+    }
+
+    /// The same picture must reach the eye the same way on either surface.
+    ///
+    /// This is the failure high dynamic range invites: a transfer function
+    /// applied once too often, or not at all, leaves an image washed out or
+    /// crushed while every unit test still passes. Drawing it both ways and
+    /// comparing the light is the check that notices.
+    #[test]
+    fn a_standard_range_image_looks_the_same_on_an_hdr_surface() {
+        let transform = ColorTransform::identity();
+        // Mid grey: far enough from both ends that a wrong curve moves it a
+        // long way, unlike black and white, which several mistakes leave
+        // exactly where they were.
+        let pixel = [128, 128, 128, 255];
+
+        let Some(sdr) = draw_offscreen(srgb_surface(), &transform, pixel) else {
+            eprintln!("skipping: no graphics adapter here");
+            return;
+        };
+        let hdr = draw_offscreen(hdr_surface(), &transform, pixel).expect("the adapter answered once already");
+
+        for channel in 0..3 {
+            assert!(
+                (sdr[channel] - hdr[channel]).abs() < 0.01,
+                "channel {channel}: the SDR surface shows {sdr:?} and the HDR one {hdr:?} - \
+                 the same image must be the same light on either"
+            );
+        }
+
+        // And it must be the light the image states, not merely a consistent
+        // wrong answer on both paths: sRGB 128 is a little over a fifth of the
+        // way up in linear light, not half.
+        assert!(
+            (hdr[0] - 0.2140).abs() < 0.01,
+            "mid grey came out at {} rather than the 0.214 sRGB defines",
+            hdr[0]
+        );
+    }
+
+    /// Highlights above SDR white are what the extended-range surface is for.
+    #[test]
+    fn an_extended_range_surface_carries_light_brighter_than_white() {
+        // A transform that scales past 1.0, standing in for a conversion whose
+        // result leaves the box a standard-range surface can hold.
+        let mut transform = ColorTransform::identity();
+        transform.is_identity = false;
+        transform.matrix = [[2.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 2.0]];
+
+        let Some(hdr) = draw_offscreen(hdr_surface(), &transform, [255, 255, 255, 255]) else {
+            eprintln!("skipping: no graphics adapter here");
+            return;
+        };
+        assert!(hdr[0] > 1.5, "white doubled should reach past SDR white rather than stop at it: {hdr:?}");
+
+        // The same transform on a standard-range surface clips, because that
+        // surface cannot carry it - which is what makes the HDR one worth
+        // configuring at all.
+        let sdr = draw_offscreen(srgb_surface(), &transform, [255, 255, 255, 255]).expect("the adapter answered already");
+        assert!(sdr[0] <= 1.01, "a standard-range surface should clip at white: {sdr:?}");
     }
 }

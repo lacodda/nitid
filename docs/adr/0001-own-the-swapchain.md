@@ -7,7 +7,9 @@ Status: accepted
 
 nitid must reach HDR output on Windows and apply ICC color transforms with full control over encoding. Both requirements land on the same resource: the presentation surface.
 
-`wgpu` 30 exposes eight surface color spaces. On Windows the constraint is specific — DirectX 12 has no encoded-extended-sRGB swapchain color space and no HLG. The only HDR path is `Bt2100Pq` on the `Rgb10a2Unorm` format, selected by querying `SurfaceCapabilities` and scaling highlights through `DisplayHdrInfo::tone_map_headroom`.
+`wgpu` 30 exposes eight surface color spaces. On Windows the constraint is specific — DirectX 12 has no encoded-extended-sRGB swapchain color space and no HLG. An HDR path exists through `Bt2100Pq` on the `Rgb10a2Unorm` format, selected by querying `SurfaceCapabilities` and scaling highlights through `DisplayHdrInfo::tone_map_headroom`.
+
+> **Corrected 2026-08-24.** This paragraph originally called `Bt2100Pq` "the only HDR path" on DX12. Measuring the surface when the HDR stage was built found a second: `ExtendedSrgbLinear` on `Rgba16Float`. The decision below is unaffected — either pair is a surface configuration a framework picks for itself — but nitid takes scRGB rather than PQ. See [0013](0013-hdr-output-goes-through-scrgb.md).
 
 A GUI framework that owns the event loop generally also configures the surface. `eframe` does. Working image viewers exist on `eframe` (FastView, SimpleImageViewer), which proves the widget layer is not the bottleneck — but they cannot express the surface configuration HDR requires without patching the framework.
 
@@ -25,7 +27,7 @@ Redraws are driven by events, not by a continuous loop: a static image costs no 
 
 Positive:
 
-- HDR is reachable: we choose the surface format and color space directly.
+- HDR is reachable: we choose the surface format and color space directly, and can change that choice while the viewer is open when the display's own state changes.
 - ICC transforms happen on the GPU per frame instead of on the CPU at decode time — faster and lossless.
 - Startup stays minimal — only a window and a device to initialize.
 - The boring parts of the UI come from a mature library.

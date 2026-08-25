@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use winit::application::ApplicationHandler;
@@ -37,9 +37,15 @@ const PIXELS_PER_NOTCH: f32 = 120.0;
 /// The window size used before an image sets one.
 const DEFAULT_WINDOW: (u32, u32) = (1280, 800);
 
+/// How often the display is asked whether it is still in HDR mode, while the
+/// viewer is on an HDR surface. A second is well under the time it takes to
+/// look back at the screen after flipping the setting, and 140 µs of it.
+const DISPLAY_WATCH_INTERVAL: Duration = Duration::from_secs(1);
+
 /// Run the viewer, optionally opening a file straight away.
 pub fn run(path: Option<PathBuf>) -> Result<()> {
-    // A user event carries a finished background decode back to this thread.
+    // A user event carries a finished background decode, or a change in the
+    // display, back to this thread.
     let event_loop = EventLoop::<Decoded>::with_user_event().build().context("creating the event loop")?;
     // Wait for input rather than spinning: nothing moves unless the user acts.
     event_loop.set_control_flow(ControlFlow::Wait);
@@ -89,6 +95,10 @@ struct App {
     display_profile: ColorProfile,
     cursor: PhysicalPosition<f64>,
     dragging: bool,
+    /// When the display was last asked about its dynamic range. `None` until
+    /// the first ask; only set while the viewer is on an HDR surface, which is
+    /// the only state that can go stale unannounced.
+    display_checked_at: Option<Instant>,
     /// A failure that must end the run; reported after the loop exits, since
     /// `ApplicationHandler` methods cannot return one.
     failure: Option<anyhow::Error>,
@@ -107,6 +117,7 @@ impl App {
             display_profile: color::display_profile(),
             cursor: PhysicalPosition::new(0.0, 0.0),
             dragging: false,
+            display_checked_at: None,
             failure: None,
         }
     }
@@ -446,6 +457,54 @@ impl App {
         }
     }
 
+    /// Reconfigure the swapchain if the display's dynamic range has changed.
+    ///
+    /// Asking costs about 140 microseconds — small next to a decode and far too
+    /// much for a frame that would otherwise be free, which is why it happens
+    /// on the events that can precede a change rather than on every redraw.
+    /// The viewer's idle loop stays asleep either way.
+    fn follow_display(&mut self) -> bool {
+        self.renderer.as_mut().is_some_and(Renderer::follow_display)
+    }
+
+    /// Check on the display when the HDR surface is up and the check is due.
+    ///
+    /// Turning HDR *off* in Windows announces itself to nothing: measured with
+    /// the viewer open, it produced no winit event and no `WM_DISPLAYCHANGE`,
+    /// while turning it *on* arrives as `Focused(true)`. Asking is the only
+    /// way to notice, and a viewer writing extended-range light into a surface
+    /// the compositor has gone back to treating as standard range shows the
+    /// wrong picture until something else wakes it.
+    ///
+    /// So the poll is narrow: only while nitid is itself on an HDR surface —
+    /// the state that can go stale — and only once a second, for the 140 µs
+    /// the query costs. On a standard-range surface, which is where an SDR
+    /// display leaves it, nothing here runs and the loop sleeps as before.
+    fn watch_the_display(&mut self) {
+        let watching = self.renderer.as_ref().is_some_and(Renderer::is_hdr);
+        let now = Instant::now();
+        if !display_check_due(watching, self.display_checked_at, now) {
+            return;
+        }
+
+        self.display_checked_at = Some(now);
+        if self.follow_display() {
+            self.request_redraw();
+        }
+    }
+
+    /// How long the loop may sleep with nothing else pending.
+    ///
+    /// `Wait` — indefinitely — unless the display is being watched, in which
+    /// case the next check bounds it.
+    fn idle_until(&self) -> ControlFlow {
+        let watching = self.renderer.as_ref().is_some_and(Renderer::is_hdr);
+        match display_watch_deadline(watching, self.display_checked_at, Instant::now()) {
+            Some(due) => ControlFlow::WaitUntil(due),
+            None => ControlFlow::Wait,
+        }
+    }
+
     fn toggle_fullscreen(&self) {
         let Some(window) = &self.window else {
             return;
@@ -481,6 +540,31 @@ impl App {
             }
         }
     }
+}
+
+/// Whether the display should be asked about its dynamic range now.
+///
+/// Only while the viewer is on an HDR surface — a standard-range one cannot go
+/// stale unannounced, because turning HDR *on* does reach the window as
+/// `Focused(true)` — and only once the interval has passed since the last ask.
+fn display_check_due(watching_hdr: bool, last_checked: Option<Instant>, now: Instant) -> bool {
+    if !watching_hdr {
+        return false;
+    }
+    match last_checked {
+        // Never asked while on this surface: ask now, so the first tick after
+        // switching to HDR establishes the baseline.
+        None => true,
+        Some(last) => now.duration_since(last) >= DISPLAY_WATCH_INTERVAL,
+    }
+}
+
+/// When the loop must wake to ask again, if it must.
+fn display_watch_deadline(watching_hdr: bool, last_checked: Option<Instant>, now: Instant) -> Option<Instant> {
+    if !watching_hdr {
+        return None;
+    }
+    Some(last_checked.unwrap_or(now) + DISPLAY_WATCH_INTERVAL)
 }
 
 enum Step {
@@ -522,10 +606,12 @@ impl ApplicationHandler<Decoded> for App {
     /// the event-driven redraw promise at the top of this file stands. Only a
     /// playing animation asks to be woken, and only for its next frame.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.watch_the_display();
+
         let advanced = match self.shown.as_mut().and_then(|shown| shown.player.as_mut()) {
             Some(player) => player.advance_to(Instant::now()),
             None => {
-                event_loop.set_control_flow(ControlFlow::Wait);
+                event_loop.set_control_flow(self.idle_until());
                 return;
             }
         };
@@ -540,10 +626,16 @@ impl ApplicationHandler<Decoded> for App {
             self.request_redraw();
         }
 
-        match self.shown.as_ref().and_then(|shown| shown.player.as_ref()).and_then(Player::wake_at) {
-            Some(due) => event_loop.set_control_flow(ControlFlow::WaitUntil(due)),
-            None => event_loop.set_control_flow(ControlFlow::Wait),
-        }
+        let flow = match self.shown.as_ref().and_then(|shown| shown.player.as_ref()).and_then(Player::wake_at) {
+            // Whichever comes first: the animation's next frame, or the check
+            // on the display.
+            Some(due) => match self.idle_until() {
+                ControlFlow::WaitUntil(watch) => ControlFlow::WaitUntil(due.min(watch)),
+                _ => ControlFlow::WaitUntil(due),
+            },
+            None => self.idle_until(),
+        };
+        event_loop.set_control_flow(flow);
     }
 
     /// The loop is finishing: write down where the window ended up.
@@ -629,7 +721,19 @@ impl ApplicationHandler<Decoded> for App {
                         shown.view.resize(renderer.size(), scale_factor);
                     }
                 }
+                self.follow_display();
                 self.request_redraw();
+            }
+
+            // Turning HDR on in Windows re-sets the display mode, and dragging
+            // the window to another monitor lands it on a display with its own
+            // answer. Neither arrives as an event of its own, but both move the
+            // window; coming back to the viewer after changing the setting is
+            // the third way it is noticed. See `Renderer::follow_display`.
+            WindowEvent::Moved(_) | WindowEvent::Focused(true) => {
+                if self.follow_display() {
+                    self.request_redraw();
+                }
             }
 
             // Dragged onto a monitor with different scaling: the surface size
@@ -721,5 +825,53 @@ mod tests {
     fn a_degenerate_size_is_handled_rather_than_dividing_by_zero() {
         assert!(worth_redrawing(0, 100));
         assert!(!worth_redrawing(1, 1));
+    }
+
+    /// A standard-range surface is never polled.
+    ///
+    /// This is what keeps the idle promise: on an SDR display — where the
+    /// viewer spends most of its life — the loop sleeps until the user acts,
+    /// exactly as it did before HDR existed. The other direction needs no
+    /// poll because turning HDR *on* reaches the window as `Focused(true)`.
+    #[test]
+    fn a_standard_range_surface_is_left_alone() {
+        let now = Instant::now();
+
+        assert!(!display_check_due(false, None, now));
+        assert!(!display_check_due(false, Some(now - Duration::from_secs(60)), now));
+        assert_eq!(display_watch_deadline(false, None, now), None);
+    }
+
+    /// The first tick on an HDR surface asks, so the interval has a baseline.
+    #[test]
+    fn the_first_check_on_an_hdr_surface_happens_at_once() {
+        assert!(display_check_due(true, None, Instant::now()));
+    }
+
+    /// Asking is bounded to once an interval: `about_to_wait` runs after every
+    /// batch of events, and a poll on each of them would turn 140 microseconds
+    /// into a cost paid per mouse move.
+    #[test]
+    fn an_hdr_surface_is_asked_no_more_than_once_an_interval() {
+        let now = Instant::now();
+        let checked = now - DISPLAY_WATCH_INTERVAL / 2;
+
+        assert!(!display_check_due(true, Some(checked), now), "asked again inside the interval");
+        assert!(
+            display_check_due(true, Some(now - DISPLAY_WATCH_INTERVAL), now),
+            "the interval passed and the display was not asked"
+        );
+    }
+
+    /// The loop must be woken for the next check, or the poll never happens on
+    /// a still image — which is the only case it exists for.
+    #[test]
+    fn watching_the_display_bounds_how_long_the_loop_sleeps() {
+        let now = Instant::now();
+        let checked = now - Duration::from_millis(200);
+
+        let due = display_watch_deadline(true, Some(checked), now).expect("an HDR surface should be watched");
+        assert_eq!(due, checked + DISPLAY_WATCH_INTERVAL);
+        assert!(due > now, "the deadline is in the past, so the loop would spin");
     }
 }

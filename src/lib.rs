@@ -1,9 +1,10 @@
 //! nitid — a fast image viewer for Windows with honest color and HDR.
 //!
 //! The window and the swapchain belong to this application rather than to a GUI
-//! framework: HDR output on Windows is only reachable through `Bt2100Pq` on
-//! `Rgb10a2Unorm`, which a framework-managed surface cannot express. See
-//! `docs/adr/0001-own-the-swapchain.md`.
+//! framework: HDR output needs a surface format and colour space of its own,
+//! which a framework-managed surface picks for itself. See
+//! `docs/adr/0001-own-the-swapchain.md` and
+//! `docs/adr/0013-hdr-output-goes-through-scrgb.md`.
 //!
 //! This crate is the whole viewer; the two binaries over it differ only in
 //! which Windows subsystem they are linked for. See
@@ -18,6 +19,7 @@ mod console;
 mod folder;
 mod format;
 mod gpu;
+mod hdr;
 mod image_source;
 #[cfg(windows)]
 mod install;

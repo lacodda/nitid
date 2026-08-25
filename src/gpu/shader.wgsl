@@ -29,6 +29,9 @@ struct Colour {
     convert: u32,
     // Whether the surface expects sRGB-encoded values written by this shader.
     encode_srgb: u32,
+    // Whether the surface carries extended-range linear light, where a value
+    // above 1.0 is brighter than SDR white rather than an overflow to clip.
+    extended_range: u32,
 }
 
 @group(0) @binding(0) var image_texture: texture_2d<f32>;
@@ -84,6 +87,9 @@ fn encode_srgb_channel(value: f32) -> f32 {
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let sampled = textureSample(image_texture, image_sampler, in.uv);
 
+    // Everything below works in linear light, which is what the texture
+    // sampler already hands over: an `*Srgb` texture is linearised by the
+    // hardware, and a plain one goes through the profile's own curves.
     var rgb = sampled.rgb;
     if colour.convert != 0u {
         // Stored values to linear light, through the image's own curves.
@@ -92,25 +98,43 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             to_linear(rgb.g, 1),
             to_linear(rgb.b, 2),
         );
-        // Between primaries. A colour outside the display's gamut lands
-        // outside 0..1 and is clipped by the encode below, which is the
-        // simplest sensible rendering intent for a viewer.
+        // Between primaries. On a standard-range surface a colour outside the
+        // display's gamut lands outside 0..1 and is clipped below, which is
+        // the simplest sensible rendering intent for a viewer; on an
+        // extended-range surface it survives, because that surface can carry
+        // it.
         rgb = colour.matrix * linear;
     }
 
     // Alpha is composited against the neutral background so a transparent PNG
     // shows the viewer's own backdrop rather than whatever is behind the
-    // window. The background is specified in the same space as the output.
+    // window. It is stated as linear light, like everything else here, so the
+    // same number means the same grey on every surface — the clear colour in
+    // `gpu.rs` is the same value for the same reason.
     let background = vec3<f32>(0.09, 0.09, 0.10);
 
-    if colour.encode_srgb != 0u {
-        let encoded = vec3<f32>(
-            encode_srgb_channel(rgb.r),
-            encode_srgb_channel(rgb.g),
-            encode_srgb_channel(rgb.b),
-        );
-        return vec4<f32>(mix(background, encoded, sampled.a), 1.0);
+    // An extended-range linear surface wants the light as it is: 1.0 is SDR
+    // white and anything above drives the display's headroom. Clamping here
+    // would throw away the highlights the surface exists to carry; encoding
+    // here would be the encoding the surface does not expect. Only the floor
+    // is held, because negative light is not a colour.
+    if colour.extended_range != 0u {
+        let light = max(rgb, vec3<f32>(0.0));
+        return vec4<f32>(mix(background, light, sampled.a), 1.0);
     }
 
-    return vec4<f32>(mix(background, clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0)), sampled.a), 1.0);
+    let clipped = clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0));
+    if colour.encode_srgb != 0u {
+        // The surface takes sRGB-encoded values, so the background is encoded
+        // with the image rather than mixed into it as light.
+        let composited = mix(background, clipped, sampled.a);
+        return vec4<f32>(
+            encode_srgb_channel(composited.r),
+            encode_srgb_channel(composited.g),
+            encode_srgb_channel(composited.b),
+            1.0,
+        );
+    }
+
+    return vec4<f32>(mix(background, clipped, sampled.a), 1.0);
 }

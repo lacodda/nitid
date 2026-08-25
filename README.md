@@ -83,6 +83,35 @@ the AV1 decoder's kernels — without it the build fails rather than falling bac
 to something slower. `winget install NASM.NASM`, `scoop install nasm`, or your
 platform's package manager.
 
+## HDR
+
+On a display in HDR mode, nitid outputs extended-range linear light — scRGB,
+`ExtendedSrgbLinear` on an `Rgba16Float` surface — so highlights above SDR
+white drive the display's headroom instead of clipping at white. It is the
+same shader either way: the colour transform already ends in linear light, and
+an HDR surface simply takes it unencoded and unclamped. An SDR image therefore
+looks identical on both surfaces, which is asserted by drawing it twice and
+comparing the pixels rather than by eye.
+
+The choice follows the display rather than being made once. Turn HDR on in
+Windows with nitid open and the swapchain is reconfigured without a restart;
+turn it off and it goes back. Turning it *on* announces itself to the window,
+so that direction costs nothing; turning it *off* announces itself to nobody at
+all, so while — and only while — nitid is on an HDR surface it asks the display
+once a second, for the 140 microseconds that costs. On an SDR display nothing
+polls and the event loop sleeps until you act, exactly as before.
+
+`NITID_STARTUP_REPORT=1` states which surface is up and how much headroom the
+display reports:
+
+```
+nitid: surface Rgba16Float ExtendedSrgbLinear, display headroom 7.71x
+```
+
+A screenshot of an HDR window is a standard-range image, so this line is the
+one way to check the answer rather than judge it. See
+[ADR 0013](docs/adr/0013-hdr-output-goes-through-scrgb.md).
+
 ## Formats
 
 Everything below decodes in pure Rust: a malformed file costs an error, never
@@ -129,7 +158,8 @@ container read separately. It gets the full colour treatment: the file's
 primaries and transfer curve are read from the bitstream and applied on the GPU
 like every other tagged format, so a Display P3 AVIF is shown across the
 display's gamut rather than folded into sRGB. 10- and 12-bit AVIF are refused
-for now rather than shown narrowed to eight bits; they arrive with HDR. See
+for now rather than shown narrowed to eight bits; they arrive with the wider
+buffer in v0.14.0, the stage after HDR. See
 [ADR 0008](docs/adr/0008-avif-decodes-with-rav1d.md).
 
 HEIC and AVIF decode in a **separate process** — not because they are unsafe
@@ -161,12 +191,15 @@ has no size limit to hide behind.
 
 ## Status
 
-Early development — v0.12.0 is out. Startup, colour and format coverage hold:
+Early development — v0.13.0 is out. Startup, colour and format coverage hold:
 every modern still format opens, a phone's photographs included, every one of
-them reaches the screen without a wait, and the ones that animate now play.
-The process that decodes the heavy formats runs with no network in either
-direction. HDR is still ahead. Development runs in small versions, each one
-theme; the road to 1.0 is fixed:
+them reaches the screen without a wait, and the ones that animate play. The
+process that decodes the heavy formats runs with no network in either
+direction. **HDR output works**, and follows the display's own state while the
+viewer is open. What HDR now waits on is the pixels rather than the screen:
+every decoder still hands over eight bits per channel, so the surface can
+carry more light than the files currently contain. Development runs in small
+versions, each one theme; the road to 1.0 is fixed:
 
 | Version | What lands |
 | --- | --- |
@@ -184,11 +217,12 @@ theme; the road to 1.0 is fixed:
 | ✅ v0.10.0 | HEIC from its thumbnail, and its ICC colour on the GPU |
 | ✅ v0.11.0 | The network closed to the decoder, and a cheaper bridge |
 | ✅ v0.12.0 | Animation: GIF, APNG and animated WebP play |
-| v0.13.0 | HDR output on Windows (`Bt2100Pq` on `Rgb10a2Unorm`) |
-| v0.14.0 | Gigapixel images via tiled rendering |
-| v0.15.0 – v0.34.0 | The everyday viewer: single instance, toolbar, EXIF panel, clipboard, file operations, culling, comparison, settings |
-| v0.35.0 – v0.38.0 | Windows integration: context menu, installer, auto-update, thumbnails |
-| v0.39.0 – v0.40.0 | Documentation site, stabilisation |
+| ✅ v0.13.0 | HDR output on Windows, following the display as it changes |
+| v0.14.0 | A wider buffer: 10- and 12-bit sources through to the screen |
+| v0.15.0 | Gigapixel images via tiled rendering |
+| v0.16.0 – v0.35.0 | The everyday viewer: single instance, toolbar, EXIF panel, clipboard, file operations, culling, comparison, settings |
+| v0.36.0 – v0.39.0 | Windows integration: context menu, installer, auto-update, thumbnails |
+| v0.40.0 – v0.41.0 | Documentation site, stabilisation |
 | v1.0.0 | Public release — the default viewer, nothing missing |
 
 Beyond 1.0: **2.x** makes a separate screenshot tool unnecessary — capture a
@@ -257,14 +291,14 @@ here as everywhere else on a scaled display.
 
 | Variable | Effect |
 | --- | --- |
-| `NITID_STARTUP_REPORT=1` | print the startup breakdown to stderr |
+| `NITID_STARTUP_REPORT=1` | print the startup breakdown to stderr, and state the surface each time it is configured |
 | `NITID_EXIT_AFTER_FIRST_FRAME=1` | close as soon as a picture is on screen; used by the startup test |
 
 ## Design notes
 
 Two decisions shape everything else:
 
-**nitid owns its swapchain.** HDR output on Windows is only reachable through `Bt2100Pq` on the `Rgb10a2Unorm` format — DirectX 12 has no extended-sRGB swapchain color space. A GUI framework that configures the surface for you closes that door, so the window and renderer are ours; `egui` is used for widgets only.
+**nitid owns its swapchain.** HDR output needs a surface format and color space chosen deliberately — `ExtendedSrgbLinear` on `Rgba16Float`, and re-chosen while the viewer runs as the display changes. A GUI framework that configures the surface for you closes that door, so the window and renderer are ours; `egui` is used for widgets only.
 
 **Untrusted input is isolated, and slow input is interruptible.** An image decoder parses hostile data by definition — pictures arrive from the internet. Every decoder nitid ships is Rust, so a malformed file causes a panic or an error rather than code execution. The separate low-integrity process that was built for memory safety earns its keep for a different reason: a thread cannot be stopped and a process can, so a decode is abandoned when you navigate away and killed when it wedges.
 

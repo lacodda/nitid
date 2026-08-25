@@ -51,6 +51,25 @@ fn reporting() -> bool {
     std::env::var_os(REPORT_VAR).is_some_and(|value| value != "0")
 }
 
+/// The prefix of the line naming the output signal, so a test can find it.
+pub const SURFACE_PREFIX: &str = "nitid: surface ";
+
+/// Report how the swapchain is configured, when the report is switched on.
+///
+/// Colour is the product's second promise, and high dynamic range is the part
+/// of it that cannot be confirmed by looking at a screenshot — a screenshot is
+/// standard range whatever the surface was. Stating the configuration turns
+/// "is HDR on?" into something a person or a test can read rather than judge.
+pub fn surface(format: &str, color_space: &str, headroom: Option<f32>) {
+    if !reporting() {
+        return;
+    }
+    match headroom {
+        Some(headroom) => eprintln!("{SURFACE_PREFIX}{format} {color_space}, display headroom {headroom:.2}x"),
+        None => eprintln!("{SURFACE_PREFIX}{format} {color_space}, display headroom unknown"),
+    }
+}
+
 /// Record that a frame with an image in it has reached the screen.
 ///
 /// Only the first call counts: later frames are the viewer running, not the
@@ -89,6 +108,11 @@ mod tests {
         // path where a frame is drawn by something that did not start a clock.
         first_pixels();
         assert!(elapsed().is_none());
+    }
+
+    #[test]
+    fn the_surface_prefix_ends_where_its_description_begins() {
+        assert!(SURFACE_PREFIX.ends_with(' '));
     }
 
     #[test]
