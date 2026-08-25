@@ -2,6 +2,11 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.13.0] - 2026-08-25
+
+### Features
+- Output high dynamic range, and follow the display
+
 ## [0.12.0] - 2026-08-23
 
 ### Features
