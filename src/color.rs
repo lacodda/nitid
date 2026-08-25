@@ -72,11 +72,32 @@ impl ColorTransform {
 
     /// Build the transform from an image profile to a display profile.
     pub fn new(source: &ColorProfile, display: &ColorProfile) -> Self {
+        // PQ stores absolute light: its decoded curve reaches 1.0 at ten
+        // thousand nits, so HDR reference white — 203 nits, BT.2408 — comes
+        // out at two percent and the whole picture would be nearly black on
+        // any surface. Scaling reference white onto 1.0 puts it on SDR white,
+        // which is where both surfaces expect it: a standard-range display
+        // clips the highlights above it, an HDR one drives them into its
+        // headroom. The scale rides in the matrix, so the shader needs no
+        // extra step. See `docs/adr/0014-pq-reference-white-lands-on-sdr-white.md`.
+        let brighten = pq_scale(source);
         let matrix = source.transform_matrix(display);
         let matrix = [
-            [matrix.v[0][0] as f32, matrix.v[0][1] as f32, matrix.v[0][2] as f32],
-            [matrix.v[1][0] as f32, matrix.v[1][1] as f32, matrix.v[1][2] as f32],
-            [matrix.v[2][0] as f32, matrix.v[2][1] as f32, matrix.v[2][2] as f32],
+            [
+                matrix.v[0][0] as f32 * brighten,
+                matrix.v[0][1] as f32 * brighten,
+                matrix.v[0][2] as f32 * brighten,
+            ],
+            [
+                matrix.v[1][0] as f32 * brighten,
+                matrix.v[1][1] as f32 * brighten,
+                matrix.v[1][2] as f32 * brighten,
+            ],
+            [
+                matrix.v[2][0] as f32 * brighten,
+                matrix.v[2][1] as f32 * brighten,
+                matrix.v[2][2] as f32 * brighten,
+            ],
         ];
 
         let decode = sample_curves(source);
@@ -88,6 +109,20 @@ impl ColorTransform {
         let is_identity = is_near_identity(&matrix) && is_near_srgb_curve(&decode);
 
         Self { matrix, decode, is_identity }
+    }
+}
+
+/// How much a profile's linear light must be scaled so its reference white
+/// lands on 1.0.
+///
+/// Only PQ needs this: its transfer function is absolute, normalised to ten
+/// thousand nits, and BT.2408 puts HDR reference white at 203 of them. Every
+/// other curve — sRGB, gamma, even HLG, which is scene-relative — already
+/// treats 1.0 as its white.
+fn pq_scale(profile: &ColorProfile) -> f32 {
+    match profile.cicp {
+        Some(cicp) if cicp.transfer_characteristics == moxcms::TransferCharacteristics::Smpte2084 => 10000.0 / 203.0,
+        _ => 1.0,
     }
 }
 
@@ -564,5 +599,55 @@ mod tests {
             .write_to(&mut png, image::ImageFormat::Png)
             .unwrap();
         assert!(profile_from(&png.into_inner()).is_none());
+    }
+
+    /// A PQ profile's reference white must land on 1.0 after the transform.
+    ///
+    /// The decoded PQ curve reaches 1.0 at ten thousand nits, so the 203-nit
+    /// reference white decodes to about 0.0203 — and without the scale folded
+    /// into the matrix, every HDR10 image would show nearly black. The scale
+    /// is checked end to end here: curve times matrix, grey in, SDR white
+    /// out.
+    #[test]
+    fn pq_reference_white_lands_on_sdr_white() {
+        let cicp = moxcms::CicpProfile {
+            color_primaries: 9u8.try_into().unwrap(),
+            transfer_characteristics: 16u8.try_into().unwrap(),
+            matrix_coefficients: 9u8.try_into().unwrap(),
+            full_range: true,
+        };
+        let mut profile = ColorProfile::new_srgb();
+        profile.update_rgb_colorimetry_from_cicp(cicp);
+
+        let transform = ColorTransform::new(&profile, &ColorProfile::new_srgb());
+        assert!(!transform.is_identity, "a PQ image must be converted");
+
+        // The PQ code for 203 nits, decoded through the sampled curve.
+        let code = 0.5806f32;
+        let position = code * (CURVE_SAMPLES - 1) as f32;
+        let index = position.floor() as usize;
+        let fraction = position - index as f32;
+        let linear = |channel: usize| {
+            let row = &transform.decode[channel * CURVE_SAMPLES..(channel + 1) * CURVE_SAMPLES];
+            row[index] + (row[index + 1] - row[index]) * fraction
+        };
+
+        // Grey through the matrix: each output row sums its weights.
+        for row in 0..3 {
+            let out: f32 = (0..3).map(|column| transform.matrix[row][column] * linear(column)).sum();
+            assert!((out - 1.0).abs() < 0.05, "PQ reference white came out at {out} on row {row}");
+        }
+    }
+
+    /// A curve that is not PQ is not scaled: sRGB white stays white.
+    #[test]
+    fn only_pq_light_is_rescaled() {
+        let transform = ColorTransform::new(&ColorProfile::new_display_p3(), &ColorProfile::new_srgb());
+        // The matrix rows of a P3-to-sRGB transform sum to about 1.0 —
+        // white maps to white. A stray PQ scale would blow this up 49-fold.
+        for row in 0..3 {
+            let sum: f32 = transform.matrix[row].iter().sum();
+            assert!((sum - 1.0).abs() < 0.02, "row {row} of an SDR transform sums to {sum}");
+        }
     }
 }

@@ -13,7 +13,7 @@ use wgpu::util::DeviceExt;
 
 use crate::color::{CURVE_SAMPLES, ColorTransform};
 use crate::hdr::{self, Output};
-use crate::image_source::{DecodedImage, Orientation};
+use crate::image_source::{DecodedImage, Depth, Orientation};
 use crate::view::View;
 
 /// The colour behind the image. It matches the shader's compositing background
@@ -96,7 +96,12 @@ struct ColourUniform {
 }
 
 impl ColourUniform {
-    fn new(transform: &ColorTransform, output: Output) -> Self {
+    /// `depth` is the depth of the texture as uploaded — a sixteen-bit texture
+    /// has no `*Srgb` variant, so the hardware cannot decode it on sampling
+    /// and the shader's curves must, even when the transform itself would
+    /// change nothing. The identity transform carries the sRGB curve for
+    /// exactly this.
+    fn new(transform: &ColorTransform, output: Output, depth: Depth) -> Self {
         let mut matrix = [[0.0; 4]; 3];
         for (row, values) in transform.matrix.iter().enumerate() {
             matrix[row][..3].copy_from_slice(values);
@@ -104,7 +109,7 @@ impl ColourUniform {
 
         Self {
             matrix,
-            convert: u32::from(!transform.is_identity),
+            convert: u32::from(!transform.is_identity || depth == Depth::Sixteen),
             // An sRGB surface format encodes for us on write. Anything else
             // expects the shader to have done it — except an extended-range
             // linear surface, which wants the light itself.
@@ -122,6 +127,9 @@ struct Upload {
     /// rather than building a texture and bind group per frame.
     texture: wgpu::Texture,
     size: (u32, u32),
+    /// The sample depth the texture was created for. A frame of another depth
+    /// cannot be written into it — the formats differ.
+    depth: Depth,
 }
 
 /// Device, surface, pipeline, and the texture being shown.
@@ -154,6 +162,13 @@ pub struct Renderer {
     /// be rewritten when the surface changes under it — the same picture needs
     /// different encoding on an SDR and an HDR surface.
     transform: ColorTransform,
+    /// Whether the device can hold sixteen-bit normalised textures.
+    ///
+    /// `Rgba16Unorm` is an optional wgpu feature. DX12 — the backend nitid
+    /// runs on — mandates the underlying format, so on Windows this is
+    /// simply true; elsewhere a wide image is narrowed on upload rather than
+    /// refused.
+    wide_textures: bool,
     upload: Option<Upload>,
 }
 
@@ -180,8 +195,17 @@ impl Renderer {
 
         crate::startup::milestone("adapter chosen");
 
+        // Sixteen-bit textures are how a 10- or 12-bit image reaches the
+        // screen at its own depth. Asked for only when the adapter offers
+        // them, so a device that cannot is still a device.
+        let wide_textures = adapter.features().contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM);
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("nitid device"),
+            required_features: if wide_textures {
+                wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
+            } else {
+                wgpu::Features::empty()
+            },
             // Downlevel limits keep integrated and older GPUs in scope; nothing
             // in the image path needs more than a texture and one draw call.
             required_limits: wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
@@ -273,7 +297,7 @@ impl Renderer {
 
         let colour = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("nitid colour"),
-            contents: bytemuck::bytes_of(&ColourUniform::new(&ColorTransform::identity(), output)),
+            contents: bytemuck::bytes_of(&ColourUniform::new(&ColorTransform::identity(), output, Depth::Eight)),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -295,6 +319,7 @@ impl Renderer {
             curve_sampler,
             colour,
             transform: ColorTransform::identity(),
+            wide_textures,
             upload: None,
         })
     }
@@ -351,8 +376,9 @@ impl Renderer {
         self.pipeline = build_pipeline(&self.device, &self.pipeline_layout, &self.shader, output.format);
         // The picture on screen was encoded for the surface that just went
         // away; the uniform says how, so it is rewritten for the new one.
+        let depth = self.upload.as_ref().map_or(Depth::Eight, |upload| upload.depth);
         self.queue
-            .write_buffer(&self.colour, 0, bytemuck::bytes_of(&ColourUniform::new(&self.transform, output)));
+            .write_buffer(&self.colour, 0, bytemuck::bytes_of(&ColourUniform::new(&self.transform, output, depth)));
         true
     }
 
@@ -370,31 +396,50 @@ impl Renderer {
             depth_or_array_layers: 1,
         };
 
+        // A wide image on a device without wide textures is narrowed here,
+        // once, at upload — the picture still opens, at the depth an 8-bit
+        // file would have had. Not met on Windows, where DX12 mandates the
+        // format; kept so the one place that would hit it degrades instead
+        // of refusing the file.
+        let narrowed;
+        let (pixels, depth): (&[u8], Depth) = match image.depth {
+            Depth::Sixteen if !self.wide_textures => {
+                narrowed = narrow_to_eight(&image.pixels);
+                (&narrowed, Depth::Eight)
+            }
+            depth => (&image.pixels, depth),
+        };
+
+        let format = match (depth, transform.is_identity) {
+            // The hardware linearises sRGB on sampling, which is both free
+            // and filtered correctly.
+            (Depth::Eight, true) => wgpu::TextureFormat::Rgba8UnormSrgb,
+            // The shader needs the stored values untouched so it can push
+            // them through the profile's curves.
+            (Depth::Eight, false) => wgpu::TextureFormat::Rgba8Unorm,
+            // No `*Srgb` variant exists at sixteen bits, so the shader's
+            // curves decode this whatever the transform says — that is the
+            // `depth` handed to `ColourUniform` below.
+            (Depth::Sixteen, _) => wgpu::TextureFormat::Rgba16Unorm,
+        };
+
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("nitid image"),
             size: extent,
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: if transform.is_identity {
-                // The hardware linearises sRGB on sampling, which is both free
-                // and filtered correctly.
-                wgpu::TextureFormat::Rgba8UnormSrgb
-            } else {
-                // The shader needs the stored values untouched so it can push
-                // them through the profile's curves.
-                wgpu::TextureFormat::Rgba8Unorm
-            },
+            format,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
 
         self.queue.write_texture(
             texture.as_image_copy(),
-            &image.pixels,
+            pixels,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(image.bytes_per_row()),
+                bytes_per_row: Some(extent.width * 4 * depth.bytes()),
                 rows_per_image: Some(extent.height),
             },
             extent,
@@ -403,7 +448,7 @@ impl Renderer {
         self.transform = transform.clone();
         self.write_curves(transform);
         self.queue
-            .write_buffer(&self.colour, 0, bytemuck::bytes_of(&ColourUniform::new(transform, self.output)));
+            .write_buffer(&self.colour, 0, bytemuck::bytes_of(&ColourUniform::new(transform, self.output, depth)));
 
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -441,6 +486,7 @@ impl Renderer {
             bind_group,
             texture,
             size: (image.width, image.height),
+            depth,
         });
     }
 
@@ -456,7 +502,7 @@ impl Renderer {
         let Some(upload) = &self.upload else {
             return false;
         };
-        if upload.size != (image.width, image.height) {
+        if upload.size != (image.width, image.height) || upload.depth != image.depth {
             return false;
         }
 
@@ -623,6 +669,19 @@ fn bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     })
 }
 
+/// Keep the top byte of each sixteen-bit sample.
+///
+/// The fallback for a device without wide textures: the same narrowing the
+/// decoder itself used to do, moved to the one machine that needs it.
+fn narrow_to_eight(pixels: &[u8]) -> Vec<u8> {
+    pixels
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_ne_bytes(*pair).to_be_bytes()[0])
+        .collect()
+}
+
 /// State the output signal for the startup report.
 ///
 /// A screenshot of an HDR window is a standard-range image, so the one thing a
@@ -743,7 +802,7 @@ mod tests {
 
     #[test]
     fn an_identity_transform_asks_the_shader_to_do_nothing() {
-        let uniform = ColourUniform::new(&ColorTransform::identity(), srgb_surface());
+        let uniform = ColourUniform::new(&ColorTransform::identity(), srgb_surface(), Depth::Eight);
         assert_eq!(uniform.convert, 0);
         assert_eq!(uniform.encode_srgb, 0);
         assert_eq!(uniform.extended_range, 0);
@@ -751,7 +810,7 @@ mod tests {
 
     #[test]
     fn a_conversion_onto_an_srgb_surface_leaves_encoding_to_the_hardware() {
-        let uniform = ColourUniform::new(&wide_gamut_transform(), srgb_surface());
+        let uniform = ColourUniform::new(&wide_gamut_transform(), srgb_surface(), Depth::Eight);
 
         assert_eq!(uniform.convert, 1);
         // An sRGB surface encodes on write; doing it in the shader too would
@@ -766,14 +825,14 @@ mod tests {
         // to the conversion, which would have written linear light to a
         // surface expecting sRGB — dark, and only on hardware nitid had not
         // met.
-        assert_eq!(ColourUniform::new(&wide_gamut_transform(), plain_surface()).encode_srgb, 1);
-        assert_eq!(ColourUniform::new(&ColorTransform::identity(), plain_surface()).encode_srgb, 1);
+        assert_eq!(ColourUniform::new(&wide_gamut_transform(), plain_surface(), Depth::Eight).encode_srgb, 1);
+        assert_eq!(ColourUniform::new(&ColorTransform::identity(), plain_surface(), Depth::Eight).encode_srgb, 1);
     }
 
     #[test]
     fn an_extended_range_surface_is_given_light_rather_than_an_encoding() {
         for transform in [ColorTransform::identity(), wide_gamut_transform()] {
-            let uniform = ColourUniform::new(&transform, hdr_surface());
+            let uniform = ColourUniform::new(&transform, hdr_surface(), Depth::Eight);
 
             assert_eq!(uniform.extended_range, 1);
             // Encoding here would apply a transfer function the surface does
@@ -860,10 +919,23 @@ mod tests {
     /// `None` when no adapter can be had, which is a fact about the machine
     /// rather than a regression in the viewer.
     fn draw_offscreen(output: Output, transform: &ColorTransform, pixel: [u8; 4]) -> Option<[f32; 4]> {
+        draw_offscreen_at(output, transform, &pixel, Depth::Eight)
+    }
+
+    fn draw_offscreen_at(output: Output, transform: &ColorTransform, pixel: &[u8], depth: Depth) -> Option<[f32; 4]> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
+        let wide = adapter.features().contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM);
+        if depth == Depth::Sixteen && !wide {
+            return None;
+        }
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("nitid offscreen test device"),
+            required_features: if wide {
+                wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
+            } else {
+                wgpu::Features::empty()
+            },
             ..Default::default()
         }))
         .ok()?;
@@ -893,20 +965,20 @@ mod tests {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: if transform.is_identity {
-                wgpu::TextureFormat::Rgba8UnormSrgb
-            } else {
-                wgpu::TextureFormat::Rgba8Unorm
+            format: match (depth, transform.is_identity) {
+                (Depth::Eight, true) => wgpu::TextureFormat::Rgba8UnormSrgb,
+                (Depth::Eight, false) => wgpu::TextureFormat::Rgba8Unorm,
+                (Depth::Sixteen, _) => wgpu::TextureFormat::Rgba16Unorm,
             },
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
         queue.write_texture(
             image.as_image_copy(),
-            &pixel,
+            pixel,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(4),
+                bytes_per_row: Some(4 * depth.bytes()),
                 rows_per_image: Some(1),
             },
             extent,
@@ -952,7 +1024,7 @@ mod tests {
         });
         let colour = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
-            contents: bytemuck::bytes_of(&ColourUniform::new(transform, output)),
+            contents: bytemuck::bytes_of(&ColourUniform::new(transform, output, depth)),
             usage: wgpu::BufferUsages::UNIFORM,
         });
 
@@ -1130,5 +1202,39 @@ mod tests {
         // configuring at all.
         let sdr = draw_offscreen(srgb_surface(), &transform, [255, 255, 255, 255]).expect("the adapter answered already");
         assert!(sdr[0] <= 1.01, "a standard-range surface should clip at white: {sdr:?}");
+    }
+
+    /// A sixteen-bit texture must show the same light as the eight-bit one.
+    ///
+    /// The wide path has no `*Srgb` hardware decode — the shader's curves
+    /// stand in for it — so this is where a curve applied once too often or
+    /// not at all becomes visible. Mid grey again, because both endpoints
+    /// survive most mistakes.
+    #[test]
+    fn a_wide_texture_shows_the_same_light_as_a_narrow_one() {
+        let transform = ColorTransform::identity();
+        let narrow = [128u8, 128, 128, 255];
+        // The same grey as 16-bit samples: 128/255 of the full range.
+        let sample = (128.0f32 / 255.0 * 65535.0 + 0.5) as u16;
+        let mut wide = Vec::new();
+        for value in [sample, sample, sample, u16::MAX] {
+            wide.extend_from_slice(&value.to_ne_bytes());
+        }
+
+        let Some(eight) = draw_offscreen(srgb_surface(), &transform, narrow) else {
+            eprintln!("skipping: no graphics adapter here");
+            return;
+        };
+        let Some(sixteen) = draw_offscreen_at(srgb_surface(), &transform, &wide, Depth::Sixteen) else {
+            eprintln!("skipping: the adapter has no wide textures");
+            return;
+        };
+
+        for channel in 0..3 {
+            assert!(
+                (eight[channel] - sixteen[channel]).abs() < 0.01,
+                "channel {channel}: the narrow texture shows {eight:?} and the wide one {sixteen:?}"
+            );
+        }
     }
 }

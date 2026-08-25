@@ -26,19 +26,47 @@ pub fn supported_extensions() -> Vec<&'static str> {
     Format::ALL.iter().flat_map(|format| format.extensions().iter().copied()).collect()
 }
 
-/// A decoded image: tightly packed RGBA8 rows, ready for a GPU upload.
+/// How wide one sample of a decoded image is.
+///
+/// Most formats deliver eight bits per channel and always will. Ten- and
+/// twelve-bit sources — HDR AVIF and HEIC — arrive as sixteen, scaled to the
+/// full range, because that is the texture width the GPU offers next to
+/// eight; carrying "ten" through the pipeline would add a case every stage
+/// must handle and no stage wants.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Depth {
+    #[default]
+    Eight,
+    /// Samples are `u16` in native byte order, two bytes each in `pixels`.
+    Sixteen,
+}
+
+impl Depth {
+    /// Bytes per sample.
+    pub fn bytes(self) -> u32 {
+        match self {
+            Self::Eight => 1,
+            Self::Sixteen => 2,
+        }
+    }
+}
+
+/// A decoded image: tightly packed RGBA rows, ready for a GPU upload.
 #[derive(Clone)]
 pub struct DecodedImage {
     pub width: u32,
     pub height: u32,
-    /// `width * height * 4` bytes, row-major, no padding.
+    /// `width * height * 4` samples, row-major, no padding. A sample is one
+    /// byte or a native-endian `u16` pair, as `depth` says.
     pub pixels: Vec<u8>,
+    /// How wide each sample is.
+    pub depth: Depth,
 }
 
 impl DecodedImage {
     /// Bytes per row as the GPU sees them.
     pub fn bytes_per_row(&self) -> u32 {
-        self.width * 4
+        self.width * 4 * self.depth.bytes()
     }
 }
 
@@ -401,7 +429,12 @@ fn decode_jpeg(bytes: &[u8]) -> Result<DecodedImage> {
         bail!("the JPEG decoded to {} bytes but {}x{} RGBA needs {expected}", pixels.len(), width, height);
     }
 
-    Ok(DecodedImage { width, height, pixels })
+    Ok(DecodedImage {
+        width,
+        height,
+        pixels,
+        depth: Depth::Eight,
+    })
 }
 
 fn decode_via_image_crate(bytes: &[u8]) -> Result<DecodedImage> {
@@ -420,6 +453,7 @@ fn decode_via_image_crate(bytes: &[u8]) -> Result<DecodedImage> {
         width,
         height,
         pixels: rgba.into_raw(),
+        depth: Depth::Eight,
     })
 }
 
@@ -431,7 +465,7 @@ fn decode_webp(bytes: &[u8]) -> Result<DecodedImage> {
     let mut decoder = image_webp::WebPDecoder::new(Cursor::new(bytes)).context("the WebP header is unreadable")?;
     let (width, height) = decoder.dimensions();
 
-    let expected = pixel_count(width, height)?;
+    let expected = pixel_count(width, height, Depth::Eight)?;
     let mut pixels = vec![0u8; expected];
 
     if decoder.has_alpha() {
@@ -444,7 +478,12 @@ fn decode_webp(bytes: &[u8]) -> Result<DecodedImage> {
         pixels = rgb_to_rgba8(&rgb, expected);
     }
 
-    Ok(DecodedImage { width, height, pixels })
+    Ok(DecodedImage {
+        width,
+        height,
+        pixels,
+        depth: Depth::Eight,
+    })
 }
 
 /// Decode a JPEG XL, returning the pixels together with the profile the file
@@ -520,18 +559,40 @@ fn decode_heic(bytes: &[u8]) -> Result<DecodedImage> {
 
     let width = image.width;
     let height = image.height;
-    let expected = pixel_count(width, height)?;
 
-    // 10- and 12-bit sources come back as 16-bit samples and are narrowed
-    // here, because the renderer uploads RGBA8. The depth is not thrown away
-    // silently for ever: HDR (v0.10.0) is where it starts to matter, and this
-    // is one of the places that will read the wider buffer instead.
-    let pixels = image.to_rgba8();
+    // A 10- or 12-bit source comes back as 16-bit samples, already scaled to
+    // the full range, and is kept that wide: the renderer takes sixteen-bit
+    // textures now, and narrowing here was the debt this stage repays.
+    let (pixels, depth) = match &image.pixels {
+        heif_oxide::Pixels::Rgb8(_) | heif_oxide::Pixels::Rgba8(_) => (image.to_rgba8(), Depth::Eight),
+        heif_oxide::Pixels::Rgb16(samples) => (rgb16_to_rgba_bytes(samples, false), Depth::Sixteen),
+        heif_oxide::Pixels::Rgba16(samples) => (rgb16_to_rgba_bytes(samples, true), Depth::Sixteen),
+    };
+
+    let expected = pixel_count(width, height, depth)?;
     if pixels.len() != expected {
         bail!("the HEIC decoded to {} bytes but {width}x{height} RGBA needs {expected}", pixels.len());
     }
 
-    Ok(DecodedImage { width, height, pixels })
+    Ok(DecodedImage { width, height, pixels, depth })
+}
+
+/// Interleave 16-bit samples into RGBA bytes, native-endian.
+///
+/// `has_alpha` says whether the samples come in fours already or in threes
+/// needing an opaque alpha appended.
+fn rgb16_to_rgba_bytes(samples: &[u16], has_alpha: bool) -> Vec<u8> {
+    if has_alpha {
+        return bytemuck::cast_slice(samples).to_vec();
+    }
+    let mut out = Vec::with_capacity(samples.len() / 3 * 8);
+    for rgb in samples.as_chunks::<3>().0 {
+        for sample in rgb {
+            out.extend_from_slice(&sample.to_ne_bytes());
+        }
+        out.extend_from_slice(&u16::MAX.to_ne_bytes());
+    }
+    out
 }
 
 /// The two come back together because `jxl-oxide` reaches both in the same
@@ -564,7 +625,7 @@ fn decode_jxl(bytes: &[u8]) -> Result<(DecodedImage, Option<ColorProfile>)> {
     let height = stream.height();
     let channels = stream.channels() as usize;
 
-    let expected = pixel_count(width, height)?;
+    let expected = pixel_count(width, height, Depth::Eight)?;
     let mut samples = vec![0u8; expected / 4 * channels];
     stream.write_to_buffer(&mut samples);
 
@@ -584,17 +645,25 @@ fn decode_jxl(bytes: &[u8]) -> Result<(DecodedImage, Option<ColorProfile>)> {
         other => bail!("a JPEG XL with {other} channels per pixel is not one this build can show"),
     };
 
-    Ok((DecodedImage { width, height, pixels }, profile))
+    Ok((
+        DecodedImage {
+            width,
+            height,
+            pixels,
+            depth: Depth::Eight,
+        },
+        profile,
+    ))
 }
 
 /// Bytes needed for a `width` by `height` RGBA8 image.
 ///
 /// Checked rather than multiplied: the dimensions come from a file that may be
 /// lying, and a 32-bit overflow here would size the buffer far too small.
-pub(crate) fn pixel_count(width: u32, height: u32) -> Result<usize> {
+pub(crate) fn pixel_count(width: u32, height: u32, depth: Depth) -> Result<usize> {
     (width as usize)
         .checked_mul(height as usize)
-        .and_then(|pixels| pixels.checked_mul(4))
+        .and_then(|pixels| pixels.checked_mul(4 * depth.bytes() as usize))
         .filter(|bytes| *bytes > 0)
         .with_context(|| format!("{width}x{height} is not an image this build can hold"))
 }
@@ -873,6 +942,35 @@ mod tests {
     /// because a HEIC cannot be built from a few bytes of header the way a
     /// PNG can: its pixels are HEVC, and no Rust encoder for them builds
     /// within this crate's MSRV.
+    /// A 64x64 10-bit HEIC holding the same shallow grey ramp as the AVIF
+    /// fixtures: about a hundred sixteen-bit units per column, which 8 bits
+    /// cannot express. Lossless, written by pillow-heif over libheif.
+    const HEIC_RAMP_10BIT: &str = concat!(
+        "AAAAHGZ0eXBoZWl4AAAAAG1pZjFoZWl4bWlhZgAAAVJtZXRhAAAAAAAAACFoZGxyAAAAAAAAAABwaWN0AAAAAAAAAAAAAAAA",
+        "AAAAACJpbG9jAAAAAERAAAEAAQAAAAABdgABAAAAAAAAAM4AAAAjaWluZgAAAAAAAQAAABVpbmZlAgAAAAABAABodmMxAAAA",
+        "AA5waXRtAAAAAAABAAAA0mlwcnAAAACzaXBjbwAAAHRodmNDAQQIAAAAAAAAAAAA//AA/P36+gAADwNgAAEAF0ABDAH//wQI",
+        "AAADAJ24AAADAAD/ugJAYQABAClCAQEECAAAAwCduAAAAwAA/6AggQTZbqSSmubgIaDAgAAADIAAAAMAhGIAAQAGRAHBcYkS",
+        "AAAAE2NvbHJuY2x4AAEADQAGgAAAABRpc3BlAAAAAAAAAEAAAABAAAAAEHBpeGkAAAAAAwoKCgAAABdpcG1hAAAAAAAAAAEA",
+        "AQSBAgMEAAAA1m1kYXQAAADKKAGvBbgVevUg///6H/Q/z/5j4T4X4f4j4X4b4j4n4X4b4j4kAxwCm5k3ueNHjvlv8I/QAZeP",
+        "z9X9AAADAJR1Bs5JsmHjLFhwQoAAD+woCeDK92AARx87ZCrCKzhs5cwAEDRlg3jzwAAWy6X7uYnO1YMksTfho0AARaWExemv",
+        "DAADXQzjgqmAp74rrYAIYvom2YugABauUtFLQlptDj3wADPG1uq2JYCABCJLnLPD7RF1y+wANwn+ES8GAADhb1YvxT4pdck/",
+        "N15LwA==",
+    );
+
+    /// The same ramp at 12 bits.
+    const HEIC_RAMP_12BIT: &str = concat!(
+        "AAAAHGZ0eXBoZWl4AAAAAG1pZjFoZWl4bWlhZgAAAVRtZXRhAAAAAAAAACFoZGxyAAAAAAAAAABwaWN0AAAAAAAAAAAAAAAA",
+        "AAAAACJpbG9jAAAAAERAAAEAAQAAAAABeAABAAAAAAAAASoAAAAjaWluZgAAAAAAAQAAABVpbmZlAgAAAAABAABodmMxAAAA",
+        "AA5waXRtAAAAAAABAAAA1GlwcnAAAAC1aXBjbwAAAHZodmNDAQQIAAAAAAAAAAAA//AA/P38/AAADwNgAAEAF0ABDAH//wQI",
+        "AAADAJm4AAADAAD/ugJAYQABACtCAQEECAAAAwCZuAAAAwAA/6AggQRSlupJKa5uAhoMCAAAAwDIAAADAAhAYgABAAZEAcFx",
+        "iRIAAAATY29scm5jbHgAAQANAAaAAAAAFGlzcGUAAAAAAAAAQAAAAEAAAAAQcGl4aQAAAAADDAwMAAAAF2lwbWEAAAAAAAAA",
+        "AQABBIECAwQAAAEybWRhdAAAASYoAa8FuBAc/+Bm///7llNyZ9zLLbktPg2H7PQtPg2UPd4dSl2UPd4dlD3eHdHoMAdzVZ9Q",
+        "BoekAdxwB3R3Or4AAQJI7ZLWN7OK6y8rrBgAApOerX7gH/nJLU0kth9iKXrAoAABl0ueBRa6TFsQZ+xAnAAIoVQ+7+VuLwqw",
+        "aCrElg4AAaUz+ZTfTwVI8b8jxfAAEJPRtauoIQAdvax2+/wOMCU35OXAAI4OgqpcODxZNI0k0doACHGlTid+3f4kPhiQ+vDc",
+        "ABlU7+p2fJn6bLpJstkAAhB9l1fGE3NPcvI9zE9F//AACGmy0LDDG0tTKwtMptAAzqC+DxHGKTvvWO+9lMAAB4stF7Q5z7x1",
+        "FZfUUZAA7mqz6gDQ9IA7jgDubMf1xBLlgYA=",
+    );
+
     const HEIC_GRADIENT: &str = concat!(
         "AAAAHGZ0eXBoZWljAAAAAG1pZjFoZWljbWlhZgAAAXxtZXRhAAAAAAAAACFoZGxyAAAAAAAAAABwaWN0AAAAAAAAAAAAAAAA",
         "AAAAACJpbG9jAAAAAERAAAEAAQAAAAABoAABAAAAAAAAAMUAAAAjaWluZgAAAAAAAQAAABVpbmZlAgAAAAABAABodmMxAAAA",
@@ -1226,9 +1324,10 @@ mod tests {
     /// sizes the buffer must not wrap.
     #[test]
     fn absurd_dimensions_are_refused_rather_than_overflowing() {
-        assert!(pixel_count(u32::MAX, u32::MAX).is_err());
-        assert!(pixel_count(0, 0).is_err());
-        assert_eq!(pixel_count(2, 3).unwrap(), 24);
+        assert!(pixel_count(u32::MAX, u32::MAX, Depth::Eight).is_err());
+        assert!(pixel_count(0, 0, Depth::Eight).is_err());
+        assert_eq!(pixel_count(2, 3, Depth::Eight).unwrap(), 24);
+        assert_eq!(pixel_count(2, 3, Depth::Sixteen).unwrap(), 48);
     }
 
     #[test]
@@ -1383,6 +1482,7 @@ mod tests {
                 width: 100,
                 height: 50,
                 pixels: Vec::new(),
+                depth: Depth::Eight,
             },
             orientation: Orientation::Rotate90,
             fidelity: Fidelity::Full,
@@ -1399,5 +1499,40 @@ mod tests {
         assert!(is_supported(Path::new("photo.png")));
         assert!(!is_supported(Path::new("notes.txt")));
         assert!(!is_supported(Path::new("no-extension")));
+    }
+
+    /// A 10-bit HEIC keeps its depth: the decoder hands over 16-bit samples
+    /// and they reach `DecodedImage` unnarrowed. The ramp fixture climbs in
+    /// steps an 8-bit pipeline cannot take — its quantum is 257 — so one
+    /// small non-zero step proves the bits survived.
+    #[test]
+    fn a_ten_bit_heic_keeps_more_than_eight_bits() {
+        let loaded = decode_here(&from_base64(HEIC_RAMP_10BIT)).unwrap();
+        assert_eq!(loaded.image.depth, Depth::Sixteen);
+        assert_eq!((loaded.image.width, loaded.image.height), (64, 64));
+
+        let red = |x: u32| {
+            let start = ((32 * loaded.image.width + x) * 4 * 2) as usize;
+            u16::from_ne_bytes([loaded.image.pixels[start], loaded.image.pixels[start + 1]])
+        };
+        let row: Vec<u16> = (0..64).map(red).collect();
+        assert!(row.windows(2).all(|pair| pair[1] >= pair[0]), "the ramp must climb: {row:?}");
+
+        let small_steps = row.windows(2).filter(|pair| pair[1] > pair[0] && pair[1] - pair[0] < 200).count();
+        assert!(small_steps > 0, "every step is 8-bit sized, so the depth was narrowed somewhere: {row:?}");
+    }
+
+    #[test]
+    fn a_twelve_bit_heic_keeps_more_than_eight_bits() {
+        let loaded = decode_here(&from_base64(HEIC_RAMP_12BIT)).unwrap();
+        assert_eq!(loaded.image.depth, Depth::Sixteen);
+
+        let red = |x: u32| {
+            let start = ((32 * loaded.image.width + x) * 4 * 2) as usize;
+            u16::from_ne_bytes([loaded.image.pixels[start], loaded.image.pixels[start + 1]])
+        };
+        let row: Vec<u16> = (0..64).map(red).collect();
+        let small_steps = row.windows(2).filter(|pair| pair[1] > pair[0] && pair[1] - pair[0] < 200).count();
+        assert!(small_steps > 0, "every step is 8-bit sized, so the depth was narrowed somewhere: {row:?}");
     }
 }

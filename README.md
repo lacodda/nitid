@@ -143,7 +143,9 @@ nothing else, so pausing restores the silence.
 HEIC — the format a modern phone photographs in — decodes in Rust like the
 rest, container and HEVC alike, and reaches the screen as fast as a JPEG: it
 carries a thumbnail as a second image inside its container, and nitid shows
-that first while the full picture decodes behind it.
+that first while the full picture decodes behind it. A 10- or 12-bit HEIC
+keeps its depth: the decoder hands over sixteen-bit samples and they reach the
+texture that wide.
 
 One limitation remains, and only for some files. A HEIC states its colour
 either as a set of standard code points or as an embedded ICC profile. With a
@@ -157,10 +159,14 @@ AVIF decodes through `rav1d` — dav1d translated to Rust by the ISRG — with t
 container read separately. It gets the full colour treatment: the file's
 primaries and transfer curve are read from the bitstream and applied on the GPU
 like every other tagged format, so a Display P3 AVIF is shown across the
-display's gamut rather than folded into sRGB. 10- and 12-bit AVIF are refused
-for now rather than shown narrowed to eight bits; they arrive with the wider
-buffer in v0.14.0, the stage after HDR. See
-[ADR 0008](docs/adr/0008-avif-decodes-with-rav1d.md).
+display's gamut rather than folded into sRGB. 10- and 12-bit AVIF decode at
+their own depth: the samples cross the whole pipeline — decoder, sandbox,
+texture — sixteen bits wide, never narrowed to eight. An HDR10 file (BT.2020
+with the PQ transfer) shows at a sensible brightness on both kinds of display:
+its reference white lands on SDR white, and on an HDR display the highlights
+above it drive the panel's headroom. See
+[ADR 0008](docs/adr/0008-avif-decodes-with-rav1d.md) and
+[ADR 0014](docs/adr/0014-pq-reference-white-lands-on-sdr-white.md).
 
 HEIC and AVIF decode in a **separate process** — not because they are unsafe
 any more, but because a process can be stopped and a thread cannot. Navigate
@@ -191,15 +197,15 @@ has no size limit to hide behind.
 
 ## Status
 
-Early development — v0.13.0 is out. Startup, colour and format coverage hold:
+Early development — v0.14.0 is out. Startup, colour and format coverage hold:
 every modern still format opens, a phone's photographs included, every one of
 them reaches the screen without a wait, and the ones that animate play. The
 process that decodes the heavy formats runs with no network in either
-direction. **HDR output works**, and follows the display's own state while the
-viewer is open. What HDR now waits on is the pixels rather than the screen:
-every decoder still hands over eight bits per channel, so the surface can
-carry more light than the files currently contain. Development runs in small
-versions, each one theme; the road to 1.0 is fixed:
+direction. **HDR output works end to end**: the surface follows the display's
+own state while the viewer is open, and 10- and 12-bit sources now cross the
+whole pipeline at their own depth — an HDR10 photograph opens bright, wide,
+and unnarrowed. Development runs in small versions, each one theme; the road
+to 1.0 is fixed:
 
 | Version | What lands |
 | --- | --- |
@@ -218,7 +224,7 @@ versions, each one theme; the road to 1.0 is fixed:
 | ✅ v0.11.0 | The network closed to the decoder, and a cheaper bridge |
 | ✅ v0.12.0 | Animation: GIF, APNG and animated WebP play |
 | ✅ v0.13.0 | HDR output on Windows, following the display as it changes |
-| v0.14.0 | A wider buffer: 10- and 12-bit sources through to the screen |
+| ✅ v0.14.0 | A wider buffer: 10- and 12-bit sources through to the screen |
 | v0.15.0 | Gigapixel images via tiled rendering |
 | v0.16.0 – v0.35.0 | The everyday viewer: single instance, toolbar, EXIF panel, clipboard, file operations, culling, comparison, settings |
 | v0.36.0 – v0.39.0 | Windows integration: context menu, installer, auto-update, thumbnails |

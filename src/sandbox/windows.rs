@@ -41,7 +41,7 @@ use windows::core::{PCWSTR, w};
 use super::protocol;
 use super::section::Section;
 use super::spawn::{AppContainer, SpawnedChild};
-use crate::image_source::{DecodedImage, Fidelity, LoadedImage, Orientation};
+use crate::image_source::{DecodedImage, Depth, Fidelity, LoadedImage, Orientation};
 
 /// The attribute marking a token's mandatory label group.
 ///
@@ -155,6 +155,7 @@ pub fn decode(bytes: &[u8], timeout: Duration) -> Result<LoadedImage> {
             protocol::RawImage {
                 width: shared.width,
                 height: shared.height,
+                depth: shared.depth,
                 pixels,
                 orientation: shared.orientation,
                 profile: shared.profile,
@@ -175,6 +176,8 @@ pub fn decode(bytes: &[u8], timeout: Duration) -> Result<LoadedImage> {
             width: image.width,
             height: image.height,
             pixels: image.pixels,
+            // The reader refused anything but these two values already.
+            depth: if image.depth == 16 { Depth::Sixteen } else { Depth::Eight },
         },
         fidelity: Fidelity::Full,
         // A vector document does not cross the boundary: the formats that

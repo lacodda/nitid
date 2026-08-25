@@ -17,7 +17,7 @@ use anyhow::{Context, Result, bail};
 use resvg::tiny_skia;
 use resvg::usvg::{self, fontdb};
 
-use crate::image_source::DecodedImage;
+use crate::image_source::{DecodedImage, Depth};
 
 /// The largest raster a vector image is allowed to produce, per side.
 ///
@@ -85,6 +85,7 @@ impl VectorImage {
         resvg::render(&self.tree, tiny_skia::Transform::from_scale(scale_x, scale_y), &mut pixmap.as_mut());
 
         Ok(DecodedImage {
+            depth: Depth::Eight,
             width,
             height,
             pixels: straight_alpha(&pixmap),

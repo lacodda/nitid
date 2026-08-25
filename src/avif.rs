@@ -27,7 +27,7 @@ use rav1d::include::dav1d::dav1d::{Dav1dContext, Dav1dSettings};
 use rav1d::include::dav1d::picture::Dav1dPicture;
 use rav1d::src::lib::{dav1d_close, dav1d_data_create, dav1d_default_settings, dav1d_get_picture, dav1d_open, dav1d_picture_unref, dav1d_send_data};
 
-use crate::image_source::{DecodedImage, Orientation};
+use crate::image_source::{DecodedImage, Depth, Orientation};
 use crate::isobmff::find_box;
 
 /// The decoder wants more input before it can produce a picture.
@@ -85,7 +85,7 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded> {
     let alpha = container.alpha_item.as_ref().and_then(|item| decode_av1(item).ok());
 
     let profile = profile_from(&frame);
-    let image = to_rgba8(&frame, alpha.as_ref(), container.premultiplied_alpha)?;
+    let image = to_rgba(&frame, alpha.as_ref(), container.premultiplied_alpha)?;
 
     Ok(Decoded {
         image,
@@ -104,11 +104,15 @@ struct Frame {
     height: u32,
     /// One entry per plane: Y, U, V. Monochrome frames carry only Y.
     planes: Vec<Vec<u8>>,
-    /// Row length of each plane in samples.
+    /// Row length of each plane in bytes — which is samples for an 8-bit
+    /// frame and twice that for a wider one.
     strides: Vec<usize>,
     /// How chroma is sampled relative to luma, as horizontal and vertical
     /// shifts: 4:2:0 is `(1, 1)`, 4:2:2 is `(1, 0)`, 4:4:4 is `(0, 0)`.
     chroma_shift: (u32, u32),
+    /// Bits per component: 8, 10 or 12. Wider samples sit in the planes as
+    /// native-endian `u16` pairs, which is how `rav1d` lays them out.
+    bpc: u8,
     /// What the bitstream says its colour means, straight from the sequence
     /// header — CICP code points, not yet interpreted.
     primaries: u8,
@@ -120,6 +124,28 @@ struct Frame {
 impl Frame {
     fn is_monochrome(&self) -> bool {
         self.planes.len() < 3
+    }
+
+    /// The largest code value a sample can hold.
+    fn max_code(&self) -> f32 {
+        ((1u32 << self.bpc) - 1) as f32
+    }
+
+    /// Read one sample of plane `index` in code units.
+    ///
+    /// The branch on width is taken per sample, but it predicts perfectly —
+    /// the depth never changes inside a frame — and the arithmetic around
+    /// each sample already dwarfs it. Measured against the old 8-bit-only
+    /// loop by the pixel-exact tests below, which still pass unchanged.
+    fn sample(&self, index: usize, x: usize, y: usize) -> f32 {
+        let plane = &self.planes[index];
+        let stride = self.strides[index];
+        if self.bpc == 8 {
+            f32::from(plane[y * stride + x])
+        } else {
+            let offset = y * stride + x * 2;
+            f32::from(u16::from_ne_bytes([plane[offset], plane[offset + 1]]))
+        }
     }
 }
 
@@ -188,12 +214,11 @@ unsafe fn copy_out(picture: &Dav1dPicture) -> Result<Frame> {
     // SAFETY: the header belongs to the picture, which is alive for this call.
     let sequence = unsafe { sequence.as_ref() };
 
-    if picture.p.bpc != 8 {
-        // 10- and 12-bit AVIF exist and are worth opening; they are not yet,
-        // because the renderer uploads RGBA8 and narrowing here would throw
-        // the depth away silently. Refused with a reason rather than shown
-        // wrong. HDR (v0.12.0) is where the wider buffer arrives.
-        bail!("a {}-bit AVIF is not one this build can show yet", picture.p.bpc);
+    if !matches!(picture.p.bpc, 8 | 10 | 12) {
+        // AV1 defines no other depths; a value here that is not one of the
+        // three is a decoder handing back something this code never taught
+        // itself to read, and guessing a layout would show garbage.
+        bail!("a {}-bit AVIF is not one this build can show", picture.p.bpc);
     }
 
     let layout = sequence.layout;
@@ -232,6 +257,7 @@ unsafe fn copy_out(picture: &Dav1dPicture) -> Result<Frame> {
         planes,
         strides,
         chroma_shift,
+        bpc: picture.p.bpc as u8,
         primaries: sequence.pri as u8,
         transfer: sequence.trc as u8,
         matrix: sequence.mtrx as u8,
@@ -340,56 +366,79 @@ fn describes_a_colour_space(primaries: u8, transfer: u8) -> bool {
     PRIMARIES.contains(&primaries) && TRANSFER.contains(&transfer)
 }
 
-/// Convert the decoded planes to the RGBA8 the renderer uploads.
-fn to_rgba8(frame: &Frame, alpha: Option<&Frame>, premultiplied: bool) -> Result<DecodedImage> {
+/// Convert the decoded planes to the RGBA the renderer uploads.
+///
+/// An 8-bit frame becomes RGBA8, exactly as it always has. A 10- or 12-bit
+/// frame becomes RGBA16, its code values scaled to the full 16-bit range —
+/// the depth the file paid for reaches the texture instead of being rounded
+/// off here.
+fn to_rgba(frame: &Frame, alpha: Option<&Frame>, premultiplied: bool) -> Result<DecodedImage> {
     let width = frame.width as usize;
     let height = frame.height as usize;
-    let expected = crate::image_source::pixel_count(frame.width, frame.height)?;
+    let depth = if frame.bpc == 8 { Depth::Eight } else { Depth::Sixteen };
+    let expected = crate::image_source::pixel_count(frame.width, frame.height, depth)?;
 
     let (kr, kb) = luma_coefficients(frame.matrix);
+    let max = frame.max_code();
     let mut pixels = vec![0u8; expected];
 
     for y in 0..height {
         for x in 0..width {
-            let luma = frame.planes[0][y * frame.strides[0] + x];
+            let luma = frame.sample(0, x, y);
 
             let (red, green, blue) = if frame.is_monochrome() {
                 // A monochrome AVIF has no chroma to combine: the luma sample
                 // is the colour, spread across the three channels.
-                let grey = expand_range(luma, frame.full_range);
+                let grey = expand_range(luma, frame.full_range, max);
                 (grey, grey, grey)
             } else {
                 let chroma_x = x >> frame.chroma_shift.0;
                 let chroma_y = y >> frame.chroma_shift.1;
-                let cb = frame.planes[1][chroma_y * frame.strides[1] + chroma_x];
-                let cr = frame.planes[2][chroma_y * frame.strides[2] + chroma_x];
-                ycbcr_to_rgb(luma, cb, cr, kr, kb, frame.full_range)
+                let cb = frame.sample(1, chroma_x, chroma_y);
+                let cr = frame.sample(2, chroma_x, chroma_y);
+                ycbcr_to_rgb(luma, cb, cr, kr, kb, frame.full_range, max)
             };
 
             let opacity = match alpha {
                 // The alpha image is a monochrome frame of the same size, so
-                // its luma plane is the coverage.
+                // its luma plane is the coverage. It may carry a different
+                // depth than the colour: its own code units are scaled onto
+                // the colour's.
                 Some(alpha) if !alpha.planes.is_empty() => {
                     let row = y.min(alpha.height.saturating_sub(1) as usize);
                     let column = x.min(alpha.width.saturating_sub(1) as usize);
-                    expand_range(alpha.planes[0][row * alpha.strides[0] + column], alpha.full_range)
+                    expand_range(alpha.sample(0, column, row), alpha.full_range, alpha.max_code()) * max / alpha.max_code()
                 }
-                _ => 0xFF,
+                _ => max,
             };
 
             let index = (y * width + x) * 4;
             // A premultiplied file stores colour already scaled by coverage;
             // the renderer blends as though it were not, so it is undone here.
-            let (red, green, blue) = if premultiplied && opacity != 0 {
-                (unpremultiply(red, opacity), unpremultiply(green, opacity), unpremultiply(blue, opacity))
+            let (red, green, blue) = if premultiplied && opacity != 0.0 {
+                (
+                    unpremultiply(red, opacity, max),
+                    unpremultiply(green, opacity, max),
+                    unpremultiply(blue, opacity, max),
+                )
             } else {
                 (red, green, blue)
             };
 
-            pixels[index] = red;
-            pixels[index + 1] = green;
-            pixels[index + 2] = blue;
-            pixels[index + 3] = opacity;
+            match depth {
+                Depth::Eight => {
+                    pixels[index] = code_to_u8(red, max);
+                    pixels[index + 1] = code_to_u8(green, max);
+                    pixels[index + 2] = code_to_u8(blue, max);
+                    pixels[index + 3] = code_to_u8(opacity, max);
+                }
+                Depth::Sixteen => {
+                    write_u16(&mut pixels, index, red, max);
+                    write_u16(&mut pixels, index + 1, green, max);
+                    write_u16(&mut pixels, index + 2, blue, max);
+                    write_u16(&mut pixels, index + 3, opacity, max);
+                }
+            }
         }
     }
 
@@ -397,7 +446,23 @@ fn to_rgba8(frame: &Frame, alpha: Option<&Frame>, premultiplied: bool) -> Result
         width: frame.width,
         height: frame.height,
         pixels,
+        depth,
     })
+}
+
+/// Clamp a code value and truncate it to a byte — the exact arithmetic the
+/// 8-bit path has always used, kept truncating so its pixels stay identical.
+fn code_to_u8(value: f32, max: f32) -> u8 {
+    value.clamp(0.0, max) as u8
+}
+
+/// Scale a code value to the full 16-bit range and store it native-endian.
+///
+/// `index` counts samples, not bytes: sample `i` of an RGBA16 image lives at
+/// bytes `2i..2i+2`.
+fn write_u16(pixels: &mut [u8], index: usize, value: f32, max: f32) {
+    let scaled = (value.clamp(0.0, max) / max * 65535.0 + 0.5) as u16;
+    pixels[index * 2..index * 2 + 2].copy_from_slice(&scaled.to_ne_bytes());
 }
 
 /// The luma weights for a set of matrix coefficients, as CICP numbers them.
@@ -415,16 +480,23 @@ fn luma_coefficients(matrix: u8) -> (f32, f32) {
     }
 }
 
-/// Convert one YCbCr sample to RGB.
-fn ycbcr_to_rgb(luma: u8, cb: u8, cr: u8, kr: f32, kb: f32, full_range: bool) -> (u8, u8, u8) {
+/// Convert one YCbCr sample to RGB, all in code units of `max`.
+///
+/// The limited-range offsets scale with the depth: 8-bit limited luma sits in
+/// 16..235, 10-bit in 64..940 — the same fractions of the code range, which
+/// is what `scale` restores.
+fn ycbcr_to_rgb(luma: f32, cb: f32, cr: f32, kr: f32, kb: f32, full_range: bool, max: f32) -> (f32, f32, f32) {
+    let scale = (max + 1.0) / 256.0;
+    let half = (max + 1.0) / 2.0;
     let (y, cb, cr) = if full_range {
-        (luma as f32, cb as f32 - 128.0, cr as f32 - 128.0)
+        (luma, cb - half, cr - half)
     } else {
-        // Limited range packs luma into 16..235 and chroma into 16..240.
+        // Limited range packs luma into 16..235 and chroma into 16..240,
+        // times the depth's scale.
         (
-            ((luma as f32 - 16.0) * 255.0 / 219.0),
-            (cb as f32 - 128.0) * 255.0 / 224.0,
-            (cr as f32 - 128.0) * 255.0 / 224.0,
+            (luma - 16.0 * scale) * max / (219.0 * scale),
+            (cb - 128.0 * scale) * max / (224.0 * scale),
+            (cr - 128.0 * scale) * max / (224.0 * scale),
         )
     };
 
@@ -433,21 +505,22 @@ fn ycbcr_to_rgb(luma: u8, cb: u8, cr: u8, kr: f32, kb: f32, full_range: bool) ->
     let blue = y + 2.0 * (1.0 - kb) * cb;
     let green = y - (2.0 * (1.0 - kr) * kr / kg) * cr - (2.0 * (1.0 - kb) * kb / kg) * cb;
 
-    (clamp(red), clamp(green), clamp(blue))
+    (red, green, blue)
 }
 
-/// Stretch a limited-range sample to the full 0..255 the renderer expects.
-fn expand_range(sample: u8, full_range: bool) -> u8 {
-    if full_range { sample } else { clamp((sample as f32 - 16.0) * 255.0 / 219.0) }
+/// Stretch a limited-range sample to the full code range, in code units.
+fn expand_range(sample: f32, full_range: bool, max: f32) -> f32 {
+    if full_range {
+        sample
+    } else {
+        let scale = (max + 1.0) / 256.0;
+        (sample - 16.0 * scale) * max / (219.0 * scale)
+    }
 }
 
-/// Undo premultiplication for one channel.
-fn unpremultiply(channel: u8, opacity: u8) -> u8 {
-    clamp(channel as f32 * 255.0 / opacity as f32)
-}
-
-fn clamp(value: f32) -> u8 {
-    value.clamp(0.0, 255.0) as u8
+/// Undo premultiplication for one channel, in code units.
+fn unpremultiply(channel: f32, opacity: f32, max: f32) -> f32 {
+    channel * max / opacity
 }
 
 /// A decoder context closed when it goes out of scope.
@@ -502,6 +575,40 @@ mod tests {
         "AAwAAAAAE2NvbHJuY2x4AAEADQAGgAAAAA5waXhpAAAAAAEIAAAADGF2MUOBABwAAAAAOGF1eEMAAAAAdXJuOm1wZWc6bXBl",
         "Z0I6Y2ljcDpzeXN0ZW1zOmF1eGlsaWFyeTphbHBoYQAAAAAeaXBtYQAAAAAAAAACAAEEAQKDBAACBAEFhgcAAABJbWRhdBIA",
         "CgUYDP/YVDIHEMAAAQAUgBIACgkYDP/aICGg0IAyIBEBqkAAeQAA0MUMvBjYhDjey1YmR1gY+xRzXtDBiH0c",
+    );
+
+    /// A 64x64 10-bit AVIF holding a neutral grey ramp that climbs about a
+    /// hundred sixteen-bit units per column — a slope an 8-bit pipeline
+    /// cannot express. Lossless, written by ffmpeg with libaom.
+    const AVIF_RAMP_10BIT: &str = concat!(
+        "AAAAIGZ0eXBhdmlmAAAAAGF2aWZtaWYxbWlhZk1BMUIAAAD5bWV0YQAAAAAAAAAvaGRscgAAAAAAAAAAcGljdAAAAAAAAAAA",
+        "AAAAAFBpY3R1cmVIYW5kbGVyAAAAAA5waXRtAAAAAAABAAAAHmlsb2MAAAAARAAAAQABAAAAAQAAASEAAABMAAAAKGlpbmYA",
+        "AAAAAAEAAAAaaW5mZQIAAAAAAQAAYXYwMUNvbG9yAAAAAGppcHJwAAAAS2lwY28AAAAUaXNwZQAAAAAAAABAAAAAQAAAABBw",
+        "aXhpAAAAAAMKCgoAAAAMYXYxQ4EATAAAAAATY29scm5jbHgAAgACAAIAAAAAF2lwbWEAAAAAAAAAAQABBAECgwQAAABUbWRh",
+        "dAoKAAAAAq//m18oCDI+EACAALtImGIjAZA4uhkqNu83L5WyFVsQvoeDpg1VL2XJDy//xJfyMC/6UGSCpIO1KRJd1FO1uo2L",
+        "0PmIyqA=",
+    );
+
+    /// The same ramp at 12 bits.
+    const AVIF_RAMP_12BIT: &str = concat!(
+        "AAAAHGZ0eXBhdmlmAAAAAGF2aWZtaWYxbWlhZgAAAPltZXRhAAAAAAAAAC9oZGxyAAAAAAAAAABwaWN0AAAAAAAAAAAAAAAA",
+        "UGljdHVyZUhhbmRsZXIAAAAADnBpdG0AAAAAAAEAAAAeaWxvYwAAAABEAAABAAEAAAABAAABHQAAAG8AAAAoaWluZgAAAAAA",
+        "AQAAABppbmZlAgAAAAABAABhdjAxQ29sb3IAAAAAamlwcnAAAABLaXBjbwAAABRpc3BlAAAAAAAAAEAAAABAAAAAEHBpeGkA",
+        "AAAAAwwMDAAAAAxhdjFDgUBsAAAAABNjb2xybmNseAACAAIAAgAAAAAXaXBtYQAAAAAAAAABAAEEAQKDBAAAAHdtZGF0CgpA",
+        "AAACr/+bXyxhMmEQAIAAu0iglLnHfUlVZU7QbsMgmxsCVJAr6tAEi6VahPZekYHQ+7F8WMnD5nUrJLFZBq8Ij//hF0O2th1c",
+        "lyjBXm+e5GuSlwBBo8Wh2H/VrYC9ubVkRJMTdwnuMPHO4Cd4",
+    );
+
+    /// The grey ramp again, 10-bit, tagged as HDR10: BT.2020 primaries with
+    /// the PQ transfer, stated in the AV1 sequence header the way a real HDR
+    /// photograph states it.
+    const AVIF_RAMP_PQ: &str = concat!(
+        "AAAAIGZ0eXBhdmlmAAAAAGF2aWZtaWYxbWlhZk1BMUIAAAD5bWV0YQAAAAAAAAAvaGRscgAAAAAAAAAAcGljdAAAAAAAAAAA",
+        "AAAAAFBpY3R1cmVIYW5kbGVyAAAAAA5waXRtAAAAAAABAAAAHmlsb2MAAAAARAAAAQABAAAAAQAAASEAAABPAAAAKGlpbmYA",
+        "AAAAAAEAAAAaaW5mZQIAAAAAAQAAYXYwMUNvbG9yAAAAAGppcHJwAAAAS2lwY28AAAAUaXNwZQAAAAAAAABAAAAAQAAAABBw",
+        "aXhpAAAAAAMKCgoAAAAMYXYxQ4EATAAAAAATY29scm5jbHgACQAQAAkAAAAAF2lwbWEAAAAAAAAAAQABBAECgwQAAABXbWRh",
+        "dAoNAAAAAq//m18qEiASCDI+EACAALtImGIjAZA4uhkqNu83L5WyFVsQvoeDpg1VMAks5y3/+LZM0RX3sB+DgCm39c/Li0fB",
+        "etMbmlpqvEk=",
     );
 
     fn from_base64(text: &str) -> Vec<u8> {
@@ -744,6 +851,7 @@ mod tests {
             planes: vec![vec![0]],
             strides: vec![1],
             chroma_shift: (0, 0),
+            bpc: 8,
             primaries: 2,
             transfer: 2,
             matrix: 2,
@@ -809,13 +917,122 @@ mod tests {
     fn neutral_grey_survives_the_conversion() {
         let (kr, kb) = luma_coefficients(1);
 
-        let (r, g, b) = ycbcr_to_rgb(128, 128, 128, kr, kb, true);
-        assert_eq!((r, g, b), (128, 128, 128));
+        let (r, g, b) = ycbcr_to_rgb(128.0, 128.0, 128.0, kr, kb, true, 255.0);
+        assert_eq!((code_to_u8(r, 255.0), code_to_u8(g, 255.0), code_to_u8(b, 255.0)), (128, 128, 128));
 
         // Limited range: 126 is mid-grey once 16..235 is stretched out.
-        let (r, g, b) = ycbcr_to_rgb(126, 128, 128, kr, kb, false);
+        let (r, g, b) = ycbcr_to_rgb(126.0, 128.0, 128.0, kr, kb, false, 255.0);
         for channel in [r, g, b] {
-            assert!(channel.abs_diff(128) <= 2, "limited-range grey came out as {r},{g},{b}");
+            assert!((channel - 128.0).abs() <= 2.0, "limited-range grey came out as {r},{g},{b}");
         }
+    }
+
+    /// The same neutral grey in 10-bit code units: mid-grey full range is
+    /// 512, and the limited-range midpoint scales with the depth. A mistake
+    /// in the depth scaling shows as a cast on every wide image.
+    #[test]
+    fn neutral_grey_survives_the_conversion_at_ten_bits() {
+        let (kr, kb) = luma_coefficients(1);
+
+        let (r, g, b) = ycbcr_to_rgb(512.0, 512.0, 512.0, kr, kb, true, 1023.0);
+        for channel in [r, g, b] {
+            assert!((channel - 512.0).abs() < 0.5, "full-range 10-bit grey came out as {r},{g},{b}");
+        }
+
+        // Limited range at 10 bits: luma sits in 64..940, so its midpoint
+        // 502 stretches back to the middle of the code range.
+        let (r, g, b) = ycbcr_to_rgb(502.0, 512.0, 512.0, kr, kb, false, 1023.0);
+        for channel in [r, g, b] {
+            assert!((channel - 511.5).abs() <= 8.0, "limited-range 10-bit grey came out as {r},{g},{b}");
+        }
+    }
+
+    /// The 16-bit writer scales code units to the full range: the top code
+    /// must land on 65535 exactly, or every wide image is slightly dark —
+    /// the same off-by-one this project caught `image-webp` committing.
+    #[test]
+    fn wide_samples_scale_to_the_full_sixteen_bit_range() {
+        let mut pixels = vec![0u8; 8];
+        write_u16(&mut pixels, 0, 1023.0, 1023.0);
+        write_u16(&mut pixels, 1, 0.0, 1023.0);
+        write_u16(&mut pixels, 2, 511.5, 1023.0);
+
+        let read = |index: usize| u16::from_ne_bytes([pixels[index * 2], pixels[index * 2 + 1]]);
+        assert_eq!(read(0), 65535, "the top code must reach full white");
+        assert_eq!(read(1), 0);
+        assert!((i32::from(read(2)) - 32768).abs() <= 32, "mid-grey landed at {}", read(2));
+    }
+
+    /// Read one 16-bit sample of the red channel.
+    fn red_at_16(image: &DecodedImage, x: u32, y: u32) -> u16 {
+        let start = ((y * image.width + x) * 4 * 2) as usize;
+        u16::from_ne_bytes([image.pixels[start], image.pixels[start + 1]])
+    }
+
+    /// The depth must be real, not just declared: the fixture's ramp climbs
+    /// about a hundred sixteen-bit units per column, and an 8-bit pipeline
+    /// cannot take a step that small — its quantum after scaling is 257, so
+    /// neighbouring columns either collapse together or jump by at least
+    /// that. Finding a small non-zero step proves the extra bits survived
+    /// the whole path: decoder, YCbCr conversion, and the 16-bit writer.
+    #[test]
+    fn a_ten_bit_avif_keeps_more_than_eight_bits() {
+        let decoded = decode(&from_base64(AVIF_RAMP_10BIT)).unwrap();
+        assert_eq!(decoded.image.depth, Depth::Sixteen);
+        assert_eq!((decoded.image.width, decoded.image.height), (64, 64));
+        assert_eq!(decoded.image.pixels.len(), 64 * 64 * 4 * 2);
+
+        let row: Vec<u16> = (0..64).map(|x| red_at_16(&decoded.image, x, 32)).collect();
+        assert!(row.windows(2).all(|pair| pair[1] >= pair[0]), "the ramp must climb: {row:?}");
+
+        let small_steps = row.windows(2).filter(|pair| pair[1] > pair[0] && pair[1] - pair[0] < 200).count();
+        assert!(small_steps > 0, "every step is 8-bit sized, so the depth was narrowed somewhere: {row:?}");
+    }
+
+    #[test]
+    fn a_twelve_bit_avif_keeps_more_than_eight_bits() {
+        let decoded = decode(&from_base64(AVIF_RAMP_12BIT)).unwrap();
+        assert_eq!(decoded.image.depth, Depth::Sixteen);
+
+        let row: Vec<u16> = (0..64).map(|x| red_at_16(&decoded.image, x, 32)).collect();
+        let small_steps = row.windows(2).filter(|pair| pair[1] > pair[0] && pair[1] - pair[0] < 200).count();
+        assert!(small_steps > 0, "every step is 8-bit sized, so the depth was narrowed somewhere: {row:?}");
+    }
+
+    /// A grey ramp must come out grey at sixteen bits too: a mistake in the
+    /// wide chroma arithmetic shows as a colour cast the narrow tests cannot
+    /// see.
+    #[test]
+    fn a_wide_grey_stays_grey() {
+        let decoded = decode(&from_base64(AVIF_RAMP_10BIT)).unwrap();
+        for x in [0, 21, 42, 63] {
+            let start = ((32 * decoded.image.width + x) * 4 * 2) as usize;
+            let sample = |offset: usize| u16::from_ne_bytes([decoded.image.pixels[start + offset * 2], decoded.image.pixels[start + offset * 2 + 1]]);
+            let (r, g, b) = (sample(0), sample(1), sample(2));
+            let spread = r.max(g).max(b) - r.min(g).min(b);
+            assert!(spread < 700, "column {x} came out tinted: r={r} g={g} b={b}");
+        }
+    }
+
+    /// An HDR10 AVIF carries its colour out of the bitstream: the PQ curve
+    /// and the BT.2020 primaries become a profile, and the transform built
+    /// from it lifts PQ's absolute light onto the pipeline's white — the
+    /// scale ADR 0014 sets. Without the profile the image would pass through
+    /// untagged; without the scale it would show nearly black.
+    #[test]
+    fn an_hdr10_avif_comes_out_bright_rather_than_black() {
+        let decoded = decode(&from_base64(AVIF_RAMP_PQ)).unwrap();
+        assert_eq!(decoded.image.depth, Depth::Sixteen);
+
+        let profile = decoded.profile.expect("an HDR10 file states its colour");
+        let cicp = profile.cicp.expect("the profile should remember its CICP");
+        assert_eq!(cicp.transfer_characteristics as u8, 16, "the PQ transfer must survive");
+
+        let transform = crate::color::ColorTransform::new(&profile, &moxcms::ColorProfile::new_srgb());
+        // The matrix carries the reference-white scale: a grey at PQ's
+        // 203-nit code must come out near 1.0, which needs weights far above
+        // the unscaled sum of ~1.0 that would leave the picture at 2%.
+        let sum: f32 = transform.matrix[1].iter().sum();
+        assert!(sum > 20.0, "the PQ scale is missing from the matrix: row sums to {sum}");
     }
 }

@@ -41,7 +41,9 @@ const MAGIC: [u8; 4] = *b"NTDS";
 /// Version 3 added the shared memory section: a request names the handle the
 /// decoder may write pixels into, and a reply may point at it instead of
 /// carrying the pixels inline.
-const VERSION: u16 = 3;
+/// Version 4 added the sample depth to an image reply: a 10- or 12-bit
+/// source crosses as sixteen bits per sample rather than being narrowed.
+const VERSION: u16 = 4;
 
 /// The largest file the decoder will be handed, and the largest reply it may
 /// send back.
@@ -55,7 +57,11 @@ pub const MAX_PAYLOAD: usize = 512 * 1024 * 1024;
 pub struct RawImage {
     pub width: u32,
     pub height: u32,
-    /// `width * height * 4` bytes of RGBA8.
+    /// Bits per sample: 8 or 16. Sixteen-bit samples sit in `pixels` as
+    /// native-endian pairs — both ends are the same executable on the same
+    /// machine, so no byte order crosses anything.
+    pub depth: u8,
+    /// `width * height * 4` samples of RGBA, each `depth` bits wide.
     pub pixels: Vec<u8>,
     /// The orientation to apply, as EXIF numbers it (1 through 8).
     ///
@@ -83,9 +89,11 @@ pub enum Reply {
 pub struct SharedImage {
     pub width: u32,
     pub height: u32,
+    /// Bits per sample: 8 or 16, as in [`RawImage`].
+    pub depth: u8,
     pub orientation: u8,
     pub profile: Vec<u8>,
-    /// How many bytes of RGBA8 the decoder wrote at the start of the section.
+    /// How many bytes of RGBA the decoder wrote at the start of the section.
     pub pixel_bytes: usize,
 }
 
@@ -145,7 +153,7 @@ pub fn write_image(mut to: impl Write, image: &RawImage) -> Result<()> {
     to.write_all(&[TAG_IMAGE])?;
     to.write_all(&image.width.to_le_bytes())?;
     to.write_all(&image.height.to_le_bytes())?;
-    to.write_all(&[image.orientation])?;
+    to.write_all(&[image.orientation, image.depth])?;
     to.write_all(&(image.profile.len() as u64).to_le_bytes())?;
     to.write_all(&image.profile)?;
     to.write_all(&(image.pixels.len() as u64).to_le_bytes())?;
@@ -168,7 +176,7 @@ pub fn write_shared_image(mut to: impl Write, image: &RawImage) -> Result<()> {
     to.write_all(&[TAG_SHARED_IMAGE])?;
     to.write_all(&image.width.to_le_bytes())?;
     to.write_all(&image.height.to_le_bytes())?;
-    to.write_all(&[image.orientation])?;
+    to.write_all(&[image.orientation, image.depth])?;
     to.write_all(&(image.profile.len() as u64).to_le_bytes())?;
     to.write_all(&image.profile)?;
     to.write_all(&(image.pixels.len() as u64).to_le_bytes())?;
@@ -213,11 +221,16 @@ pub fn read_reply(mut from: impl Read) -> Result<Result<Reply, String>> {
             let width = read_u32(&mut from)?;
             let height = read_u32(&mut from)?;
 
-            let mut orientation = [0u8; 1];
+            let mut orientation = [0u8; 2];
             from.read_exact(&mut orientation)?;
             // Out-of-range values appear in real files; upright is the safe
             // reading, and the same one `Orientation::from_exif` takes.
-            let orientation = orientation[0];
+            let (orientation, depth) = (orientation[0], orientation[1]);
+            // The depth sizes the pixel check below, so a value this code
+            // does not know is refused before it can size anything.
+            if !matches!(depth, 8 | 16) {
+                bail!("the decoder claims {depth} bits per sample, which this build does not speak");
+            }
 
             let profile_length = read_u64(&mut from)? as usize;
             if profile_length > MAX_PROFILE {
@@ -230,7 +243,7 @@ pub fn read_reply(mut from: impl Read) -> Result<Result<Reply, String>> {
 
             let expected = (width as usize)
                 .checked_mul(height as usize)
-                .and_then(|pixels| pixels.checked_mul(4))
+                .and_then(|pixels| pixels.checked_mul(4 * (depth as usize / 8)))
                 .unwrap_or(usize::MAX);
             if length != expected {
                 bail!("the decoder returned {length} bytes for a {width}x{height} image, which needs {expected}");
@@ -243,6 +256,7 @@ pub fn read_reply(mut from: impl Read) -> Result<Result<Reply, String>> {
                 return Ok(Ok(Reply::Shared(SharedImage {
                     width,
                     height,
+                    depth,
                     orientation,
                     profile,
                     pixel_bytes: length,
@@ -254,6 +268,7 @@ pub fn read_reply(mut from: impl Read) -> Result<Result<Reply, String>> {
             Ok(Ok(Reply::Inline(RawImage {
                 width,
                 height,
+                depth,
                 pixels,
                 orientation,
                 profile,
@@ -335,6 +350,7 @@ mod tests {
     #[test]
     fn an_image_survives_the_round_trip() {
         let image = RawImage {
+            depth: 8,
             width: 2,
             height: 1,
             pixels: vec![1, 2, 3, 4, 5, 6, 7, 8],
@@ -357,6 +373,7 @@ mod tests {
     #[test]
     fn a_shared_image_carries_its_metadata_and_no_pixels() {
         let image = RawImage {
+            depth: 8,
             width: 2,
             height: 2,
             pixels: vec![9; 16],
@@ -411,6 +428,7 @@ mod tests {
     fn the_orientation_and_profile_cross_with_the_pixels() {
         let profile = moxcms::ColorProfile::new_srgb().encode().expect("encoding a profile");
         let image = RawImage {
+            depth: 8,
             width: 2,
             height: 2,
             pixels: vec![7; 16],
@@ -435,6 +453,7 @@ mod tests {
     #[test]
     fn an_untagged_image_crosses_without_a_profile() {
         let image = RawImage {
+            depth: 8,
             width: 1,
             height: 1,
             pixels: vec![0; 4],
@@ -473,6 +492,7 @@ mod tests {
     #[test]
     fn writing_an_oversized_profile_is_refused() {
         let image = RawImage {
+            depth: 8,
             width: 1,
             height: 1,
             pixels: vec![0; 4],
@@ -546,6 +566,7 @@ mod tests {
     #[test]
     fn a_truncated_reply_is_an_error_rather_than_a_hang_or_a_panic() {
         let image = RawImage {
+            depth: 8,
             width: 4,
             height: 4,
             pixels: vec![0; 64],
@@ -558,5 +579,61 @@ mod tests {
         for cut in 0..wire.len() {
             assert!(read_reply(&wire[..cut]).is_err(), "a reply cut at {cut} bytes was accepted");
         }
+    }
+
+    /// The depth sizes the pixel check, so it is validated before use: a
+    /// decoder claiming a width this code does not speak is refused, not
+    /// interpreted.
+    #[test]
+    fn a_depth_this_build_does_not_speak_is_refused() {
+        let image = RawImage {
+            depth: 12,
+            width: 2,
+            height: 2,
+            pixels: vec![0; 2 * 2 * 4],
+            orientation: 1,
+            profile: Vec::new(),
+        };
+        let mut wire = Vec::new();
+        write_image(&mut wire, &image).unwrap();
+
+        let Err(error) = read_reply(&mut wire.as_slice()) else {
+            panic!("a 12-bit claim was believed");
+        };
+        assert!(error.to_string().contains("12 bits"), "the refusal must name the depth: {error:#}");
+    }
+
+    /// A sixteen-bit image needs twice the bytes, and the length check must
+    /// know that — a doubled buffer refused, or a narrow one accepted, would
+    /// each let a lying decoder size an allocation.
+    #[test]
+    fn the_pixel_length_check_follows_the_depth() {
+        let image = RawImage {
+            depth: 16,
+            width: 2,
+            height: 2,
+            pixels: vec![0; 2 * 2 * 4 * 2],
+            orientation: 1,
+            profile: Vec::new(),
+        };
+        let mut wire = Vec::new();
+        write_image(&mut wire, &image).unwrap();
+        assert!(matches!(read_reply(&mut wire.as_slice()), Ok(Ok(Reply::Inline(inner))) if inner.depth == 16));
+
+        // The same claim with an 8-bit-sized buffer must be refused.
+        let lying = RawImage {
+            pixels: vec![0; 2 * 2 * 4],
+            ..RawImage {
+                depth: 16,
+                width: 2,
+                height: 2,
+                pixels: Vec::new(),
+                orientation: 1,
+                profile: Vec::new(),
+            }
+        };
+        let mut wire = Vec::new();
+        write_image(&mut wire, &lying).unwrap();
+        assert!(read_reply(&mut wire.as_slice()).is_err(), "a 16-bit claim over 8-bit-sized pixels was believed");
     }
 }

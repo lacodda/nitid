@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::format::Format;
-use crate::image_source::DecodedImage;
+use crate::image_source::{DecodedImage, Depth};
 
 /// The most decoded frame data an animation may hold, across all its frames.
 ///
@@ -103,7 +103,12 @@ fn collect(frames: image::Frames) -> Option<Vec<Frame>> {
         }
 
         out.push(Frame {
-            image: DecodedImage { width, height, pixels },
+            image: DecodedImage {
+                width,
+                height,
+                pixels,
+                depth: Depth::Eight,
+            },
             delay,
         });
     }
@@ -141,7 +146,7 @@ fn webp_frames(bytes: &[u8]) -> Option<Vec<Frame>> {
 
     let (width, height) = decoder.dimensions();
     let frame_bytes = decoder.output_buffer_size()?;
-    let rgba_bytes = crate::image_source::pixel_count(width, height).ok()?;
+    let rgba_bytes = crate::image_source::pixel_count(width, height, Depth::Eight).ok()?;
     let opaque = !decoder.has_alpha();
 
     let mut out = Vec::new();
@@ -166,7 +171,12 @@ fn webp_frames(bytes: &[u8]) -> Option<Vec<Frame>> {
         }
 
         out.push(Frame {
-            image: DecodedImage { width, height, pixels },
+            image: DecodedImage {
+                width,
+                height,
+                pixels,
+                depth: Depth::Eight,
+            },
             delay: normalise_delay(Duration::from_millis(u64::from(milliseconds))),
         });
     }
@@ -269,6 +279,7 @@ mod tests {
                         width: 1,
                         height: 1,
                         pixels: vec![0; 4],
+                        depth: Depth::Eight,
                     },
                     delay: Duration::from_millis(*ms),
                 })

@@ -227,6 +227,10 @@ pub fn run_as_decoder() -> Result<()> {
             let image = protocol::RawImage {
                 width: loaded.image.width,
                 height: loaded.image.height,
+                depth: match loaded.image.depth {
+                    crate::image_source::Depth::Eight => 8,
+                    crate::image_source::Depth::Sixteen => 16,
+                },
                 pixels: loaded.image.pixels,
                 orientation: loaded.orientation.to_exif(),
                 // A profile that will not re-encode is sent as none rather

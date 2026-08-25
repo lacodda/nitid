@@ -64,6 +64,61 @@ fn with_environment<T>(variables: &[(&str, &str)], body: impl FnOnce() -> T) -> 
     outcome
 }
 
+/// A 64x64 10-bit HEIC holding a shallow grey ramp — about a hundred
+/// sixteen-bit units per column, a slope 8 bits cannot express. Lossless,
+/// written by pillow-heif over libheif. The same fixture the unit tests use;
+/// here it crosses the process boundary.
+const HEIC_RAMP_10BIT: &str = concat!(
+    "AAAAHGZ0eXBoZWl4AAAAAG1pZjFoZWl4bWlhZgAAAVJtZXRhAAAAAAAAACFoZGxyAAAAAAAAAABwaWN0AAAAAAAAAAAAAAAA",
+    "AAAAACJpbG9jAAAAAERAAAEAAQAAAAABdgABAAAAAAAAAM4AAAAjaWluZgAAAAAAAQAAABVpbmZlAgAAAAABAABodmMxAAAA",
+    "AA5waXRtAAAAAAABAAAA0mlwcnAAAACzaXBjbwAAAHRodmNDAQQIAAAAAAAAAAAA//AA/P36+gAADwNgAAEAF0ABDAH//wQI",
+    "AAADAJ24AAADAAD/ugJAYQABAClCAQEECAAAAwCduAAAAwAA/6AggQTZbqSSmubgIaDAgAAADIAAAAMAhGIAAQAGRAHBcYkS",
+    "AAAAE2NvbHJuY2x4AAEADQAGgAAAABRpc3BlAAAAAAAAAEAAAABAAAAAEHBpeGkAAAAAAwoKCgAAABdpcG1hAAAAAAAAAAEA",
+    "AQSBAgMEAAAA1m1kYXQAAADKKAGvBbgVevUg///6H/Q/z/5j4T4X4f4j4X4b4j4n4X4b4j4kAxwCm5k3ueNHjvlv8I/QAZeP",
+    "z9X9AAADAJR1Bs5JsmHjLFhwQoAAD+woCeDK92AARx87ZCrCKzhs5cwAEDRlg3jzwAAWy6X7uYnO1YMksTfho0AARaWExemv",
+    "DAADXQzjgqmAp74rrYAIYvom2YugABauUtFLQlptDj3wADPG1uq2JYCABCJLnLPD7RF1y+wANwn+ES8GAADhb1YvxT4pdck/",
+    "N15LwA==",
+);
+
+fn from_base64(text: &str) -> Vec<u8> {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    let mut out = Vec::new();
+    let mut accumulator: u32 = 0;
+    let mut bits = 0;
+    for byte in text.bytes().filter(|byte| *byte != b'=') {
+        let value = ALPHABET.iter().position(|candidate| *candidate == byte).expect("a base64 character") as u32;
+        accumulator = (accumulator << 6) | value;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((accumulator >> bits) as u8);
+        }
+    }
+    out
+}
+
+/// Sixteen-bit pixels survive the crossing: the protocol carries the depth,
+/// the section is sized for the doubled bytes, and what arrives is the ramp
+/// the file holds — including the small steps 8 bits cannot take. This is
+/// the protocol's version 4 exercised for real, not just parsed.
+#[test]
+fn a_wide_image_crosses_at_its_own_depth() {
+    let decoded = with_decoder(|| nitid::testing::decode_sandboxed(&from_base64(HEIC_RAMP_10BIT))).expect("the sandboxed wide decode should succeed");
+
+    assert_eq!(decoded.image.depth, nitid::testing::Depth::Sixteen);
+    assert_eq!((decoded.image.width, decoded.image.height), (64, 64));
+    assert_eq!(decoded.image.pixels.len(), 64 * 64 * 4 * 2, "sixteen-bit pixels are two bytes each");
+
+    let red = |x: u32| {
+        let start = ((32 * decoded.image.width + x) * 4 * 2) as usize;
+        u16::from_ne_bytes([decoded.image.pixels[start], decoded.image.pixels[start + 1]])
+    };
+    let row: Vec<u16> = (0..64).map(red).collect();
+    let small_steps = row.windows(2).filter(|pair| pair[1] > pair[0] && pair[1] - pair[0] < 200).count();
+    assert!(small_steps > 0, "the depth was narrowed on its way across: {row:?}");
+}
+
 /// A PNG, encoded here so the test ships no binary fixture.
 fn png(width: u32, height: u32) -> Vec<u8> {
     let buffer = image::RgbaImage::from_pixel(width, height, image::Rgba([10, 200, 90, 255]));
