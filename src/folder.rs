@@ -64,6 +64,10 @@ impl Folder {
     /// double-clicked it expects to be looking at it.
     ///
     /// `None` when nothing worth showing arrived.
+    ///
+    /// Windows-only, like the hand-over that is its only caller: elsewhere
+    /// this would be a method nobody calls, which the build denies.
+    #[cfg(windows)]
     pub fn extend(&mut self, paths: &[PathBuf]) -> Option<&Path> {
         let arriving: Vec<PathBuf> = paths
             .iter()
