@@ -14,6 +14,7 @@ use wgpu::util::DeviceExt;
 use crate::color::{CURVE_SAMPLES, ColorTransform};
 use crate::hdr::{self, Output};
 use crate::image_source::{DecodedImage, Depth, Orientation};
+use crate::tiles::{self, Grid, Span, Tile};
 use crate::view::View;
 
 /// The colour behind the image. It matches the shader's compositing background
@@ -28,17 +29,23 @@ const BACKGROUND: wgpu::Color = wgpu::Color {
 /// Placement uniforms, laid out to match `Placement` in `shader.wgsl`.
 ///
 /// WGSL aligns a `mat2x2<f32>` to 8 bytes and each of its columns to 8, so the
-/// two `vec2` fields ahead of it need no padding. The struct is 32 bytes.
+/// two `vec2` fields ahead of it need no padding, and the two after it are
+/// aligned already. The struct is 48 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct Placement {
     half_size: [f32; 2],
     centre: [f32; 2],
     orientation: [[f32; 2]; 2],
+    uv_scale: [f32; 2],
+    uv_offset: [f32; 2],
 }
 
 impl Placement {
     /// Fold zoom, pan, and EXIF orientation into what the vertex stage needs.
+    ///
+    /// This is the whole image in one texture: the quad covers it and samples
+    /// all of it.
     fn new(view: &View, window: (u32, u32), orientation: Orientation) -> Self {
         let window_width = window.0.max(1) as f32;
         let window_height = window.1.max(1) as f32;
@@ -51,12 +58,79 @@ impl Placement {
             // Clip space is y-up; a positive pixel offset moves down the screen.
             centre: [2.0 * offset_x / window_width, -2.0 * offset_y / window_height],
             orientation: orientation_matrix(orientation),
+            uv_scale: [1.0, 1.0],
+            uv_offset: [0.0, 0.0],
         }
+    }
+
+    /// Narrow a whole-image placement down to one tile of it.
+    ///
+    /// `span` is the part of the image this tile draws and `inner` the part of
+    /// its texture that holds those pixels, both as fractions — see
+    /// `tiles.rs`. The tile's quad is the image's quad scaled to `span`, which
+    /// keeps zoom and pan in one place: they shape the image rectangle, and
+    /// each tile is a fixed fraction of whatever that rectangle became.
+    ///
+    /// `span` is in the image's own coordinates, and `half_size`/`centre` are
+    /// already the screen's, so the orientation has to be applied to the span
+    /// to bring the two into the same frame. A rotated image otherwise draws
+    /// each tile correctly and puts it in the wrong place — measured at
+    /// 224/255 away from the same picture drawn whole.
+    fn for_tile(mut self, orientation: Orientation, span: Span, inner: Span) -> Self {
+        let (span_width, span_height) = span.size();
+        let (centre_x, centre_y) = span.centre();
+
+        // Offset from the image's centre, in image coordinates and in the
+        // -1..1 units the quad's half-size is stated in.
+        let from_centre = [2.0 * centre_x - 1.0, 2.0 * centre_y - 1.0];
+        let (on_screen, screen_width, screen_height) = to_screen(orientation, from_centre, span_width, span_height);
+
+        // The image rectangle runs -half_size..half_size around `centre`, so
+        // the tile's centre is that offset scaled by the rectangle's reach.
+        // `on_screen` is already clip space, y-up.
+        self.centre = [
+            self.centre[0] + self.half_size[0] * on_screen[0],
+            self.centre[1] + self.half_size[1] * on_screen[1],
+        ];
+        self.half_size = [self.half_size[0] * screen_width, self.half_size[1] * screen_height];
+
+        let (inner_width, inner_height) = inner.size();
+        self.uv_scale = [inner_width, inner_height];
+        self.uv_offset = [inner.left, inner.top];
+        self
     }
 
     fn as_bytes(&self) -> &[u8] {
         bytemuck::bytes_of(self)
     }
+}
+
+/// Carry an offset and a size from the image's own axes onto the screen's.
+///
+/// A tile knows where it sits in the image; the quad it has to fill is stated
+/// in clip space, which the orientation has already turned. `orientation_matrix`
+/// runs the other way — screen corner to the texel it should show — so this
+/// inverts it rather than restating the eight cases by hand, and the tests
+/// check the two against each other.
+///
+/// `offset` is in the image's -1..1 units, y-down. The returned offset is clip
+/// space, y-up. The returned size is the span's, with the axes exchanged when
+/// the orientation exchanges them.
+fn to_screen(orientation: Orientation, offset: [f32; 2], width: f32, height: f32) -> ([f32; 2], f32, f32) {
+    // The shader computes `m * v` with `v = (corner.x, -corner.y)`, WGSL
+    // reading `m` column-major. Every orientation matrix is orthogonal —
+    // measured, including the four reflections, whose determinant is -1 and
+    // whose transpose is still their inverse — so undoing it is a transpose
+    // rather than a division. The test checks that against the shader's own
+    // matrix rather than trusting the claim.
+    let m = orientation_matrix(orientation);
+    let v = [m[0][0] * offset[0] + m[0][1] * offset[1], m[1][0] * offset[0] + m[1][1] * offset[1]];
+    // `v` is `(corner.x, -corner.y)`, so the y turns on the way back out.
+    // Dropping this negation is what put a tiled picture inside out.
+    let on_screen = [v[0], -v[1]];
+
+    let (width, height) = if orientation.swaps_axes() { (height, width) } else { (width, height) };
+    (on_screen, width, height)
 }
 
 /// The inverse of the EXIF transform, mapping quad corners to texture space.
@@ -120,15 +194,30 @@ impl ColourUniform {
     }
 }
 
-/// The image currently resident on the GPU.
-struct Upload {
+/// One piece of the image on the GPU, with everything a draw call needs.
+///
+/// An image that fits a texture is a single one of these and costs exactly
+/// what the untiled renderer cost.
+struct TileUpload {
     bind_group: wgpu::BindGroup,
     /// Kept so an animation can write its next frame into the same texture
     /// rather than building a texture and bind group per frame.
     texture: wgpu::Texture,
+    /// This tile's own placement uniforms. A tile needs its own quad and its
+    /// own texture inset, so the single shared buffer of the untiled
+    /// renderer cannot serve them all within one pass; at 48 bytes each and
+    /// a handful of tiles, a buffer per tile is cheaper than the dynamic
+    /// offsets it would otherwise take.
+    placement: wgpu::Buffer,
+    tile: Tile,
+}
+
+/// The image currently resident on the GPU.
+struct Upload {
+    tiles: Vec<TileUpload>,
     size: (u32, u32),
-    /// The sample depth the texture was created for. A frame of another depth
-    /// cannot be written into it — the formats differ.
+    /// The sample depth the textures were created for. A frame of another
+    /// depth cannot be written into them — the formats differ.
     depth: Depth,
 }
 
@@ -152,7 +241,6 @@ pub struct Renderer {
     pipeline_layout: wgpu::PipelineLayout,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
-    uniforms: wgpu::Buffer,
     /// Tone curves sampled to linear light: three rows, one per channel.
     curves: wgpu::Texture,
     curves_view: wgpu::TextureView,
@@ -169,7 +257,48 @@ pub struct Renderer {
     /// simply true; elsewhere a wide image is narrowed on upload rather than
     /// refused.
     wide_textures: bool,
+    /// The longest side a texture may have, and so the size an image is cut
+    /// into pieces at. Taken from the device; see [`tile_limit`].
+    tile_limit: u32,
     upload: Option<Upload>,
+}
+
+/// Decide how an image is cut up, and refuse the result if it still would not
+/// fit the device.
+///
+/// `cut_at` is the limit tiles are made to, normally the device's own but
+/// lowerable for tests; `device_limit` is what the driver will actually
+/// accept. Kept apart, and checked here rather than trusted, because the cost
+/// of handing wgpu an oversize texture is not a bad frame but the whole
+/// viewer: `create_texture` cannot return an error, so it reports through the
+/// device's error handler, which by default panics.
+///
+/// `None` when no cut satisfies the device, which cannot happen with a limit
+/// taken from that device and is a bug rather than a file if it does.
+fn plan_tiles(size: (u32, u32), cut_at: u32, device_limit: u32) -> Option<Grid> {
+    let grid = Grid::new(size, cut_at);
+    let fits = grid
+        .tiles()
+        .iter()
+        .all(|tile| tile.padded_width <= device_limit && tile.padded_height <= device_limit);
+    fits.then_some(grid)
+}
+
+/// The side limit to cut images at.
+///
+/// Normally the device's own, which on the hardware this runs on is 16384.
+/// `NITID_TILE_LIMIT` lowers it, which is the only way to exercise the tiled
+/// path in a test: no fixture is 16384 pixels wide, and one that was would
+/// make the suite unbearable. It never raises the limit past what the device
+/// will accept, because a texture over that limit is exactly the silent
+/// failure this module exists to prevent. Nothing in normal use sets it.
+fn tile_limit(device: &wgpu::Device) -> u32 {
+    let device_limit = device.limits().max_texture_dimension_2d;
+    std::env::var("NITID_TILE_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|limit| *limit > 0)
+        .map_or(device_limit, |limit| limit.min(device_limit))
 }
 
 impl Renderer {
@@ -222,6 +351,7 @@ impl Renderer {
         let config = configure(&capabilities, output, size);
         surface.configure(&device, &config);
 
+        let tile_limit = tile_limit(&device);
         let layout = bind_group_layout(&device);
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -249,17 +379,6 @@ impl Renderer {
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             ..Default::default()
-        });
-
-        let uniforms = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("nitid placement"),
-            contents: Placement {
-                half_size: [1.0, 1.0],
-                centre: [0.0, 0.0],
-                orientation: orientation_matrix(Orientation::Normal),
-            }
-            .as_bytes(),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
         // One row per channel. `R16Float` rather than `R32Float` because only
@@ -313,13 +432,13 @@ impl Renderer {
             pipeline_layout,
             layout,
             sampler,
-            uniforms,
             curves,
             curves_view,
             curve_sampler,
             colour,
             transform: ColorTransform::identity(),
             wide_textures,
+            tile_limit,
             upload: None,
         })
     }
@@ -390,11 +509,7 @@ impl Renderer {
     /// uploaded instead, because the shader has to apply the image's own tone
     /// curves rather than assume sRGB.
     pub fn set_image(&mut self, image: &DecodedImage, transform: &ColorTransform) {
-        let extent = wgpu::Extent3d {
-            width: image.width.max(1),
-            height: image.height.max(1),
-            depth_or_array_layers: 1,
-        };
+        let size = (image.width.max(1), image.height.max(1));
 
         // A wide image on a device without wide textures is narrowed here,
         // once, at upload — the picture still opens, at the depth an 8-bit
@@ -423,77 +538,125 @@ impl Renderer {
             (Depth::Sixteen, _) => wgpu::TextureFormat::Rgba16Unorm,
         };
 
-        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("nitid image"),
-            size: extent,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
+        // Past the device's side limit an image becomes several textures. The
+        // limit has to be respected rather than discovered: an oversize
+        // `create_texture` has no `Result` to refuse with: it reports through
+        // the device's error handler, whose default is a panic. Measured — a
+        // 20000-pixel-wide file decoded in full and then took the viewer down
+        // as it was about to appear. See ADR 0015.
+        let Some(grid) = plan_tiles(size, self.tile_limit, self.device.limits().max_texture_dimension_2d) else {
+            // Nothing can be drawn within this device's limits. Drop what is
+            // up rather than hand the driver a texture it will reject.
+            self.upload = None;
+            return;
+        };
+        let bytes_per_pixel = 4 * depth.bytes() as usize;
 
-        self.queue.write_texture(
-            texture.as_image_copy(),
-            pixels,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(extent.width * 4 * depth.bytes()),
-                rows_per_image: Some(extent.height),
-            },
-            extent,
-        );
+        let mut uploads = Vec::with_capacity(grid.len());
+        for tile in grid.tiles() {
+            let extent = wgpu::Extent3d {
+                width: tile.padded_width,
+                height: tile.padded_height,
+                depth_or_array_layers: 1,
+            };
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("nitid image"),
+                size: extent,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+
+            // The single-tile case is every ordinary photograph, and it
+            // uploads the decoder's buffer directly — no copy, exactly as
+            // before tiling existed.
+            let owned;
+            let data: &[u8] = if grid.is_single() {
+                pixels
+            } else {
+                let Some(copied) = tiles::extract(pixels, size, tile, bytes_per_pixel) else {
+                    // Short buffer: a decoder broke its own contract. Drop
+                    // what is up rather than draw a torn picture.
+                    self.upload = None;
+                    return;
+                };
+                owned = copied;
+                &owned
+            };
+
+            self.queue.write_texture(
+                texture.as_image_copy(),
+                data,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(tile.padded_width * bytes_per_pixel as u32),
+                    rows_per_image: Some(tile.padded_height),
+                },
+                extent,
+            );
+
+            let placement = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("nitid placement"),
+                size: size_of::<Placement>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("nitid image bindings"),
+                layout: &self.layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: placement.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(&self.curves_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::Sampler(&self.curve_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: self.colour.as_entire_binding(),
+                    },
+                ],
+            });
+
+            uploads.push(TileUpload {
+                bind_group,
+                texture,
+                placement,
+                tile: *tile,
+            });
+        }
 
         self.transform = transform.clone();
         self.write_curves(transform);
         self.queue
             .write_buffer(&self.colour, 0, bytemuck::bytes_of(&ColourUniform::new(transform, self.output, depth)));
 
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("nitid image bindings"),
-            layout: &self.layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: self.uniforms.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&self.curves_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::Sampler(&self.curve_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: self.colour.as_entire_binding(),
-                },
-            ],
-        });
-
-        self.upload = Some(Upload {
-            bind_group,
-            texture,
-            size: (image.width, image.height),
-            depth,
-        });
+        self.upload = Some(Upload { tiles: uploads, size, depth });
     }
 
     /// Write new pixels into the texture already on screen.
     ///
-    /// This is the frame tick of an animation: the texture, its format, the
-    /// colour transform and the bind group all stand — the frames of one file
+    /// This is the frame tick of an animation: the textures, their format, the
+    /// colour transform and the bind groups all stand — the frames of one file
     /// share a size and a profile — so a frame costs one upload rather than
     /// the full `set_image`. False when nothing is up yet or the size does
     /// not match, in which case the caller's picture is wrong enough that a
@@ -506,21 +669,41 @@ impl Renderer {
             return false;
         }
 
-        let extent = wgpu::Extent3d {
-            width: image.width.max(1),
-            height: image.height.max(1),
-            depth_or_array_layers: 1,
-        };
-        self.queue.write_texture(
-            upload.texture.as_image_copy(),
-            &image.pixels,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(image.bytes_per_row()),
-                rows_per_image: Some(extent.height),
-            },
-            extent,
-        );
+        let bytes_per_pixel = 4 * image.depth.bytes() as usize;
+        for piece in &upload.tiles {
+            let tile = &piece.tile;
+            let extent = wgpu::Extent3d {
+                width: tile.padded_width,
+                height: tile.padded_height,
+                depth_or_array_layers: 1,
+            };
+
+            // One tile is the whole picture, which is every animation the
+            // viewer has met: a GIF past the texture limit is possible but
+            // has never turned up, and it costs a copy per tile per frame
+            // rather than being refused.
+            let owned;
+            let data: &[u8] = if upload.tiles.len() == 1 {
+                &image.pixels
+            } else {
+                let Some(copied) = tiles::extract(&image.pixels, upload.size, tile, bytes_per_pixel) else {
+                    return false;
+                };
+                owned = copied;
+                &owned
+            };
+
+            self.queue.write_texture(
+                piece.texture.as_image_copy(),
+                data,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(tile.padded_width * bytes_per_pixel as u32),
+                    rows_per_image: Some(tile.padded_height),
+                },
+                extent,
+            );
+        }
         true
     }
 
@@ -566,12 +749,29 @@ impl Renderer {
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded | wgpu::CurrentSurfaceTexture::Validation => return Ok(()),
         };
 
-        if let Some((view, orientation)) = shown {
-            let placement = Placement::new(view, self.size(), orientation);
-            self.queue.write_buffer(&self.uniforms, 0, placement.as_bytes());
+        let target = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let encoder = self.draw_into(&target, self.size(), shown);
+
+        self.queue.submit(Some(encoder.finish()));
+        self.queue.present(frame);
+        Ok(())
+    }
+
+    /// Record the image pass into a fresh encoder, drawing onto `target`.
+    ///
+    /// Split out of `render` so a test can point the same code at a texture it
+    /// reads back: the swapchain is the one thing an offscreen test cannot
+    /// have, and everything worth checking — where each tile lands, what it
+    /// samples, how many draws it takes — is on this side of that line.
+    fn draw_into(&self, target: &wgpu::TextureView, size: (u32, u32), shown: Option<(&View, Orientation)>) -> wgpu::CommandEncoder {
+        if let (Some((view, orientation)), Some(upload)) = (shown, self.upload.as_ref()) {
+            let whole = Placement::new(view, size, orientation);
+            for piece in &upload.tiles {
+                let placement = whole.for_tile(orientation, piece.tile.span(upload.size), piece.tile.inner_uv());
+                self.queue.write_buffer(&piece.placement, 0, placement.as_bytes());
+            }
         }
 
-        let target = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("nitid frame") });
@@ -580,7 +780,7 @@ impl Renderer {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("nitid image pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &target,
+                    view: target,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -596,14 +796,16 @@ impl Renderer {
 
             if let Some(upload) = &self.upload {
                 pass.set_pipeline(&self.pipeline);
-                pass.set_bind_group(0, &upload.bind_group, &[]);
-                pass.draw(0..4, 0..1);
+                // One draw call per tile, which for every image that fits a
+                // texture is one draw call in total.
+                for piece in &upload.tiles {
+                    pass.set_bind_group(0, &piece.bind_group, &[]);
+                    pass.draw(0..4, 0..1);
+                }
             }
         }
 
-        self.queue.submit(Some(encoder.finish()));
-        self.queue.present(frame);
-        Ok(())
+        encoder
     }
 }
 
@@ -842,10 +1044,11 @@ mod tests {
     }
 
     #[test]
-    fn placement_is_thirty_two_bytes() {
+    fn placement_is_forty_eight_bytes() {
         // The shader's `Placement` must agree; a mismatch is silent corruption
-        // of the framing rather than a compile error.
-        assert_eq!(std::mem::size_of::<Placement>(), 32);
+        // of the framing rather than a compile error. The two `vec2` fields
+        // that carry a tile's texture inset took it from 32 bytes to 48.
+        assert_eq!(std::mem::size_of::<Placement>(), 48);
     }
 
     #[test]
@@ -1012,14 +1215,12 @@ mod tests {
         );
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor::default());
+        // Built through the production constructor rather than by hand, so a
+        // mistake in how placement is assembled shows up here too: a view of
+        // a 1x1 image in a 1x1 window fills the target exactly.
         let placement = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
-            contents: Placement {
-                half_size: [1.0, 1.0],
-                centre: [0.0, 0.0],
-                orientation: orientation_matrix(Orientation::Normal),
-            }
-            .as_bytes(),
+            contents: Placement::new(&View::new((1, 1), (1, 1), 1.0), (1, 1), Orientation::Normal).as_bytes(),
             usage: wgpu::BufferUsages::UNIFORM,
         });
         let colour = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1236,5 +1437,564 @@ mod tests {
                 "channel {channel}: the narrow texture shows {eight:?} and the wide one {sixteen:?}"
             );
         }
+    }
+
+    /// Environment variables are a process-wide resource: a test that sets
+    /// one races every other test in the binary. The sandbox suite learned
+    /// this in v0.9.0, where "hang on purpose" leaked into four neighbours.
+    static ENVIRONMENT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Draw a whole image at `limit` as the texture side limit, and read the
+    /// target back as 8-bit RGBA rows.
+    ///
+    /// This drives the real pieces: `Grid` decides the cut, `tiles::extract`
+    /// fills each texture, `Placement::for_tile` places each quad, and the
+    /// production shader and pipeline draw them. Only the device and the
+    /// swapchain are stood in for, because an offscreen test cannot have one.
+    ///
+    /// `None` when no adapter can be had, which is a fact about the machine.
+    fn draw_tiled(image: &DecodedImage, limit: u32, view: &View, orientation: Orientation, target_size: (u32, u32)) -> Option<Vec<u8>> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("nitid tiling test device"),
+            ..Default::default()
+        }))
+        .ok()?;
+
+        let output = plain_surface();
+        let transform = ColorTransform::identity();
+        let layout = bind_group_layout(&device);
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: None,
+            source: wgpu::ShaderSource::Wgsl(include_str!("gpu/shader.wgsl").into()),
+        });
+        let pipeline = build_pipeline(&device, &pipeline_layout, &shader, output.format);
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            ..Default::default()
+        });
+
+        // Tone curves, as `Renderer::write_curves` writes them.
+        let curve_extent = wgpu::Extent3d {
+            width: CURVE_SAMPLES as u32,
+            height: 3,
+            depth_or_array_layers: 1,
+        };
+        let curves = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: curve_extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let halves: Vec<half::f16> = transform.decode.iter().map(|value| half::f16::from_f32(*value)).collect();
+        queue.write_texture(
+            curves.as_image_copy(),
+            bytemuck::cast_slice(&halves),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some((CURVE_SAMPLES * 2) as u32),
+                rows_per_image: Some(3),
+            },
+            curve_extent,
+        );
+        let curves_view = curves.create_view(&wgpu::TextureViewDescriptor::default());
+        let curve_sampler = device.create_sampler(&wgpu::SamplerDescriptor::default());
+        let colour = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::bytes_of(&ColourUniform::new(&transform, output, Depth::Eight)),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+        let size = (image.width, image.height);
+        let grid = Grid::new(size, limit);
+        let whole = Placement::new(view, target_size, orientation);
+
+        // Everything a draw needs, built exactly as `set_image` builds it.
+        let mut pieces = Vec::new();
+        for tile in grid.tiles() {
+            let extent = wgpu::Extent3d {
+                width: tile.padded_width,
+                height: tile.padded_height,
+                depth_or_array_layers: 1,
+            };
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: None,
+                size: extent,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let data = tiles::extract(&image.pixels, size, tile, 4).expect("the fixture is well formed");
+            queue.write_texture(
+                texture.as_image_copy(),
+                &data,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(tile.padded_width * 4),
+                    rows_per_image: Some(tile.padded_height),
+                },
+                extent,
+            );
+
+            let placement = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: whole.for_tile(orientation, tile.span(size), tile.inner_uv()).as_bytes(),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+            let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&texture_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: placement.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(&curves_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::Sampler(&curve_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: colour.as_entire_binding(),
+                    },
+                ],
+            });
+            pieces.push(bind_group);
+        }
+
+        let target_extent = wgpu::Extent3d {
+            width: target_size.0,
+            height: target_size.1,
+            depth_or_array_layers: 1,
+        };
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: target_extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: output.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // A texture-to-buffer copy pads rows to 256 bytes. Getting this wrong
+        // does not fail the copy loudly enough to notice: the probe that
+        // designed this feature read all zeroes and nearly concluded that
+        // tiling needed no overlap.
+        let row = (target_size.0 * 4).next_multiple_of(256);
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (row * target_size.1) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(BACKGROUND),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&pipeline);
+            for bind_group in &pieces {
+                pass.set_bind_group(0, bind_group, &[]);
+                pass.draw(0..4, 0..1);
+            }
+        }
+        encoder.copy_texture_to_buffer(
+            target.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row),
+                    rows_per_image: Some(target_size.1),
+                },
+            },
+            target_extent,
+        );
+        queue.submit([encoder.finish()]);
+        readback.map_async(wgpu::MapMode::Read, .., |_| {});
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            })
+            .ok()?;
+        let bytes = readback.slice(..).get_mapped_range().ok()?.to_vec();
+
+        // Drop the row padding, so the caller compares pixels rather than
+        // alignment.
+        let mut out = Vec::with_capacity((target_size.0 * target_size.1 * 4) as usize);
+        for y in 0..target_size.1 as usize {
+            let start = y * row as usize;
+            out.extend_from_slice(&bytes[start..start + (target_size.0 * 4) as usize]);
+        }
+        Some(out)
+    }
+
+    /// A picture with detail in both directions, so a tile placed wrongly
+    /// shows up as a moved feature rather than as more of the same colour.
+    fn test_picture(width: u32, height: u32) -> DecodedImage {
+        let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                pixels.extend_from_slice(&[(x * 255 / width.max(1)) as u8, (y * 255 / height.max(1)) as u8, ((x + y) % 256) as u8, 255]);
+            }
+        }
+        DecodedImage {
+            width,
+            height,
+            pixels,
+            depth: Depth::Eight,
+        }
+    }
+
+    /// The worst channel difference between two readbacks of the same size.
+    fn worst_difference(a: &[u8], b: &[u8]) -> i32 {
+        assert_eq!(a.len(), b.len(), "the two readbacks are different sizes");
+        a.iter().zip(b).map(|(x, y)| (i32::from(*x) - i32::from(*y)).abs()).max().unwrap_or(0)
+    }
+
+    /// The whole point of the version: an image cut into tiles must draw the
+    /// same picture as the same image in one texture.
+    ///
+    /// Compared through the frame buffer rather than by reasoning about
+    /// coordinates, because a tile misplaced by its own width still satisfies
+    /// every arithmetic invariant the geometry tests check.
+    #[test]
+    fn a_tiled_image_draws_the_same_picture_as_a_whole_one() {
+        let image = test_picture(64, 48);
+        let view = View::new((64, 48), (128, 96), 1.0);
+
+        let Some(whole) = draw_tiled(&image, 4096, &view, Orientation::Normal, (128, 96)) else {
+            eprintln!("skipping: no graphics adapter here");
+            return;
+        };
+        // A limit that cuts this picture into a grid of tiles in both axes.
+        let tiled = draw_tiled(&image, 20, &view, Orientation::Normal, (128, 96)).expect("the adapter answered once already");
+
+        let worst = worst_difference(&whole, &tiled);
+        assert!(worst <= 1, "the tiled picture differs from the whole one by {worst}/255");
+    }
+
+    /// The same, magnified — where a seam actually shows.
+    ///
+    /// A picture blown up past one texel per pixel is the case the overlap
+    /// exists for: without it the sampler clamps at each tile's edge and the
+    /// join reads as a flat step. Measured at eight values out of 255 before
+    /// the overlap was added, which is why the tolerance here is 1.
+    #[test]
+    fn a_magnified_tiled_image_has_no_seam() {
+        let image = test_picture(16, 16);
+        let mut view = View::new((16, 16), (256, 256), 1.0);
+        view.zoom_at(24.0, (128.0, 128.0));
+
+        let Some(whole) = draw_tiled(&image, 4096, &view, Orientation::Normal, (256, 256)) else {
+            eprintln!("skipping: no graphics adapter here");
+            return;
+        };
+        let tiled = draw_tiled(&image, 6, &view, Orientation::Normal, (256, 256)).expect("the adapter answered once already");
+
+        let worst = worst_difference(&whole, &tiled);
+        assert!(worst <= 1, "a seam shows at magnification: {worst}/255 away from the whole picture");
+    }
+
+    /// Orientation is applied to the whole rectangle, so tiles have to follow
+    /// it. A rotated tiled image must match the rotated whole one — the case
+    /// where placing a tile in image space rather than screen space gives a
+    /// picture assembled inside out.
+    #[test]
+    fn tiles_follow_the_exif_orientation() {
+        let image = test_picture(48, 32);
+        // Rotation swaps the axes, which is what the view is told about.
+        let view = View::new((32, 48), (128, 128), 1.0);
+
+        for orientation in [
+            Orientation::Rotate90,
+            Orientation::Rotate180,
+            Orientation::FlipHorizontal,
+            Orientation::Transpose,
+        ] {
+            let Some(whole) = draw_tiled(&image, 4096, &view, orientation, (128, 128)) else {
+                eprintln!("skipping: no graphics adapter here");
+                return;
+            };
+            let tiled = draw_tiled(&image, 20, &view, orientation, (128, 128)).expect("the adapter answered once already");
+
+            let worst = worst_difference(&whole, &tiled);
+            assert!(worst <= 1, "{orientation:?}: the tiled picture differs by {worst}/255");
+        }
+    }
+
+    /// Panned and zoomed, the tiles must still land where the whole picture
+    /// would: `for_tile` derives each quad from the placed rectangle, so an
+    /// error in that derivation shows only once the rectangle is off-centre.
+    #[test]
+    fn tiles_follow_zoom_and_pan() {
+        let image = test_picture(40, 40);
+        let mut view = View::new((40, 40), (160, 160), 1.0);
+        view.zoom_at(8.0, (40.0, 120.0));
+        view.pan((17.0, -23.0));
+
+        let Some(whole) = draw_tiled(&image, 4096, &view, Orientation::Normal, (160, 160)) else {
+            eprintln!("skipping: no graphics adapter here");
+            return;
+        };
+        let tiled = draw_tiled(&image, 14, &view, Orientation::Normal, (160, 160)).expect("the adapter answered once already");
+
+        let worst = worst_difference(&whole, &tiled);
+        assert!(worst <= 1, "under zoom and pan the tiled picture differs by {worst}/255");
+    }
+
+    /// `to_screen` must be the exact inverse of what the shader does, checked
+    /// against the shader's own matrix rather than against a second table of
+    /// the eight cases — a table would just be the same guess written twice.
+    ///
+    /// The transpose passes this for the four orientations that keep the axes
+    /// and fails it for the four that exchange them, which is how the bug it
+    /// guards against reached a rendered frame.
+    #[test]
+    fn a_tile_offset_travels_to_the_screen_and_back_unchanged() {
+        for orientation in [
+            Orientation::Normal,
+            Orientation::FlipHorizontal,
+            Orientation::Rotate180,
+            Orientation::FlipVertical,
+            Orientation::Transpose,
+            Orientation::Rotate90,
+            Orientation::Transverse,
+            Orientation::Rotate270,
+        ] {
+            let m = orientation_matrix(orientation);
+            for offset in [[1.0, 0.0], [0.0, 1.0], [-0.5, 0.25], [0.3, -0.7]] {
+                let (on_screen, _, _) = to_screen(orientation, offset, 1.0, 1.0);
+
+                // Put the screen offset through the shader's own arithmetic:
+                // `m * (corner.x, -corner.y)`, WGSL reading `m` column-major.
+                let v = [on_screen[0], -on_screen[1]];
+                let back = [m[0][0] * v[0] + m[1][0] * v[1], m[0][1] * v[0] + m[1][1] * v[1]];
+
+                assert!(
+                    (back[0] - offset[0]).abs() < 1e-5 && (back[1] - offset[1]).abs() < 1e-5,
+                    "{orientation:?}: {offset:?} went to the screen as {on_screen:?} and came back as {back:?}",
+                );
+            }
+        }
+    }
+
+    /// `to_screen` undoes the orientation with a transpose, which is only the
+    /// inverse if every one of these matrices is orthogonal. Four of them are
+    /// reflections, with determinant -1 — that does not stop the transpose
+    /// being the inverse, but it is exactly the sort of thing that gets
+    /// assumed rather than checked, so it is checked.
+    #[test]
+    fn every_orientation_matrix_is_its_own_inverse_transposed() {
+        for orientation in [
+            Orientation::Normal,
+            Orientation::FlipHorizontal,
+            Orientation::Rotate180,
+            Orientation::FlipVertical,
+            Orientation::Transpose,
+            Orientation::Rotate90,
+            Orientation::Transverse,
+            Orientation::Rotate270,
+        ] {
+            let m = orientation_matrix(orientation);
+            // `m` times its transpose must be the identity.
+            for row in 0..2 {
+                for column in 0..2 {
+                    let product = m[0][row] * m[0][column] + m[1][row] * m[1][column];
+                    let expected = if row == column { 1.0 } else { 0.0 };
+                    assert!(
+                        (product - expected).abs() < 1e-6,
+                        "{orientation:?} is not orthogonal: entry ({row},{column}) of M*Mt is {product}",
+                    );
+                }
+            }
+        }
+    }
+
+    /// A rotation exchanges the axes of the span as well as its direction: a
+    /// tile that is wide in the image is tall on screen.
+    #[test]
+    fn a_quarter_turn_exchanges_a_tiles_screen_size() {
+        let (_, width, height) = to_screen(Orientation::Rotate90, [0.0, 0.0], 0.25, 1.0);
+        assert_eq!((width, height), (1.0, 0.25));
+
+        let (_, width, height) = to_screen(Orientation::Rotate180, [0.0, 0.0], 0.25, 1.0);
+        assert_eq!((width, height), (0.25, 1.0));
+    }
+
+    /// A whole-image placement samples all of its texture; only a tile insets.
+    #[test]
+    fn an_untiled_placement_samples_the_whole_texture() {
+        let view = View::new((100, 100), (100, 100), 1.0);
+        let placement = Placement::new(&view, (100, 100), Orientation::Normal);
+        assert_eq!(placement.uv_scale, [1.0, 1.0]);
+        assert_eq!(placement.uv_offset, [0.0, 0.0]);
+    }
+
+    /// The single-tile case must come out of `for_tile` unchanged: it is the
+    /// path every ordinary photograph takes, and it has to cost nothing.
+    #[test]
+    fn a_single_tile_placement_is_the_whole_image_placement() {
+        let view = View::new((4000, 3000), (1000, 800), 1.0);
+        let whole = Placement::new(&view, (1000, 800), Orientation::Normal);
+        let grid = Grid::new((4000, 3000), 16384);
+        let tile = grid.tiles()[0];
+
+        let placed = whole.for_tile(Orientation::Normal, tile.span((4000, 3000)), tile.inner_uv());
+        assert_eq!(placed.half_size, whole.half_size);
+        assert_eq!(placed.centre, whole.centre);
+        assert_eq!(placed.uv_scale, [1.0, 1.0]);
+        assert_eq!(placed.uv_offset, [0.0, 0.0]);
+    }
+
+    /// Tiles must partition the image rectangle: their quads have to add up
+    /// to the whole one, edge to edge, with no gap and no overlap.
+    #[test]
+    fn the_tile_quads_tile_the_image_rectangle() {
+        let view = View::new((1000, 600), (1000, 600), 1.0);
+        let whole = Placement::new(&view, (1000, 600), Orientation::Normal);
+        let grid = Grid::new((1000, 600), 256);
+
+        // The left and right edges of one row of tiles, in clip space.
+        let mut spans: Vec<(f32, f32)> = grid
+            .tiles()
+            .iter()
+            .filter(|tile| tile.y == 0)
+            .map(|tile| {
+                let placed = whole.for_tile(Orientation::Normal, tile.span((1000, 600)), tile.inner_uv());
+                (placed.centre[0] - placed.half_size[0], placed.centre[0] + placed.half_size[0])
+            })
+            .collect();
+        spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+        assert!(spans.len() > 1, "this limit was meant to need several tiles");
+
+        assert!(
+            (spans[0].0 - (whole.centre[0] - whole.half_size[0])).abs() < 1e-5,
+            "the first tile does not start at the image's left edge"
+        );
+        for pair in spans.windows(2) {
+            assert!((pair[0].1 - pair[1].0).abs() < 1e-5, "a gap or an overlap between tiles: {pair:?}");
+        }
+        let last = spans.last().expect("at least one tile");
+        assert!(
+            (last.1 - (whole.centre[0] + whole.half_size[0])).abs() < 1e-5,
+            "the last tile does not reach the image's right edge"
+        );
+    }
+
+    /// The guard `set_image` leans on: whatever limit it is handed, no texture
+    /// it goes on to create may exceed what the device accepts.
+    ///
+    /// This is the check that catches a cut made to the wrong limit — the
+    /// mutation that replaces `self.tile_limit` with something larger. Every
+    /// other tiling test builds its own `Grid`, so none of them would notice.
+    #[test]
+    fn a_plan_never_exceeds_the_devices_limit() {
+        // Cut to the device's own limit: a plan, and every tile within it.
+        for size in [(4000, 3000), (30000, 20000), (16385, 100)] {
+            let grid = plan_tiles(size, 16384, 16384).expect("the device's own limit always has a plan");
+            for tile in grid.tiles() {
+                assert!(
+                    tile.padded_width <= 16384 && tile.padded_height <= 16384,
+                    "{size:?}: {tile:?} exceeds the limit"
+                );
+            }
+        }
+
+        // Cut to a limit larger than the device allows: refused rather than
+        // handed on. The viewer shows nothing, which beats a panic.
+        assert!(plan_tiles((30000, 20000), u32::MAX, 16384).is_none());
+        assert!(plan_tiles((20000, 100), 20000, 16384).is_none());
+
+        // Small enough for the device either way: still a plan.
+        assert!(plan_tiles((800, 600), u32::MAX, 16384).is_some());
+    }
+
+    /// The lever the tests need, and the guard that it can never make things
+    /// worse: it may lower the limit, never raise it past the device.
+    #[test]
+    fn the_tile_limit_lever_never_exceeds_the_device() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())) else {
+            eprintln!("skipping: no graphics adapter here");
+            return;
+        };
+        let Ok((device, _queue)) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: None,
+            ..Default::default()
+        })) else {
+            eprintln!("skipping: no device here");
+            return;
+        };
+        let device_limit = device.limits().max_texture_dimension_2d;
+        let _guard = ENVIRONMENT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        // Unset: the device's own limit.
+        unsafe { std::env::remove_var("NITID_TILE_LIMIT") };
+        assert_eq!(tile_limit(&device), device_limit);
+
+        // Set lower: taken.
+        unsafe { std::env::set_var("NITID_TILE_LIMIT", "64") };
+        assert_eq!(tile_limit(&device), 64);
+
+        // Higher than the device allows: clamped, because a texture past the
+        // device's limit is the crash being prevented here.
+        unsafe { std::env::set_var("NITID_TILE_LIMIT", (u64::from(device_limit) * 4).to_string()) };
+        assert_eq!(tile_limit(&device), device_limit);
+
+        // Nonsense: ignored rather than obeyed.
+        unsafe { std::env::set_var("NITID_TILE_LIMIT", "not a number") };
+        assert_eq!(tile_limit(&device), device_limit);
+        unsafe { std::env::set_var("NITID_TILE_LIMIT", "0") };
+        assert_eq!(tile_limit(&device), device_limit);
+
+        unsafe { std::env::remove_var("NITID_TILE_LIMIT") };
     }
 }

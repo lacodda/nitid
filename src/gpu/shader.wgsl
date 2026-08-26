@@ -13,6 +13,12 @@ struct Placement {
     // Row-major 2x2 mapping quad corners to texture coordinates; this is where
     // the EXIF orientation lives, so decoded pixels are never rewritten.
     orientation: mat2x2<f32>,
+    // The part of this draw's texture that carries the pixels being shown.
+    // An image small enough for one texture uses the whole of it — scale 1,
+    // offset 0 — and a tile of a larger one uses the sub-rectangle inside its
+    // padding. See `tiles.rs` and ADR 0015.
+    uv_scale: vec2<f32>,
+    uv_offset: vec2<f32>,
 }
 
 // How the image's colours become the display's.
@@ -61,7 +67,12 @@ fn vs_main(@builtin(vertex_index) index: u32) -> VertexOutput {
 
     // Corner space is y-up in clip space and y-down in texture space.
     let oriented = placement.orientation * vec2<f32>(corner.x, -corner.y);
-    out.uv = oriented * 0.5 + 0.5;
+    // The inset is applied after the orientation because it names a rectangle
+    // of the texture as stored, and `oriented` is already in that space: the
+    // orientation maps a screen corner to the texel it should show, and the
+    // inset then picks that texel out of this tile rather than out of the
+    // whole image.
+    out.uv = (oriented * 0.5 + 0.5) * placement.uv_scale + placement.uv_offset;
     return out;
 }
 

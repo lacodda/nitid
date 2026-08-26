@@ -27,6 +27,7 @@ mod isobmff;
 mod loader;
 mod sandbox;
 mod startup;
+mod tiles;
 mod vector;
 mod view;
 

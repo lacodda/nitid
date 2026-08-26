@@ -112,6 +112,27 @@ A screenshot of an HDR window is a standard-range image, so this line is the
 one way to check the answer rather than judge it. See
 [ADR 0013](docs/adr/0013-hdr-output-goes-through-scrgb.md).
 
+## Large images
+
+A GPU texture has a maximum side — 16384 on current integrated hardware, and
+as little as 2048 on the oldest cards nitid still runs on. A stitched panorama
+or a scanned map goes past it, and the way that failed is worth knowing: the
+graphics API has no way to return the rejection, so it reports it through a
+side channel and the default handling is a panic. Before this version such a
+file decoded all the way through and then took the viewer down at the moment
+it was about to appear.
+
+nitid cuts such an image into tiles the device will hold and draws them as one
+picture. Zoom and pan work as they do on any other image, and the joins are
+invisible: each tile carries one pixel of its neighbour so the filter has a
+real texel to interpolate towards, rather than the repeated edge that leaves a
+visible step under magnification. An image that fits in one texture is still
+one texture and one draw call — tiling costs it a single comparison.
+
+Still bounded by memory rather than by the texture limit: a tiled image holds
+every pixel at once. See
+[ADR 0015](docs/adr/0015-large-images-are-tiled.md).
+
 ## Formats
 
 Everything below decodes in pure Rust: a malformed file costs an error, never
@@ -225,7 +246,7 @@ to 1.0 is fixed:
 | ✅ v0.12.0 | Animation: GIF, APNG and animated WebP play |
 | ✅ v0.13.0 | HDR output on Windows, following the display as it changes |
 | ✅ v0.14.0 | A wider buffer: 10- and 12-bit sources through to the screen |
-| v0.15.0 | Gigapixel images via tiled rendering |
+| ✅ v0.15.0 | Gigapixel images via tiled rendering |
 | v0.16.0 – v0.35.0 | The everyday viewer: single instance, toolbar, EXIF panel, clipboard, file operations, culling, comparison, settings |
 | v0.36.0 – v0.39.0 | Windows integration: context menu, installer, auto-update, thumbnails |
 | v0.40.0 – v0.41.0 | Documentation site, stabilisation |
@@ -299,6 +320,7 @@ here as everywhere else on a scaled display.
 | --- | --- |
 | `NITID_STARTUP_REPORT=1` | print the startup breakdown to stderr, and state the surface each time it is configured |
 | `NITID_EXIT_AFTER_FIRST_FRAME=1` | close as soon as a picture is on screen; used by the startup test |
+| `NITID_TILE_LIMIT=<pixels>` | lower the texture side an image is cut into tiles at, so the tiled path can be exercised on a small file; never raises it past what the device accepts |
 
 ## Design notes
 
