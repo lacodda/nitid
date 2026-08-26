@@ -26,6 +26,7 @@ mod install;
 mod isobmff;
 mod loader;
 mod sandbox;
+mod single;
 mod startup;
 mod tiles;
 mod vector;
@@ -41,6 +42,20 @@ pub mod testing {
     pub use crate::color::{ColorTransform, profile_from};
     pub use crate::image_source::{Depth, decode_here};
     pub use crate::sandbox::decode as decode_sandboxed;
+
+    /// Whether a viewer is listening on the channel `id` names.
+    ///
+    /// The single-instance tests have to wait for the first viewer to be
+    /// ready before a second one can hand anything over, and asking the
+    /// channel is the only way that does not involve starting a viewer with
+    /// no file — which would open a window that never exits.
+    #[cfg(windows)]
+    pub fn instance_is_listening(id: &str) -> bool {
+        // SAFETY: the tests are the only caller, and they set this to a value
+        // of their own before starting any viewer.
+        unsafe { std::env::set_var("NITID_INSTANCE_ID", id) };
+        crate::single::channel::is_listening(&crate::single::pipe_name())
+    }
 }
 
 use std::ffi::OsString;
@@ -49,8 +64,12 @@ use std::process::ExitCode;
 
 /// What the command line asked for.
 enum Command {
-    /// Show an image, or an empty window when no file was named.
-    View(Option<PathBuf>),
+    /// Show the images named, or an empty window when none were.
+    ///
+    /// A list rather than one path because the shell can hand over several:
+    /// selecting five files and pressing Enter starts five processes, whose
+    /// paths are gathered into one window. See `single`.
+    View(Vec<PathBuf>),
     Install,
     Uninstall,
     Help,
@@ -82,13 +101,13 @@ pub fn run(windowed: bool) -> ExitCode {
     }
 
     let result = match command {
-        Command::View(path) => {
+        Command::View(paths) => {
             // The console binary hides the console it was given; the windowed
             // one never had one.
             if !windowed {
                 console::hide_if_ours();
             }
-            app::run(path)
+            view(paths)
         }
         Command::Help => {
             print_usage();
@@ -116,6 +135,47 @@ pub fn run(windowed: bool) -> ExitCode {
     }
 }
 
+/// Show `paths`, in this process or in the window that is already open.
+///
+/// Starting a viewer costs a window and a graphics device — measured at 190 to
+/// 340 milliseconds of a 320 to 560 millisecond cold start. A viewer that is
+/// already running has both, so when one is found this process hands its files
+/// over and exits, and the picture appears in the time it takes to decode it.
+///
+/// Every way of failing to hand over ends in opening a window here: no window
+/// to talk to, a pipe that cannot be created, a message that will not send.
+/// Failing to share is never a reason to refuse to show a picture.
+fn view(paths: Vec<PathBuf>) -> anyhow::Result<()> {
+    #[cfg(windows)]
+    if single::enabled() {
+        // Relative paths mean different things in different processes: the
+        // shell gives each launch its own working directory. Resolved here,
+        // where the original one still applies.
+        let paths = single::absolute(&paths);
+        let name = single::pipe_name();
+
+        match single::channel::claim(&name) {
+            // Nobody else is up: this process is the window. It keeps the
+            // listener and hands it to the event loop.
+            Ok(Some(listener)) => return app::run_owning(paths, listener),
+            // Somebody is. Hand over and go.
+            Ok(None) => {
+                if !paths.is_empty() && single::channel::send(&name, &paths, single::HANDOVER_PATIENCE).is_ok() {
+                    return Ok(());
+                }
+                // Either there was nothing to hand over — a bare launch, which
+                // should open its own window rather than silently do nothing —
+                // or the window went away between the claim and the message.
+            }
+            // The pipe could not be made for some other reason. Say so where
+            // there is somewhere to say it, and open a window anyway.
+            Err(error) => eprintln!("nitid: {error:#}"),
+        }
+    }
+
+    app::run(paths)
+}
+
 /// Re-run this command as `nitid.exe`, which has a console.
 ///
 /// The two binaries sit in the same directory by construction: they are built
@@ -137,7 +197,7 @@ fn delegate_to_console_binary() -> ExitCode {
 fn parse(args: impl Iterator<Item = OsString>) -> Command {
     let mut args = args.peekable();
     let Some(first) = args.next() else {
-        return Command::View(None);
+        return Command::View(Vec::new());
     };
 
     match first.to_str() {
@@ -149,8 +209,10 @@ fn parse(args: impl Iterator<Item = OsString>) -> Command {
         // unrecognised argument is treated as a path.
         Some(sandbox::DECODE_ARGUMENT) => Command::Decode,
         // Anything else is a path — including one that looks like a flag,
-        // since a file may legitimately be named `--version`.
-        _ => Command::View(Some(PathBuf::from(first))),
+        // since a file may legitimately be named `--version`. Every remaining
+        // argument is a path too: a command line naming several files opens
+        // them as one list rather than showing only the first.
+        _ => Command::View(std::iter::once(first).chain(args).map(PathBuf::from).collect()),
     }
 }
 
@@ -160,12 +222,14 @@ fn print_usage() {
 nitid {version} — a fast image viewer with honest color
 
 Usage:
-  nitid [FILE]
+  nitid [FILE...]
   nitid install
   nitid uninstall
 
 Arguments:
-  FILE          image to open; its folder becomes the browsing list
+  FILE...       images to open. One file browses its folder; several browse
+                themselves. A viewer already open takes them rather than a
+                second window starting
 
 Commands:
   install       copy nitid to %LOCALAPPDATA%\\Programs and register its file
@@ -200,15 +264,25 @@ mod tests {
 
     #[test]
     fn no_arguments_opens_an_empty_window() {
-        assert!(matches!(parse_args(&[]), Command::View(None)));
+        assert!(matches!(parse_args(&[]), Command::View(paths) if paths.is_empty()));
     }
 
     #[test]
     fn a_path_is_opened() {
-        let Command::View(Some(path)) = parse_args(&["photo.jpg"]) else {
+        let Command::View(paths) = parse_args(&["photo.jpg"]) else {
             panic!("a path should open the viewer");
         };
-        assert_eq!(path, PathBuf::from("photo.jpg"));
+        assert_eq!(paths, vec![PathBuf::from("photo.jpg")]);
+    }
+
+    /// The shell hands one file per launch, but a command line — and a
+    /// hand-over from another instance — can carry several.
+    #[test]
+    fn several_paths_are_all_opened() {
+        let Command::View(paths) = parse_args(&["one.jpg", "two.png", "three.webp"]) else {
+            panic!("several paths should open the viewer");
+        };
+        assert_eq!(paths, vec![PathBuf::from("one.jpg"), PathBuf::from("two.png"), PathBuf::from("three.webp")]);
     }
 
     #[test]
@@ -224,7 +298,7 @@ mod tests {
     #[test]
     fn the_decoder_argument_is_not_a_path() {
         assert!(matches!(parse_args(&[sandbox::DECODE_ARGUMENT]), Command::Decode));
-        assert!(matches!(parse_args(&["decode-stdin"]), Command::View(Some(_))));
+        assert!(matches!(parse_args(&["decode-stdin"]), Command::View(paths) if paths.len() == 1));
     }
 
     /// A file really can be called `install`; the shell passes a qualified
@@ -232,9 +306,9 @@ mod tests {
     #[test]
     fn a_path_ending_in_a_command_name_still_opens() {
         let qualified = PathBuf::from("pictures").join("install");
-        let Command::View(Some(path)) = parse_args(&[&qualified.to_string_lossy()]) else {
+        let Command::View(paths) = parse_args(&[&qualified.to_string_lossy()]) else {
             panic!("a qualified path should open the viewer");
         };
-        assert_eq!(path, qualified);
+        assert_eq!(paths, vec![qualified]);
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "nitid"
-version = "0.15.0"
+version = "0.16.0"
 edition = "2024"
 rust-version = "1.89"
 description = "A fast image viewer for Windows with honest color and HDR: first pixels in milliseconds, ICC on the GPU, modern formats"
@@ -28,7 +28,7 @@ exclude = [
 winresource = "0.1"
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.62", features = ["Win32_System_Console", "Win32_UI_Shell", "Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Security", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_UI_ColorSystem", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security_Authorization", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Memory", "Win32_Security_Isolation", "Win32_System_Pipes"] }
+windows = { version = "0.62", features = ["Win32_System_Console", "Win32_UI_Shell", "Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Security", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_UI_ColorSystem", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security_Authorization", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Memory", "Win32_Security_Isolation", "Win32_System_Pipes", "Win32_System_IO"] }
 windows-registry = "0.6"
 
 [dependencies]

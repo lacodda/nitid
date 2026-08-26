@@ -37,6 +37,51 @@ impl Folder {
         Ok(Self { entries, current })
     }
 
+    /// Browse an explicit selection rather than a folder.
+    ///
+    /// Selecting five files in the shell and pressing Enter should give one
+    /// window that browses those five, not the hundreds that happen to sit
+    /// beside them. The cursor starts on the first.
+    ///
+    /// `None` when nothing selected is an image this build can open, which
+    /// leaves the caller showing whatever it already had.
+    pub fn of_selection(paths: &[PathBuf]) -> Option<Self> {
+        let entries: Vec<PathBuf> = paths
+            .iter()
+            .filter(|path| image_source::is_supported(path))
+            .filter_map(|path| absolute(path).ok())
+            .collect();
+
+        (!entries.is_empty()).then_some(Self { entries, current: 0 })
+    }
+
+    /// Add files to what is being browsed, and move the cursor to the first
+    /// of them.
+    ///
+    /// This is a hand-over from another instance arriving while the window is
+    /// already open. Files already in the list are not duplicated; the cursor
+    /// lands on the first of the new ones either way, because the person who
+    /// double-clicked it expects to be looking at it.
+    ///
+    /// `None` when nothing worth showing arrived.
+    pub fn extend(&mut self, paths: &[PathBuf]) -> Option<&Path> {
+        let arriving: Vec<PathBuf> = paths
+            .iter()
+            .filter(|path| image_source::is_supported(path))
+            .filter_map(|path| absolute(path).ok())
+            .collect();
+
+        let first = arriving.first()?.clone();
+        for path in arriving {
+            if !self.entries.contains(&path) {
+                self.entries.push(path);
+            }
+        }
+
+        self.current = self.entries.iter().position(|entry| entry == &first)?;
+        Some(self.current())
+    }
+
     /// The file the viewer is showing.
     pub fn current(&self) -> &Path {
         &self.entries[self.current]

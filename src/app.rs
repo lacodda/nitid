@@ -43,25 +43,69 @@ const DEFAULT_WINDOW: (u32, u32) = (1280, 800);
 const DISPLAY_WATCH_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Run the viewer, optionally opening a file straight away.
-pub fn run(path: Option<PathBuf>) -> Result<()> {
-    // A user event carries a finished background decode, or a change in the
-    // display, back to this thread.
-    let event_loop = EventLoop::<Decoded>::with_user_event().build().context("creating the event loop")?;
+pub fn run(paths: Vec<PathBuf>) -> Result<()> {
+    start(paths, None)
+}
+
+/// The same, for the process that owns the instance pipe.
+///
+/// The listener is handed over here rather than started earlier because it
+/// needs the event loop's proxy to wake the window, and that does not exist
+/// until the loop is built.
+#[cfg(windows)]
+pub fn run_owning(paths: Vec<PathBuf>, listener: crate::single::channel::Listener) -> Result<()> {
+    start(paths, Some(listener))
+}
+
+fn start(paths: Vec<PathBuf>, listener: Option<Listening>) -> Result<()> {
+    // A user event carries a finished background decode, a change in the
+    // display, or files handed over by another instance, back to this thread.
+    let event_loop = EventLoop::<Event>::with_user_event().build().context("creating the event loop")?;
     // Wait for input rather than spinning: nothing moves unless the user acts.
     event_loop.set_control_flow(ControlFlow::Wait);
+
+    // A second instance wakes this loop the same way a finished decode does,
+    // so nothing has to poll and a still image still costs no wakeups.
+    #[cfg(windows)]
+    if let Some(listener) = listener {
+        let proxy = event_loop.create_proxy();
+        listener.listen(move |paths| {
+            let _ = proxy.send_event(Event::Open(paths));
+        });
+    }
+    #[cfg(not(windows))]
+    let _ = listener;
 
     let proxy = event_loop.create_proxy();
     let loader = Loader::new(move |decoded| {
         // The loop may already be gone if the window was closed mid-decode;
         // there is nobody left to tell, and that is fine.
-        let _ = proxy.send_event(decoded);
+        let _ = proxy.send_event(Event::Decoded(Box::new(decoded)));
     });
 
-    let mut app = App::new(path, loader);
+    let mut app = App::new(paths, loader);
     event_loop.run_app(&mut app).context("running the viewer")?;
 
     app.into_result()
 }
+
+/// What reaches the event loop from elsewhere.
+enum Event {
+    /// A background decode finished.
+    ///
+    /// Boxed because a decode carries a whole image and a hand-over carries a
+    /// list of paths: without it every event in the queue would be the size of
+    /// the larger one.
+    Decoded(Box<Decoded>),
+    /// Another instance handed these files over rather than opening a window.
+    Open(Vec<PathBuf>),
+}
+
+/// The listener type, which only exists on Windows.
+#[cfg(windows)]
+type Listening = crate::single::channel::Listener;
+#[cfg(not(windows))]
+type Listening = std::convert::Infallible;
 
 /// What the viewer is showing, once a file has been opened.
 struct Shown {
@@ -83,8 +127,8 @@ struct Shown {
 }
 
 struct App {
-    /// The file to open once the window exists.
-    initial: Option<PathBuf>,
+    /// The files to open once the window exists.
+    initial: Vec<PathBuf>,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     folder: Option<Folder>,
@@ -105,7 +149,7 @@ struct App {
 }
 
 impl App {
-    fn new(initial: Option<PathBuf>, loader: Loader) -> Self {
+    fn new(initial: Vec<PathBuf>, loader: Loader) -> Self {
         Self {
             initial,
             window: None,
@@ -149,6 +193,93 @@ impl App {
         // enlarged.
         self.refresh();
         self.prefetch_neighbours();
+    }
+
+    /// Open what was named: one file browses its folder, several browse
+    /// themselves.
+    ///
+    /// The two cases differ in what the arrow keys then walk through, and the
+    /// difference is the point of multi-select — five chosen files should be
+    /// five, not the hundreds sitting beside them.
+    ///
+    /// The folder is set before the picture is shown because `prefetch` keeps
+    /// only the current file's neighbours in the cache: showing first would
+    /// have the prefetch of the *old* neighbourhood evict the image just put
+    /// on screen.
+    fn open(&mut self, paths: &[PathBuf]) {
+        let (folder, path) = match paths {
+            [] => return,
+            [single] => match Folder::open(single) {
+                Ok(folder) => {
+                    let path = folder.current().to_path_buf();
+                    (Some(folder), path)
+                }
+                Err(error) => {
+                    eprintln!("nitid: {error:#}");
+                    (None, single.clone())
+                }
+            },
+            several => match Folder::of_selection(several) {
+                Some(folder) => {
+                    let path = folder.current().to_path_buf();
+                    (Some(folder), path)
+                }
+                // Nothing in the selection is an image this build opens.
+                None => return,
+            },
+        };
+
+        if let Some(folder) = folder {
+            self.folder = Some(folder);
+        }
+        self.show(&path);
+    }
+
+    /// Files from another instance, which chose to hand them over rather than
+    /// open a second window.
+    ///
+    /// They join what is already being browsed rather than replacing it: the
+    /// window was showing something the user was looking at, and arriving
+    /// files are an addition to that, not a reason to forget it. The cursor
+    /// moves to the first of them, because that is the file that was just
+    /// double-clicked.
+    fn handed_over(&mut self, paths: Vec<PathBuf>) {
+        // A messenger is another process and its message is not trusted: only
+        // files that exist are opened, so a stray sender cannot make the
+        // window jump to an error for a file nobody chose.
+        let paths: Vec<PathBuf> = paths.into_iter().filter(|path| crate::single::openable(path)).collect();
+        if paths.is_empty() {
+            return;
+        }
+
+        match self.folder.as_mut() {
+            Some(folder) => match folder.extend(&paths) {
+                Some(path) => {
+                    let path = path.to_path_buf();
+                    self.show(&path);
+                }
+                None => return,
+            },
+            // Nothing open yet — the window was started bare.
+            None => self.open(&paths),
+        }
+
+        self.raise();
+    }
+
+    /// Bring the window to the user's attention.
+    ///
+    /// A hand-over happens because somebody double-clicked a file, and a
+    /// window that updates silently behind other windows looks like nothing
+    /// happened at all.
+    fn raise(&self) {
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        // Restoring first: the window may be minimised, in which case
+        // focusing alone leaves it in the taskbar.
+        window.set_minimized(false);
+        window.focus_window();
     }
 
     /// Put the embedded thumbnail on screen while the full decode runs.
@@ -594,9 +725,12 @@ fn worth_redrawing(drawn: u32, wanted: u32) -> bool {
     wanted > drawn * TOLERANCE || wanted < drawn / TOLERANCE
 }
 
-impl ApplicationHandler<Decoded> for App {
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: Decoded) {
-        self.decoded(event);
+impl ApplicationHandler<Event> for App {
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: Event) {
+        match event {
+            Event::Decoded(decoded) => self.decoded(*decoded),
+            Event::Open(paths) => self.handed_over(paths),
+        }
     }
 
     /// The animation tick. Runs after every batch of events, which is where
@@ -697,12 +831,9 @@ impl ApplicationHandler<Decoded> for App {
         self.window = Some(window.clone());
         self.renderer = Some(renderer);
 
-        if let Some(path) = self.initial.take() {
-            match Folder::open(&path) {
-                Ok(folder) => self.folder = Some(folder),
-                Err(error) => eprintln!("nitid: {error:#}"),
-            }
-            self.show(&path);
+        let initial = std::mem::take(&mut self.initial);
+        if !initial.is_empty() {
+            self.open(&initial);
         }
 
         window.set_visible(true);
@@ -782,13 +913,7 @@ impl ApplicationHandler<Decoded> for App {
 
             WindowEvent::CursorLeft { .. } => self.dragging = false,
 
-            WindowEvent::DroppedFile(path) => {
-                match Folder::open(&path) {
-                    Ok(folder) => self.folder = Some(folder),
-                    Err(error) => eprintln!("nitid: {error:#}"),
-                }
-                self.show(&path);
-            }
+            WindowEvent::DroppedFile(path) => self.open(&[path]),
 
             WindowEvent::RedrawRequested => self.redraw(event_loop),
 

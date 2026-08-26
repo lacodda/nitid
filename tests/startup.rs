@@ -205,6 +205,12 @@ fn measure(exe: &Path, image: &Path) -> Result<Measurement, String> {
         .arg(image)
         .env("NITID_STARTUP_REPORT", "1")
         .env("NITID_EXIT_AFTER_FIRST_FRAME", "1")
+        // What this gate measures is a *cold* start — window, graphics device,
+        // decode, from nothing. A viewer left open on the machine running the
+        // tests would take the file instead, and this run would report the
+        // time to hand a path down a pipe: a number with nothing to do with
+        // what a user waits for, and a gate that could never fail.
+        .env("NITID_NO_SINGLE_INSTANCE", "1")
         .output()
         .map_err(|error| format!("running the viewer: {error}"))?;
 

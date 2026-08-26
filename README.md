@@ -112,6 +112,26 @@ A screenshot of an HDR window is a standard-range image, so this line is the
 one way to check the answer rather than judge it. See
 [ADR 0013](docs/adr/0013-hdr-output-goes-through-scrgb.md).
 
+## One window
+
+Double-clicking a second image does not open a second viewer. The launch finds
+the one already running, hands its file over and exits, and the picture appears
+in the time it takes to decode — measured at 135 to 155 milliseconds against
+320 to 560 for a cold start, because the window and the graphics device are
+already there.
+
+The same answers multi-select. Windows starts one process per selected file, so
+five files means five launches; four of them hand their file to the first, and
+the five arrive as one list in one window. Arrow keys then walk that selection
+rather than the whole folder — the five you picked, not the hundreds beside
+them. Five files opened this way took 239 milliseconds altogether.
+
+The window that owns the channel is simply the first one to create it, which is
+a single atomic call, so two launches racing cannot both decide they are the
+window. Nothing polls: a hand-over wakes the event loop the same way a finished
+decode does, and a still image still costs no wakeups at all. See
+[ADR 0016](docs/adr/0016-one-window-elected-by-a-named-pipe.md).
+
 ## Large images
 
 A GPU texture has a maximum side — 16384 on current integrated hardware, and
@@ -218,16 +238,18 @@ has no size limit to hide behind.
 
 ## Status
 
-Early development — v0.15.0 is out. Startup, colour and format coverage hold:
+Early development — v0.16.0 is out. Startup, colour and format coverage hold:
 every modern still format opens, a phone's photographs included, every one of
 them reaches the screen without a wait, and the ones that animate play. The
 process that decodes the heavy formats runs with no network in either
 direction. HDR output works end to end: the surface follows the display's own
 state while the viewer is open, and 10- and 12-bit sources cross the whole
-pipeline at their own depth. **Size is no longer a limit either** — an image
+pipeline at their own depth. Size is no longer a limit either — an image
 past what a GPU texture can hold is drawn as tiles rather than crashing the
-viewer, so a stitched panorama opens like any other picture. Development runs
-in small versions, each one theme; the road to 1.0 is fixed:
+viewer. **And it is one window now**: opening a second image hands it to the
+viewer already running instead of starting another, which is both faster and
+what multi-select should have done all along. Development runs in small
+versions, each one theme; the road to 1.0 is fixed:
 
 | Version | What lands |
 | --- | --- |
@@ -248,7 +270,8 @@ in small versions, each one theme; the road to 1.0 is fixed:
 | ✅ v0.13.0 | HDR output on Windows, following the display as it changes |
 | ✅ v0.14.0 | A wider buffer: 10- and 12-bit sources through to the screen |
 | ✅ v0.15.0 | Gigapixel images via tiled rendering |
-| v0.16.0 – v0.35.0 | The everyday viewer: single instance, toolbar, EXIF panel, clipboard, file operations, culling, comparison, settings |
+| ✅ v0.16.0 | One window: a second launch hands its file over; multi-select arrives as one list |
+| v0.17.0 – v0.35.0 | The everyday viewer: toolbar, EXIF panel, clipboard, file operations, culling, comparison, settings |
 | v0.36.0 – v0.39.0 | Windows integration: context menu, installer, auto-update, thumbnails |
 | v0.40.0 – v0.41.0 | Documentation site, stabilisation |
 | v1.0.0 | Public release — the default viewer, nothing missing |
@@ -322,6 +345,8 @@ here as everywhere else on a scaled display.
 | `NITID_STARTUP_REPORT=1` | print the startup breakdown to stderr, and state the surface each time it is configured |
 | `NITID_EXIT_AFTER_FIRST_FRAME=1` | close as soon as a picture is on screen; used by the startup test |
 | `NITID_TILE_LIMIT=<pixels>` | lower the texture side an image is cut into tiles at, so the tiled path can be exercised on a small file; never raises it past what the device accepts |
+| `NITID_NO_SINGLE_INSTANCE=1` | open a window of this launch's own instead of handing the file to one already open; used by the startup gate, which measures a cold start |
+| `NITID_INSTANCE_ID=<text>` | share a window only with launches carrying the same value, so a test never talks to the viewer you have open |
 
 ## Design notes
 

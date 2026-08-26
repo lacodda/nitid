@@ -7,7 +7,7 @@ the very top: with the header it duplicates the title block, and with
 `--strip header` the new section lands *above* the title. Neither is right on
 its own, so this generates the section and inserts it after the header.
 
-Usage: python tools/changelog.py v0.15.0
+Usage: python tools/changelog.py v0.16.0
 """
 
 import subprocess
