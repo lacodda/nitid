@@ -2,6 +2,11 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.16.0] - 2026-08-26
+
+### Features
+- Hand a file to the window already open
+
 ## [0.15.0] - 2026-08-26
 
 ### Features
