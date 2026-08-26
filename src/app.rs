@@ -57,7 +57,10 @@ pub fn run_owning(paths: Vec<PathBuf>, listener: crate::single::channel::Listene
     start(paths, Some(listener))
 }
 
-fn start(paths: Vec<PathBuf>, listener: Option<Listening>) -> Result<()> {
+/// `listener` is `None` for a viewer that shares no window — either because
+/// nothing was claimed, or because this is not Windows, where the whole
+/// mechanism lives.
+fn start(paths: Vec<PathBuf>, #[cfg(windows)] listener: Option<crate::single::channel::Listener>, #[cfg(not(windows))] listener: Option<()>) -> Result<()> {
     // A user event carries a finished background decode, a change in the
     // display, or files handed over by another instance, back to this thread.
     let event_loop = EventLoop::<Event>::with_user_event().build().context("creating the event loop")?;
@@ -98,14 +101,9 @@ enum Event {
     /// the larger one.
     Decoded(Box<Decoded>),
     /// Another instance handed these files over rather than opening a window.
+    #[cfg(windows)]
     Open(Vec<PathBuf>),
 }
-
-/// The listener type, which only exists on Windows.
-#[cfg(windows)]
-type Listening = crate::single::channel::Listener;
-#[cfg(not(windows))]
-type Listening = std::convert::Infallible;
 
 /// What the viewer is showing, once a file has been opened.
 struct Shown {
@@ -238,11 +236,14 @@ impl App {
     /// Files from another instance, which chose to hand them over rather than
     /// open a second window.
     ///
+    /// Windows only, because the hand-over is: see `single`.
+    ///
     /// They join what is already being browsed rather than replacing it: the
     /// window was showing something the user was looking at, and arriving
     /// files are an addition to that, not a reason to forget it. The cursor
     /// moves to the first of them, because that is the file that was just
     /// double-clicked.
+    #[cfg(windows)]
     fn handed_over(&mut self, paths: Vec<PathBuf>) {
         // A messenger is another process and its message is not trusted: only
         // files that exist are opened, so a stray sender cannot make the
@@ -272,6 +273,7 @@ impl App {
     /// A hand-over happens because somebody double-clicked a file, and a
     /// window that updates silently behind other windows looks like nothing
     /// happened at all.
+    #[cfg(windows)]
     fn raise(&self) {
         let Some(window) = self.window.as_ref() else {
             return;
@@ -729,6 +731,7 @@ impl ApplicationHandler<Event> for App {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: Event) {
         match event {
             Event::Decoded(decoded) => self.decoded(*decoded),
+            #[cfg(windows)]
             Event::Open(paths) => self.handed_over(paths),
         }
     }

@@ -26,6 +26,10 @@ mod install;
 mod isobmff;
 mod loader;
 mod sandbox;
+// The whole mechanism is Windows shell behaviour: the pipe, the election, and
+// the multi-select it answers. There is nothing here for another platform to
+// compile.
+#[cfg(windows)]
 mod single;
 mod startup;
 mod tiles;
