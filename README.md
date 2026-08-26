@@ -218,15 +218,16 @@ has no size limit to hide behind.
 
 ## Status
 
-Early development — v0.14.0 is out. Startup, colour and format coverage hold:
+Early development — v0.15.0 is out. Startup, colour and format coverage hold:
 every modern still format opens, a phone's photographs included, every one of
 them reaches the screen without a wait, and the ones that animate play. The
 process that decodes the heavy formats runs with no network in either
-direction. **HDR output works end to end**: the surface follows the display's
-own state while the viewer is open, and 10- and 12-bit sources now cross the
-whole pipeline at their own depth — an HDR10 photograph opens bright, wide,
-and unnarrowed. Development runs in small versions, each one theme; the road
-to 1.0 is fixed:
+direction. HDR output works end to end: the surface follows the display's own
+state while the viewer is open, and 10- and 12-bit sources cross the whole
+pipeline at their own depth. **Size is no longer a limit either** — an image
+past what a GPU texture can hold is drawn as tiles rather than crashing the
+viewer, so a stitched panorama opens like any other picture. Development runs
+in small versions, each one theme; the road to 1.0 is fixed:
 
 | Version | What lands |
 | --- | --- |
