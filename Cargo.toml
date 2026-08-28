@@ -59,12 +59,8 @@ heif-oxide = "0.1.0"
 # whose C decoders were the reason for the sandbox does not need one — see
 # `docs/adr/0008-avif-decodes-with-rav1d.md`. It is the one dependency that
 # needs a build tool: NASM, without which the crate does not compile at all.
-#
-# `avif-parse` is held at 1.x deliberately: 2.x requires Rust 1.90 and would
-# raise the MSRV promised to anyone building from source, for a container
-# parser whose API is identical across the two.
 rav1d = "1.1.0"
-avif-parse = "1.4"
+avif-parse = "2.1"
 
 # Metadata
 # The interface: toolbar, status line, key sheet, toasts. `egui` draws into

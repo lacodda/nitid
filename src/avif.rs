@@ -65,6 +65,11 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded> {
     // the viewer down, so the parse is caught and reported as what it is: a
     // file that would not open. The decoder itself needs no such net; it
     // reports failures.
+    //
+    // Still true at 2.1.0, checked rather than assumed: the crate has a
+    // commit called "Depanic", but removing this net makes the malformed-file
+    // test fail on `assertion left == right failed: bad parser state bytes
+    // left` in its own `lib.rs`.
     let parsed = std::panic::catch_unwind(|| {
         let mut cursor = bytes;
         avif_parse::read_avif(&mut cursor).map_err(|error| format!("{error:?}"))
