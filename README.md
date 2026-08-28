@@ -72,17 +72,6 @@ profile costs a redraw rather than a reload.
 When the image and the display already agree, no conversion happens at all and
 the hardware does the sRGB decoding for free.
 
-## Building
-
-```
-cargo build --release
-```
-
-One tool beyond cargo is required: **NASM**, which `rav1d` needs to assemble
-the AV1 decoder's kernels — without it the build fails rather than falling back
-to something slower. `winget install NASM.NASM`, `scoop install nasm`, or your
-platform's package manager.
-
 ## HDR
 
 On a display in HDR mode, nitid outputs extended-range linear light — scRGB,
@@ -131,6 +120,38 @@ a single atomic call, so two launches racing cannot both decide they are the
 window. Nothing polls: a hand-over wakes the event loop the same way a finished
 decode does, and a still image still costs no wakeups at all. See
 [ADR 0016](docs/adr/0016-one-window-elected-by-a-named-pipe.md).
+
+## The interface
+
+The chrome is not there while you are looking at a photograph. There is a
+status line along the bottom saying what is on screen — the file, where it sits
+in the folder, its size, format, bit depth, what the colour transform is doing,
+and the zoom — and everything else appears when you reach for it.
+
+Move the pointer to the top of the window and a toolbar comes down: step
+through the folder, zoom, fit, actual size, full screen. It carries nothing the
+keyboard does not, and every button names its key. Press `?` for the full list.
+
+**It is not on the way to the picture.** Laying the interface out and building
+its place on the GPU costs around forty milliseconds, so the first frame is the
+photograph alone and the chrome arrives on the frame after — measured at 44 to
+86 milliseconds behind it, and held in that order by a test rather than by
+intent. The startup promise is unchanged: first pixels in 407 to 509
+milliseconds on the same file that took 489 to 528 before the interface
+existed.
+
+Drawing it correctly on an HDR surface took a detour worth knowing about. egui
+picks how to encode its output from whether the target is an sRGB format, and
+the extended-range surface is not one — drawn straight onto it, a mid grey came
+out 2.35 times too bright. So egui draws into an sRGB texture of its own and a
+shader of nitid's composites that onto the surface, asking the same question
+the image shader asks. The interface also stops at SDR white: a toolbar pushed
+into the display's headroom would compete with the photograph. See
+[ADR 0017](docs/adr/0017-the-interface-is-composited-through-our-own-shader.md).
+
+Nothing here polls. A frame is laid out only when it would look different from
+the last one, and the only thing that asks the loop to wake is a message while
+it is fading.
 
 ## Large images
 
@@ -238,7 +259,7 @@ has no size limit to hide behind.
 
 ## Status
 
-Early development — v0.16.0 is out. Startup, colour and format coverage hold:
+Early development — v0.17.0 is out. Startup, colour and format coverage hold:
 every modern still format opens, a phone's photographs included, every one of
 them reaches the screen without a wait, and the ones that animate play. The
 process that decodes the heavy formats runs with no network in either
@@ -248,7 +269,10 @@ pipeline at their own depth. Size is no longer a limit either — an image
 past what a GPU texture can hold is drawn as tiles rather than crashing the
 viewer. **And it is one window now**: opening a second image hands it to the
 viewer already running instead of starting another, which is both faster and
-what multi-select should have done all along. Development runs in small
+what multi-select should have done all along. **And it has an interface now**:
+a status line saying what is on screen, a toolbar that comes down when the
+pointer reaches for it, and a key sheet — none of it in front of the
+photograph. Development runs in small
 versions, each one theme; the road to 1.0 is fixed:
 
 | Version | What lands |
@@ -271,7 +295,8 @@ versions, each one theme; the road to 1.0 is fixed:
 | ✅ v0.14.0 | A wider buffer: 10- and 12-bit sources through to the screen |
 | ✅ v0.15.0 | Gigapixel images via tiled rendering |
 | ✅ v0.16.0 | One window: a second launch hands its file over; multi-select arrives as one list |
-| v0.17.0 – v0.35.0 | The everyday viewer: toolbar, EXIF panel, clipboard, file operations, culling, comparison, settings |
+| ✅ v0.17.0 | The interface: status line, a toolbar that appears on approach, key sheet, messages |
+| v0.18.0 – v0.35.0 | The everyday viewer: EXIF panel, clipboard, file operations, culling, comparison, settings |
 | v0.36.0 – v0.39.0 | Windows integration: context menu, installer, auto-update, thumbnails |
 | v0.40.0 – v0.41.0 | Documentation site, stabilisation |
 | v1.0.0 | Public release — the default viewer, nothing missing |
@@ -283,11 +308,18 @@ is the gallery: grid, folders, filters, timeline, duplicates.
 ## Building
 
 ```
+cargo build --release
 cargo run --release
-cargo fmt --check && cargo clippy -- -D warnings && cargo test
+cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 ```
 
-Requires Rust 1.89 or newer.
+Requires Rust 1.95 or newer — the version `egui-wgpu` needs, and the first that
+builds against wgpu 30.
+
+One tool beyond cargo is required: **NASM**, which `rav1d` needs to assemble
+the AV1 decoder's kernels — without it the build fails rather than falling back
+to something slower. `winget install NASM.NASM`, `scoop install nasm`, or your
+platform's package manager.
 
 ## Installing
 
