@@ -129,8 +129,9 @@ in the folder, its size, format, bit depth, what the colour transform is doing,
 and the zoom — and everything else appears when you reach for it.
 
 Move the pointer to the top of the window and a toolbar comes down: step
-through the folder, zoom, fit, actual size, full screen. It carries nothing the
-keyboard does not, and every button names its key. Press `?` for the full list.
+through the folder, zoom, fit, actual size, turn, the zoom lock, the backdrop,
+full screen. It carries nothing the keyboard does not, and every button names
+its key. Press `?` for the full list.
 
 **It is not on the way to the picture.** Laying the interface out and building
 its place on the GPU costs around forty milliseconds, so the first frame is the
@@ -152,6 +153,35 @@ into the display's headroom would compete with the photograph. See
 Nothing here polls. A frame is laid out only when it would look different from
 the last one, and the only thing that asks the loop to wake is a message while
 it is fading.
+
+## Controlling the view
+
+Three things you can do to a picture without touching the file.
+
+**Hold the framing across a step** with `L`. By default every image is framed
+for itself, which is what a folder of unrelated pictures wants. Locked, the
+arrow keys become a way to compare a series: each frame arrives at the same
+magnification over the same part of the picture, so what moves between them is
+the only thing that moves. The place is held as a fraction rather than as
+pixels, so a neighbour of a different size shows the corresponding part of
+itself instead of drifting.
+
+**Turn the picture** with `R`, or the other way with `Shift+R`. It is a viewing
+transform: the file is untouched, and stepping to another image shows that one
+as its own metadata asks. Rotating the file itself is a later version. The turn
+combines with whatever the file already asks for by multiplying their matrices,
+in an order that was measured rather than chosen — the two candidate orders
+agree on every rotation and differ on every mirror, so a table written by
+looking at photographs would be wrong in exactly the cases photographs do not
+show. See [ADR 0018](docs/adr/0018-orientation-composes-by-matrix-multiplication.md).
+
+**Choose what shows through transparency** with `B`: the viewer's own dark
+scene, a checkerboard, black, or white. Judging a cut-out against one backdrop
+is judging it against one background — a logo bound for a white page has to be
+seen on white, and a checkerboard is how you tell "transparent" from "a flat
+grey that happens to match the scene". The checker is measured in screen
+pixels, so it stays the same size at any zoom rather than reading as part of
+the picture.
 
 ## Large images
 
@@ -259,7 +289,7 @@ has no size limit to hide behind.
 
 ## Status
 
-Early development — v0.17.0 is out. Startup, colour and format coverage hold:
+Early development — v0.18.0 is out. Startup, colour and format coverage hold:
 every modern still format opens, a phone's photographs included, every one of
 them reaches the screen without a wait, and the ones that animate play. The
 process that decodes the heavy formats runs with no network in either
@@ -272,7 +302,9 @@ viewer already running instead of starting another, which is both faster and
 what multi-select should have done all along. **And it has an interface now**:
 a status line saying what is on screen, a toolbar that comes down when the
 pointer reaches for it, and a key sheet — none of it in front of the
-photograph. Development runs in small
+photograph. The framing can be held across a step for comparing a series, the
+picture turned, and the backdrop behind transparency chosen. Development runs
+in small
 versions, each one theme; the road to 1.0 is fixed:
 
 | Version | What lands |
@@ -296,7 +328,8 @@ versions, each one theme; the road to 1.0 is fixed:
 | ✅ v0.15.0 | Gigapixel images via tiled rendering |
 | ✅ v0.16.0 | One window: a second launch hands its file over; multi-select arrives as one list |
 | ✅ v0.17.0 | The interface: status line, a toolbar that appears on approach, key sheet, messages |
-| v0.18.0 – v0.35.0 | The everyday viewer: EXIF panel, clipboard, file operations, culling, comparison, settings |
+| ✅ v0.18.0 | Controlling the view: zoom lock across a step, viewing rotation, backdrop for transparency |
+| v0.19.0 – v0.35.0 | The everyday viewer: EXIF panel, clipboard, file operations, culling, comparison, settings |
 | v0.36.0 – v0.39.0 | Windows integration: context menu, installer, auto-update, thumbnails |
 | v0.40.0 – v0.41.0 | Documentation site, stabilisation |
 | v1.0.0 | Public release — the default viewer, nothing missing |
