@@ -2,6 +2,22 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.17.0] - 2026-08-28
+
+### Breaking Changes
+- The minimum supported Rust version is now 1.95, raised from 1.89 by
+  `egui-wgpu` 0.36 - the first release built against wgpu 30. Building with
+  an older toolchain fails to resolve.
+
+### Documentation
+- Describe the interface, and fix what had gone stale
+
+### Features
+- A status line, a toolbar on approach, and a key sheet
+
+### Performance
+- Let the picture reach the screen before the chrome
+
 ## [0.16.0] - 2026-08-26
 
 ### Features
