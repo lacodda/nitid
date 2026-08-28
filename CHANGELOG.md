@@ -2,6 +2,19 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.18.0] - 2026-08-28
+
+### Documentation
+- Describe the view controls, and why orientation composes as it does
+
+### Bug Fixes
+- The toolbar buttons introduced in 0.17.0 did nothing. The interface was
+  laid out only when its own status changed, and a press changes none of
+  it, so the frame carrying the press was never laid out.
+
+### Features
+- A zoom lock, a viewing rotation, and a backdrop for transparency
+
 ## [0.17.0] - 2026-08-28
 
 ### Breaking Changes
