@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.19.0] - 2026-08-28
+
+### Documentation
+- Describe the Info panel
+
+### Features
+- A panel saying what the file says about itself
+
 ## [0.18.0] - 2026-08-28
 
 ### Documentation
