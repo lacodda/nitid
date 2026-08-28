@@ -92,6 +92,77 @@ fn a_picture_reaches_the_screen_quickly() {
     );
 }
 
+/// The interface must not stand between the process starting and the picture
+/// appearing — and it must arrive right after it.
+///
+/// Both halves are needed. Measured, laying the chrome out and building its
+/// pipeline costs around forty milliseconds, and putting that in front of the
+/// photograph spends the promise the product is built on. But an interface
+/// that is merely *late* would pass a timing check while never being drawn at
+/// all, so this also waits for the frame that carries it.
+#[test]
+fn the_interface_arrives_after_the_picture_and_never_before_it() {
+    let Some(exe) = viewer_binary() else {
+        eprintln!("skipping: the viewer binary was not found next to the test");
+        return;
+    };
+
+    let dir = tempfile::tempdir().expect("creating a temporary folder");
+    let image = photo_sized_image(dir.path());
+
+    let output = Command::new(&exe)
+        .arg(&image)
+        .env("NITID_STARTUP_REPORT", "1")
+        // Wait one frame longer than the other gates: for the chrome.
+        .env("NITID_EXIT_AFTER_FIRST_FRAME", "interface")
+        .env("NITID_NO_SINGLE_INSTANCE", "1")
+        .output()
+        .expect("running the viewer");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for line in stderr.lines().filter(|line| line.contains(" at ") || line.contains(" in ")) {
+        eprintln!("  {}", line.trim());
+    }
+
+    let Some(picture) = reported(&stderr, "nitid: first pixels in ") else {
+        eprintln!("skipping: the viewer could not open a window here");
+        return;
+    };
+
+    let interface = reported(&stderr, "nitid: interface on screen at ").expect(
+        "the interface never reached the screen. It is drawn on the frame after the          picture, so either that frame is not being asked for, or nothing is being          laid out into it.",
+    );
+
+    // The order is the whole point: the picture first, the chrome after.
+    assert!(
+        interface > picture,
+        "the interface was on screen at {interface:.1} ms and the picture at {picture:.1} ms —          the chrome is being drawn into the first frame again, which puts its cost          in front of the promise."
+    );
+
+    // And the first frame is genuinely free of it: the interface milestone
+    // that marks its layout must come after the first pixels were reported.
+    let laid_out = stderr
+        .lines()
+        .position(|line| line.contains("interface laid out"))
+        .expect("the interface was never laid out");
+    let pixels = stderr
+        .lines()
+        .position(|line| line.contains("first pixels in"))
+        .expect("the first pixels were never reported");
+    assert!(
+        laid_out > pixels,
+        "the interface was laid out before the picture reached the screen, so its          cost is on the startup path after all."
+    );
+}
+
+/// Read a millisecond figure from a reported line.
+fn reported(stderr: &str, prefix: &str) -> Option<f64> {
+    stderr
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(prefix))
+        .and_then(|rest| rest.trim_end_matches(" ms").parse::<f64>().ok())
+}
+
 /// The same gate for HEIC, the format a phone photographs in.
 ///
 /// Held separately because the mechanism is different: there is no quick frame

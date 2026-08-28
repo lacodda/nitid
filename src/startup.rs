@@ -19,12 +19,41 @@ static FIRST_PIXELS: OnceLock<Duration> = OnceLock::new();
 /// The environment variable that turns the report on.
 const REPORT_VAR: &str = "NITID_STARTUP_REPORT";
 
+/// The environment variable that closes the viewer once it has drawn.
+const EXIT_VAR: &str = "NITID_EXIT_AFTER_FIRST_FRAME";
+
 /// Whether the viewer should close as soon as it has shown a picture.
 ///
 /// Only the startup gate sets this: it needs the process to finish so it can
 /// read the measurement, and a window waiting for a human would hang it.
+///
+/// Set to `interface` it waits one frame longer, for the chrome that follows
+/// the picture. The gate needs both: that the interface is *not* on the way to
+/// the first pixels, and that it arrives immediately after — and a viewer that
+/// quit on the first frame could never show the second half.
 pub fn exit_after_first_frame() -> bool {
-    std::env::var_os("NITID_EXIT_AFTER_FIRST_FRAME").is_some_and(|value| value != "0")
+    matches!(exit_when(), Some(ExitWhen::FirstFrame))
+}
+
+/// Whether the viewer should close once the interface has been drawn over the
+/// picture.
+pub fn exit_after_interface() -> bool {
+    matches!(exit_when(), Some(ExitWhen::Interface))
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ExitWhen {
+    FirstFrame,
+    Interface,
+}
+
+fn exit_when() -> Option<ExitWhen> {
+    let value = std::env::var_os(EXIT_VAR)?;
+    match value.to_str() {
+        Some("0") => None,
+        Some("interface") => Some(ExitWhen::Interface),
+        _ => Some(ExitWhen::FirstFrame),
+    }
 }
 
 /// The prefix of the reported line, so a test can find it unambiguously.
@@ -90,6 +119,22 @@ pub fn first_pixels() {
             FIRST_PIXELS.get().copied().unwrap_or_default().as_secs_f64() * 1000.0
         );
     }
+}
+
+/// The prefix of the line saying the interface reached the screen.
+pub const INTERFACE_PREFIX: &str = "nitid: interface on screen at ";
+
+/// Record that a frame carrying the chrome has reached the screen.
+///
+/// Reported unconditionally rather than under the report flag, because the
+/// gate that reads it is asking about order, not about speed: it needs to see
+/// that this happened *after* the first pixels, on a run where the report may
+/// or may not be on.
+pub fn interface_drawn() {
+    let Some(started) = STARTED.get() else {
+        return;
+    };
+    eprintln!("{INTERFACE_PREFIX}{:.1} ms", started.elapsed().as_secs_f64() * 1000.0);
 }
 
 /// How long the first picture took to appear, once it has.
