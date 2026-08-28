@@ -38,6 +38,9 @@ struct Colour {
     // Whether the surface carries extended-range linear light, where a value
     // above 1.0 is brighter than SDR white rather than an overflow to clip.
     extended_range: u32,
+    // What shows through a transparent pixel: 0 the viewer's own dark scene,
+    // 1 a checkerboard, 2 black, 3 white. See `Backdrop` in `gpu.rs`.
+    backdrop: u32,
 }
 
 @group(0) @binding(0) var image_texture: texture_2d<f32>;
@@ -74,6 +77,40 @@ fn vs_main(@builtin(vertex_index) index: u32) -> VertexOutput {
     // whole image.
     out.uv = (oriented * 0.5 + 0.5) * placement.uv_scale + placement.uv_offset;
     return out;
+}
+
+// How wide one square of the checkerboard is, in physical pixels.
+//
+// Measured on screen rather than in the image, so the pattern stays the same
+// size at any zoom: a checker that scaled with the picture would read as part
+// of the picture, which is the one thing it must not do.
+const CHECKER_SIZE: f32 = 12.0;
+
+// What shows through a transparent pixel, as linear light.
+//
+// The scene stays dark by decision, so that is the default; the other three
+// exist because judging a cut-out against one backdrop is judging it against
+// one background, and a logo bound for a white page has to be seen on white.
+fn backdrop_at(position: vec2<f32>) -> vec3<f32> {
+    switch colour.backdrop {
+        // A checkerboard, in the two greys the convention uses, kept dark
+        // enough not to glare beside the viewer's own scene.
+        case 1u: {
+            let square = floor(position / CHECKER_SIZE);
+            let dark = (square.x + square.y) % 2.0 < 1.0;
+            // sRGB 0.20 and 0.28 as linear light.
+            return select(vec3<f32>(0.0331), vec3<f32>(0.0648), dark);
+        }
+        case 2u: {
+            return vec3<f32>(0.0);
+        }
+        case 3u: {
+            return vec3<f32>(1.0);
+        }
+        default: {
+            return vec3<f32>(0.09, 0.09, 0.10);
+        }
+    }
 }
 
 // Look one channel up in its sampled tone curve.
@@ -117,12 +154,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         rgb = colour.matrix * linear;
     }
 
-    // Alpha is composited against the neutral background so a transparent PNG
-    // shows the viewer's own backdrop rather than whatever is behind the
+    // Alpha is composited against the chosen backdrop so a transparent PNG
+    // shows something of the viewer's rather than whatever is behind the
     // window. It is stated as linear light, like everything else here, so the
     // same number means the same grey on every surface — the clear colour in
     // `gpu.rs` is the same value for the same reason.
-    let background = vec3<f32>(0.09, 0.09, 0.10);
+    let background = backdrop_at(in.clip_position.xy);
 
     // An extended-range linear surface wants the light as it is: 1.0 is SDR
     // white and anything above drives the display's headroom. Clamping here

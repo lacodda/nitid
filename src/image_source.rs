@@ -123,6 +123,72 @@ impl Orientation {
     pub fn swaps_axes(self) -> bool {
         matches!(self, Self::Transpose | Self::Rotate90 | Self::Transverse | Self::Rotate270)
     }
+
+    /// This orientation as the 2x2 matrix the renderer uses.
+    ///
+    /// The renderer maps quad corners to texture space, so this is the
+    /// *inverse* of what the picture visibly does. Kept here rather than only
+    /// in `gpu.rs` because composing two orientations is matrix multiplication
+    /// and nothing else — a hand-written table of "what follows what" is eight
+    /// chances to get a sign wrong, which is exactly how the tile orientation
+    /// went wrong in v0.15.0.
+    pub const fn matrix(self) -> [[i8; 2]; 2] {
+        match self {
+            Self::Normal => [[1, 0], [0, 1]],
+            Self::FlipHorizontal => [[-1, 0], [0, 1]],
+            Self::Rotate180 => [[-1, 0], [0, -1]],
+            Self::FlipVertical => [[1, 0], [0, -1]],
+            Self::Transpose => [[0, 1], [1, 0]],
+            Self::Rotate90 => [[0, 1], [-1, 0]],
+            Self::Transverse => [[0, -1], [-1, 0]],
+            Self::Rotate270 => [[0, -1], [1, 0]],
+        }
+    }
+
+    /// The orientation whose matrix is `matrix`, if it is one of the eight.
+    fn from_matrix(matrix: [[i8; 2]; 2]) -> Option<Self> {
+        [
+            Self::Normal,
+            Self::FlipHorizontal,
+            Self::Rotate180,
+            Self::FlipVertical,
+            Self::Transpose,
+            Self::Rotate90,
+            Self::Transverse,
+            Self::Rotate270,
+        ]
+        .into_iter()
+        .find(|candidate| candidate.matrix() == matrix)
+    }
+
+    /// This orientation followed by `then`, as one orientation.
+    ///
+    /// Composition is matrix multiplication and nothing else. The order is
+    /// `self * then`, derived rather than guessed: tracking where a texel
+    /// lands on screen through a quarter turn picks this order and not the
+    /// other, and the two differ precisely on the mirrored orientations —
+    /// where a plausible-looking table would be wrong and no ordinary
+    /// photograph would reveal it.
+    pub fn then(self, then: Self) -> Self {
+        let (a, b) = (self.matrix(), then.matrix());
+        let product = [
+            [a[0][0] * b[0][0] + a[0][1] * b[1][0], a[0][0] * b[0][1] + a[0][1] * b[1][1]],
+            [a[1][0] * b[0][0] + a[1][1] * b[1][0], a[1][0] * b[0][1] + a[1][1] * b[1][1]],
+        ];
+        // The eight orientations are a group under multiplication, so the
+        // product is always one of them; the fallback is unreachable and is
+        // held down by a test rather than left to trust.
+        Self::from_matrix(product).unwrap_or(self)
+    }
+
+    /// Turn the picture a quarter turn, as the person looking at it sees it.
+    ///
+    /// This is a viewing transform: the file is not touched, and stepping to
+    /// another image starts from whatever that file asks for. Rotating the
+    /// file itself is a different feature and a later version.
+    pub fn turned(self, clockwise: bool) -> Self {
+        self.then(if clockwise { Self::Rotate90 } else { Self::Rotate270 })
+    }
 }
 
 /// Whether an image is the real thing or the placeholder shown while it loads.
@@ -1351,6 +1417,110 @@ mod tests {
         assert!(Orientation::Rotate90.swaps_axes());
         assert!(Orientation::Rotate270.swaps_axes());
         assert!(Orientation::Transpose.swaps_axes());
+    }
+
+    /// Every orientation, so a property can be checked against all of them
+    /// rather than against the two or three a test author thinks of.
+    const ALL: [Orientation; 8] = [
+        Orientation::Normal,
+        Orientation::FlipHorizontal,
+        Orientation::Rotate180,
+        Orientation::FlipVertical,
+        Orientation::Transpose,
+        Orientation::Rotate90,
+        Orientation::Transverse,
+        Orientation::Rotate270,
+    ];
+
+    /// The eight orientations are closed under composition — which is what
+    /// lets `then` return one of them rather than needing a fallback. The
+    /// `unwrap_or` in it is unreachable, and this is what says so.
+    #[test]
+    fn composing_any_two_orientations_gives_another_one() {
+        for first in ALL {
+            for second in ALL {
+                let product = first.then(second);
+                // `from_matrix` found it, which is only true if the product
+                // really is one of the eight rather than the fallback.
+                assert_eq!(
+                    product.matrix(),
+                    matrix_product(first.matrix(), second.matrix()),
+                    "{first:?} then {second:?} fell back instead of composing",
+                );
+            }
+        }
+    }
+
+    fn matrix_product(a: [[i8; 2]; 2], b: [[i8; 2]; 2]) -> [[i8; 2]; 2] {
+        [
+            [a[0][0] * b[0][0] + a[0][1] * b[1][0], a[0][0] * b[0][1] + a[0][1] * b[1][1]],
+            [a[1][0] * b[0][0] + a[1][1] * b[1][0], a[1][0] * b[0][1] + a[1][1] * b[1][1]],
+        ]
+    }
+
+    /// Four quarter turns is where you started, from any orientation. This is
+    /// the property that would catch a sign error in the composition, which is
+    /// how the equivalent geometry went wrong in v0.15.0.
+    #[test]
+    fn four_quarter_turns_return_to_the_start() {
+        for start in ALL {
+            for clockwise in [true, false] {
+                let mut turned = start;
+                for _ in 0..4 {
+                    turned = turned.turned(clockwise);
+                }
+                assert_eq!(turned, start, "{start:?} did not come back after four turns");
+            }
+        }
+    }
+
+    /// Turning one way then the other is turning not at all.
+    #[test]
+    fn a_turn_and_its_opposite_cancel() {
+        for start in ALL {
+            assert_eq!(start.turned(true).turned(false), start, "{start:?} did not come back");
+            assert_eq!(start.turned(false).turned(true), start, "{start:?} did not come back");
+        }
+    }
+
+    /// A quarter turn exchanges the axes; two of them do not. Stated as a
+    /// property so it holds for the mirrored orientations too, where the
+    /// intuition from a photograph runs out.
+    #[test]
+    fn a_quarter_turn_exchanges_the_axes_and_a_half_turn_does_not() {
+        for start in ALL {
+            assert_ne!(
+                start.turned(true).swaps_axes(),
+                start.swaps_axes(),
+                "a quarter turn of {start:?} kept the same axes"
+            );
+            assert_eq!(
+                start.turned(true).turned(true).swaps_axes(),
+                start.swaps_axes(),
+                "a half turn of {start:?} exchanged the axes",
+            );
+        }
+    }
+
+    /// The turn a user asks for lands where they can see it: turning an
+    /// upright picture clockwise is `Rotate90`, and turning it the other way
+    /// is `Rotate270`. The mirrored cases are held by the properties above,
+    /// which is where a hand-written table would have gone wrong.
+    #[test]
+    fn turning_an_upright_picture_goes_the_way_it_says() {
+        assert_eq!(Orientation::Normal.turned(true), Orientation::Rotate90);
+        assert_eq!(Orientation::Normal.turned(false), Orientation::Rotate270);
+        assert_eq!(Orientation::Rotate90.turned(true), Orientation::Rotate180);
+    }
+
+    /// Composing with `Normal` changes nothing — the case the viewer is in
+    /// whenever the user has not turned anything, which is nearly always.
+    #[test]
+    fn composing_with_normal_is_the_identity() {
+        for start in ALL {
+            assert_eq!(start.then(Orientation::Normal), start);
+            assert_eq!(Orientation::Normal.then(start), start);
+        }
     }
 
     #[test]

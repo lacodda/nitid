@@ -93,6 +93,63 @@ impl View {
         (self.image.0 * self.scale, self.image.1 * self.scale)
     }
 
+    /// Carry this framing onto a different picture, for the zoom lock.
+    ///
+    /// Unlike [`rebase`](Self::rebase), the two images are not the same
+    /// picture: they are neighbours in a folder, and may be any size. What
+    /// carries over is what the user set — the zoom as they read it, and where
+    /// in the frame they were looking, as a fraction of the image.
+    ///
+    /// The fraction is what makes a series comparable. Holding the pixel
+    /// offset instead would drift across images of different sizes; holding
+    /// the fraction puts the same part of each picture under the same part of
+    /// the window, which is the whole point of stepping through frames of one
+    /// scene.
+    ///
+    /// `Fit` is not carried: it is the default rather than a choice, and each
+    /// image answers it for itself. `Actual` is a choice — "show me this
+    /// pixel for pixel" — so it carries, which is how a series is walked at
+    /// 100% to compare sharpness.
+    pub fn carry_onto(&self, image: (u32, u32), window: (u32, u32), scale_factor: f32) -> Self {
+        let mut next = Self::new(image, window, scale_factor);
+        match self.mode {
+            FitMode::Fit => return next,
+            FitMode::Actual => {
+                next.set_actual();
+                return next;
+            }
+            FitMode::Free => {}
+        }
+
+        // The zoom the user reads, restated in the new view's physical terms.
+        next.scale = (self.scale() * next.scale_factor).clamp(MIN_SCALE, MAX_SCALE);
+        next.mode = FitMode::Free;
+
+        // Where they were looking, as a fraction of the image, mapped onto
+        // whatever the new image's overhang allows.
+        let fraction = self.looking_at();
+        let (width, height) = next.scaled_size();
+        let limit_x = ((width - next.window.0) / 2.0).max(0.0);
+        let limit_y = ((height - next.window.1) / 2.0).max(0.0);
+        next.offset = (fraction.0 * limit_x, fraction.1 * limit_y);
+        next.clamp_offset();
+        next
+    }
+
+    /// Where in the frame the user is looking, as a fraction of the pan range.
+    ///
+    /// Zero is centred; ±1 is against an edge. Expressed this way it means the
+    /// same thing on an image of any size, which is what the zoom lock needs.
+    fn looking_at(&self) -> (f32, f32) {
+        let (width, height) = self.scaled_size();
+        let limit_x = ((width - self.window.0) / 2.0).max(0.0);
+        let limit_y = ((height - self.window.1) / 2.0).max(0.0);
+        (
+            if limit_x > 0.0 { self.offset.0 / limit_x } else { 0.0 },
+            if limit_y > 0.0 { self.offset.1 / limit_y } else { 0.0 },
+        )
+    }
+
     /// Swap in an image of the same picture at a different resolution,
     /// keeping the framing the user is looking at.
     ///
@@ -366,6 +423,88 @@ mod tests {
         view.resize((2000, 2000), 2.0);
         assert!(about(view.scale(), 1.0));
         assert!(about(view.physical_scale(), 2.0));
+    }
+
+    /// The zoom lock's whole purpose: step through frames of one scene and
+    /// each arrives at the same magnification over the same part of the
+    /// picture, so the difference between them is what moves.
+    #[test]
+    fn the_lock_carries_the_zoom_and_the_place_onto_the_next_image() {
+        let mut first = view((4000, 3000), (1000, 800));
+        first.set_actual();
+        // Look at the top-left corner rather than the middle.
+        first.pan((10_000.0, 10_000.0));
+        let zoom = first.scale();
+        let place = first.looking_at();
+
+        // The next frame of the same shoot: identical dimensions.
+        let next = first.carry_onto((4000, 3000), (1000, 800), 1.0);
+
+        assert!(about(next.scale(), zoom), "the zoom changed: {} vs {zoom}", next.scale());
+        assert!(about(next.looking_at().0, place.0), "the horizontal place moved");
+        assert!(about(next.looking_at().1, place.1), "the vertical place moved");
+        // Same size, same framing: the offsets themselves match too.
+        assert!(about(next.offset().0, first.offset().0));
+        assert!(about(next.offset().1, first.offset().1));
+    }
+
+    /// The place is held as a fraction, so a neighbour of another size shows
+    /// the corresponding part of itself rather than drifting by pixels.
+    #[test]
+    fn the_lock_holds_the_same_part_of_a_differently_sized_neighbour() {
+        let mut first = view((4000, 3000), (1000, 800));
+        first.zoom_to_at(2.0, (500.0, 400.0));
+        first.pan((10_000.0, 0.0));
+        assert!(about(first.looking_at().0, 1.0), "the fixture is not against the edge");
+
+        // Half the size, same aspect: still against the same edge.
+        let next = first.carry_onto((2000, 1500), (1000, 800), 1.0);
+        assert!(about(next.scale(), first.scale()), "the zoom did not carry");
+        assert!(about(next.looking_at().0, 1.0), "the place did not carry onto a smaller neighbour");
+    }
+
+    /// `Fit` is the default rather than a choice, so it is not carried: each
+    /// image is fitted for itself. `Actual` *is* a choice — "show me this
+    /// pixel for pixel" — and carries, which is how a series is walked at
+    /// 100% to compare sharpness.
+    #[test]
+    fn the_lock_carries_a_choice_but_not_the_default() {
+        let fitted = view((4000, 3000), (1000, 800));
+        assert_eq!(fitted.mode(), FitMode::Fit);
+        let next = fitted.carry_onto((800, 600), (1000, 800), 1.0);
+        assert_eq!(next.mode(), FitMode::Fit, "a fitted framing was carried instead of recomputed");
+        // A small neighbour is shown at 100%, not shrunk to the big one's fit.
+        assert!(about(next.scale(), 1.0), "the small neighbour came out at {}", next.scale());
+
+        let mut actual = view((4000, 3000), (1000, 800));
+        actual.set_actual();
+        let next = actual.carry_onto((800, 600), (1000, 800), 1.0);
+        assert_eq!(next.mode(), FitMode::Actual, "100% did not carry to the next image");
+        assert!(about(next.scale(), 1.0));
+    }
+
+    /// A neighbour that fits in the window has nothing to pan, so the carried
+    /// place has nowhere to go — and must not push it off centre.
+    #[test]
+    fn the_lock_does_not_shift_a_neighbour_that_fits() {
+        let mut first = view((4000, 3000), (1000, 800));
+        first.set_actual();
+        first.pan((10_000.0, 10_000.0));
+
+        let next = first.carry_onto((200, 150), (1000, 800), 1.0);
+        assert_eq!(next.offset(), (0.0, 0.0), "a neighbour smaller than the window was pushed off centre");
+    }
+
+    /// The zoom the user reads is what carries, not the physical scale: the
+    /// same series stepped through on a 200% display must not double.
+    #[test]
+    fn the_lock_carries_the_zoom_the_user_reads() {
+        let mut first = View::new((4000, 3000), (1000, 800), 1.0);
+        first.zoom_to_at(2.0, (500.0, 400.0));
+
+        let next = first.carry_onto((4000, 3000), (2000, 1600), 2.0);
+        assert!(about(next.scale(), 2.0), "the zoom read {} on the scaled display", next.scale());
+        assert!(about(next.physical_scale(), 4.0), "the physical scale did not follow the display");
     }
 
     #[test]

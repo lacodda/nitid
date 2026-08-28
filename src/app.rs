@@ -110,6 +110,17 @@ enum Event {
 
 /// What the viewer is showing, once a file has been opened.
 struct Shown {
+    /// A quarter turn the user asked for, on top of what the file asks for.
+    ///
+    /// A viewing transform: the file is untouched, and this goes away with the
+    /// picture it belongs to — the next image is shown as its own metadata
+    /// asks. Writing a rotation back to the file is a later version.
+    turn: Orientation,
+    /// Which file this is. Kept so a thumbnail can be told from the picture
+    /// it stands in for: `Fidelity` alone says "this is a thumbnail", not
+    /// "of what", and a step to the next file arrives as a thumbnail while
+    /// the previous file is still what `shown` holds.
+    path: PathBuf,
     orientation: Orientation,
     view: View,
     /// Whether this is the real image or the thumbnail standing in for it.
@@ -173,6 +184,19 @@ struct App {
     painted: Option<PaintedFrame>,
     /// When a toast next needs a frame, while one is fading.
     toast_deadline: Option<Instant>,
+    /// Whether egui asked for a frame of its own.
+    ///
+    /// Set from what `on_window_event` reports. Without it the interface is
+    /// laid out only when the *status* changes, and a press on a button
+    /// changes no status: the toolbar drew and did nothing, which is how it
+    /// shipped in v0.17.0 and what a hands-on run found.
+    wants_frame: bool,
+    /// Whether the framing carries from one image to the next.
+    ///
+    /// Off by default: a folder of unrelated pictures wants each one framed
+    /// for itself. On, it turns the arrow keys into a way to compare a series
+    /// — the same magnification over the same part of each frame.
+    zoom_locked: bool,
     /// Whether a frame with a picture in it has reached the screen yet.
     ///
     /// The interface waits for that frame. Laying it out and building its
@@ -211,6 +235,8 @@ impl App {
             overlay: None,
             painted: None,
             toast_deadline: None,
+            wants_frame: false,
+            zoom_locked: false,
             shown_once: false,
         }
     }
@@ -231,7 +257,7 @@ impl App {
         match self.loader.request(path) {
             // Prefetched: the neighbour the arrow key asked for is already in
             // memory, so it goes up in this frame with no intermediate.
-            Request::Ready(image) => self.upload(&image),
+            Request::Ready(image) => self.upload(path, &image),
             Request::Pending => self.show_quick_frame(path),
         }
 
@@ -347,11 +373,11 @@ impl App {
             return;
         };
 
-        self.upload(&thumbnail);
+        self.upload(path, &thumbnail);
         startup::milestone("thumbnail up");
     }
 
-    fn upload(&mut self, loaded: &LoadedImage) {
+    fn upload(&mut self, path: &Path, loaded: &LoadedImage) {
         let scale_factor = self.scale_factor();
         let Some(renderer) = self.renderer.as_mut() else {
             return;
@@ -364,19 +390,26 @@ impl App {
         });
         renderer.set_image(&loaded.image, &transform);
 
-        // Replacing a thumbnail with the image it stood in for must not move
-        // the picture: the framing carries over, rebased onto the resolution
-        // that just arrived, so the swap reads as the picture sharpening.
-        let view = match &self.shown {
-            Some(shown) if shown.fidelity == Fidelity::Thumbnail => {
-                let mut view = shown.view;
-                view.rebase(loaded.display_size());
-                view
-            }
-            _ => View::new(loaded.display_size(), renderer.size(), scale_factor),
-        };
+        let view = frame_arriving(
+            self.shown.as_ref().map(|shown| Previous {
+                view: shown.view,
+                fidelity: shown.fidelity,
+                same_file: shown.path == path,
+            }),
+            loaded.display_size(),
+            renderer.size(),
+            scale_factor,
+            self.zoom_locked,
+        );
 
         self.shown = Some(Shown {
+            // A turn belongs to the picture on screen. The full decode
+            // replacing its own thumbnail keeps it; a different file does not.
+            turn: match &self.shown {
+                Some(shown) if shown.path == path => shown.turn,
+                _ => Orientation::Normal,
+            },
+            path: path.to_path_buf(),
             orientation: loaded.orientation,
             view,
             fidelity: loaded.fidelity,
@@ -505,7 +538,7 @@ impl App {
         match result {
             Ok(image) => {
                 startup::milestone("full image up");
-                self.upload(&image);
+                self.upload(&path, &image);
                 // `refresh` rather than a redraw on its own: a vector image
                 // arrives drawn at its document size and has to be drawn again
                 // for the framing it is fitted into.
@@ -634,6 +667,37 @@ impl App {
                 "-" | "_" => self.zoom(-1.0),
                 "0" => self.reframe(Reframe::Fit),
                 "1" => self.reframe(Reframe::Actual),
+                // What shows through a transparent pixel. A cut-out judged
+                // against one backdrop is a cut-out judged against one
+                // background, which is how a halo reaches a customer.
+                "b" | "B" => {
+                    if let Some(renderer) = self.renderer.as_mut() {
+                        let next = renderer.backdrop().next();
+                        renderer.set_backdrop(next);
+                        self.interface.toast(
+                            match next.name() {
+                                Some(name) => format!("backdrop: {name}"),
+                                None => "backdrop: the viewer's own".to_string(),
+                            },
+                            Instant::now(),
+                        );
+                        self.request_redraw();
+                    }
+                }
+                // A quarter turn of the view. Shift for the other way, which
+                // arrives as the capital letter and needs no modifier state.
+                "r" => self.turn(true),
+                "R" => self.turn(false),
+                // Hold the framing across a step, for comparing a series
+                // frame by frame. Announced by a toast and shown in the
+                // status line: a mode with no sign of itself is a mode the
+                // user fights rather than uses.
+                "l" | "L" => {
+                    self.zoom_locked = !self.zoom_locked;
+                    self.interface
+                        .toast(if self.zoom_locked { "zoom locked" } else { "zoom unlocked" }, Instant::now());
+                    self.request_redraw();
+                }
                 // The chrome disappears by design, so the list of what the
                 // keys do has to be reachable from the keys themselves.
                 "?" => {
@@ -661,6 +725,31 @@ impl App {
             shown.view.zoom_at(notches, centre);
             self.refresh();
         }
+    }
+
+    /// Turn the picture on screen a quarter turn.
+    ///
+    /// The view is reframed afterwards because a turned image has swapped its
+    /// width and height: a landscape photograph fitted to the window is a
+    /// portrait one that no longer fits.
+    fn turn(&mut self, clockwise: bool) {
+        let Some(renderer) = self.renderer.as_ref() else {
+            return;
+        };
+        let window = renderer.size();
+        let scale_factor = self.scale_factor();
+        let Some(shown) = self.shown.as_mut() else {
+            return;
+        };
+
+        let before = shown.turn;
+        shown.turn = shown.turn.turned(clockwise);
+
+        if let Some(turned) = size_after_turn(shown.size, before, shown.turn) {
+            shown.size = turned;
+            shown.view = View::new(turned, window, scale_factor);
+        }
+        self.refresh();
     }
 
     fn reframe(&mut self, how: Reframe) {
@@ -779,6 +868,8 @@ impl App {
                 (frame, count, player.paused())
             }),
             hdr: self.renderer.as_ref().is_some_and(Renderer::is_hdr),
+            locked: self.zoom_locked,
+            backdrop: self.renderer.as_ref().and_then(|renderer| renderer.backdrop().name()),
         }
     }
 
@@ -802,9 +893,10 @@ impl App {
         // A toast fades, so while one is up every frame differs from the last.
         self.toast_deadline = self.interface.tick(now);
         let fading = self.toast_deadline.is_some();
-        if !self.interface.changed(&status) && !fading && self.painted.is_some() {
+        if !worth_laying_out(self.interface.changed(&status), fading, self.wants_frame, self.painted.is_some()) {
             return None;
         }
+        self.wants_frame = false;
 
         let window = self.window.clone()?;
         let input = self.input.as_mut()?;
@@ -848,7 +940,8 @@ impl App {
         };
         // With no image open the pass still runs and clears to the background,
         // so the window is never a hole showing whatever was behind it.
-        let shown = self.shown.as_ref().map(|shown| (&shown.view, shown.orientation));
+        // What the file asks for, then what the user asked for on top of it.
+        let shown = self.shown.as_ref().map(|shown| (&shown.view, shown.orientation.then(shown.turn)));
         let carries_image = shown.is_some();
 
         // The interface's place on the GPU is built here, the first time
@@ -950,7 +1043,7 @@ fn handled(key: &Key) -> bool {
             | NamedKey::End
             | NamedKey::F11,
         ) => true,
-        Key::Character(character) => matches!(character.as_str(), "+" | "=" | "-" | "_" | "0" | "1" | "?"),
+        Key::Character(character) => matches!(character.as_str(), "+" | "=" | "-" | "_" | "0" | "1" | "?" | "l" | "L" | "r" | "R" | "b" | "B"),
         _ => false,
     }
 }
@@ -969,9 +1062,99 @@ fn key_for(action: Action) -> Key {
         Action::ZoomIn => Key::Character("+".into()),
         Action::Fit => Key::Character("0".into()),
         Action::Actual => Key::Character("1".into()),
+        Action::TurnRight => Key::Character("r".into()),
+        Action::TurnLeft => Key::Character("R".into()),
+        Action::Backdrop => Key::Character("b".into()),
+        Action::Lock => Key::Character("l".into()),
         Action::FullScreen => Key::Named(NamedKey::F11),
         Action::Keys => Key::Character("?".into()),
     }
+}
+
+/// Whether an event egui asked to repaint for should also earn a new layout.
+///
+/// `RedrawRequested` is excluded, and the reason was measured rather than
+/// reasoned: egui answers every redraw by asking for another, so treating that
+/// as a reason to lay out again is a loop. It ran at 573 layouts in three
+/// seconds on a still picture — the idle promise spent entirely on chrome.
+///
+/// Real input is what earns a frame; a redraw *is* the frame.
+fn earns_a_layout(repaint: bool, event: &WindowEvent) -> bool {
+    repaint && !matches!(event, WindowEvent::RedrawRequested)
+}
+
+/// Whether the interface should be laid out this frame.
+///
+/// Laying out costs about ten milliseconds, so a frame that would look
+/// identical is skipped — that is what keeps a still picture free. But
+/// "identical" is about what the *status* says, and the status is not the only
+/// reason egui needs a frame.
+///
+/// `input_pending` is that other reason, and it is the one that shipped
+/// broken in v0.17.0: a press on a toolbar button changes no status at all —
+/// the file, the zoom, the mode are all what they were — so the frame carrying
+/// the press was never laid out and the button did nothing. A hands-on run
+/// found it; 316 tests did not.
+fn worth_laying_out(status_changed: bool, toast_fading: bool, input_pending: bool, has_frame: bool) -> bool {
+    // With nothing drawn yet there is nothing to keep showing, so the first
+    // frame is always laid out.
+    !has_frame || status_changed || toast_fading || input_pending
+}
+
+/// The size a picture presents after a turn, when the turn changed it.
+///
+/// `None` when the shape is unchanged and the framing should be left where the
+/// user put it. A quarter turn exchanges the axes — a landscape photograph
+/// fitted to the window becomes a portrait one that no longer fits — while a
+/// half turn presents exactly the same rectangle.
+///
+/// A free function because the alternative is not testable: the condition
+/// lives inside a method that needs a renderer and an image on screen, and
+/// mutation testing showed it inverted there without a single test noticing.
+fn size_after_turn(size: (u32, u32), before: Orientation, after: Orientation) -> Option<(u32, u32)> {
+    (before.swaps_axes() != after.swaps_axes()).then_some((size.1, size.0))
+}
+
+/// What was on screen when a new image arrived.
+struct Previous {
+    view: View,
+    fidelity: Fidelity,
+    /// Whether it is the same file, rather than a neighbour.
+    same_file: bool,
+}
+
+/// How to frame an image that has just arrived.
+///
+/// A free function rather than three arms inside `upload`, because the choice
+/// is the feature: mutation testing showed that deleting the zoom lock's arm
+/// there passed every test and the whole gate — the lock's own unit tests
+/// prove what `carry_onto` computes, not that anything calls it. This is a
+/// decision made of plain values, so it can be asked directly.
+fn frame_arriving(previous: Option<Previous>, image: (u32, u32), window: (u32, u32), scale_factor: f32, locked: bool) -> View {
+    let fresh = || View::new(image, window, scale_factor);
+    let Some(previous) = previous else {
+        return fresh();
+    };
+
+    // The same file arriving at its full resolution: the framing is kept and
+    // rebased, so the swap reads as the picture sharpening rather than as
+    // anything moving. `same_file` is what makes this the same file — the
+    // fidelity alone would also match the thumbnail of the *next* file, which
+    // is a different picture entirely.
+    if previous.fidelity == Fidelity::Thumbnail && previous.same_file {
+        let mut view = previous.view;
+        view.rebase(image);
+        return view;
+    }
+
+    // With the lock on, the framing carries from the picture before — the same
+    // magnification over the same part of the frame, which is what makes a
+    // series comparable by stepping through it.
+    if locked {
+        return previous.view.carry_onto(image, window, scale_factor);
+    }
+
+    fresh()
 }
 
 /// The earlier of two deadlines, when there is one.
@@ -1168,7 +1351,19 @@ impl ApplicationHandler<Event> for App {
         let claimed = match (self.window.clone(), self.input.as_mut()) {
             (Some(window), Some(input)) => {
                 let response = input.on_window_event(&window, &event);
-                if response.repaint {
+                // `RedrawRequested` is excluded deliberately, and the reason
+                // was measured: egui answers every redraw by asking for
+                // another, so treating that as a reason to lay out again is a
+                // loop — 573 layouts in three seconds on a still picture,
+                // which is the idle promise spent entirely on chrome. Real
+                // input is what earns a frame; a redraw is the frame.
+                if earns_a_layout(response.repaint, &event) {
+                    // Both halves matter: the window has to be asked for a
+                    // frame, and the interface has to be allowed to lay one
+                    // out when it comes. Asking without allowing is a redraw
+                    // that skips straight past egui, which is how the toolbar
+                    // shipped drawing and not answering.
+                    self.wants_frame = true;
                     window.request_redraw();
                 }
                 response.consumed
@@ -1279,6 +1474,203 @@ impl ApplicationHandler<Event> for App {
 mod tests {
     use super::*;
 
+    /// A picture arriving with nothing before it is framed for itself.
+    #[test]
+    fn the_first_image_is_framed_for_itself() {
+        let view = frame_arriving(None, (4000, 3000), (1000, 800), 1.0, false);
+        assert_eq!(view.mode(), FitMode::Fit);
+    }
+
+    /// The zoom lock has to actually be consulted.
+    ///
+    /// Found by mutation: with the decision inline in `upload`, replacing the
+    /// lock's condition with `false` passed all 316 tests and the whole gate.
+    /// `carry_onto` had tests of its own, which proved what it computes and
+    /// not that anything calls it.
+    #[test]
+    fn the_lock_decides_how_a_neighbour_is_framed() {
+        let mut zoomed = View::new((4000, 3000), (1000, 800), 1.0);
+        zoomed.zoom_to_at(3.0, (500.0, 400.0));
+
+        let previous = || {
+            Some(Previous {
+                view: zoomed,
+                fidelity: Fidelity::Full,
+                same_file: false,
+            })
+        };
+
+        // Locked: the neighbour arrives at the zoom the user set.
+        let locked = frame_arriving(previous(), (4000, 3000), (1000, 800), 1.0, true);
+        assert_eq!(locked.mode(), FitMode::Free, "the lock did not carry the framing");
+        assert!((locked.scale() - 3.0).abs() < 0.01, "the neighbour came out at {}", locked.scale());
+
+        // Unlocked: it is fitted, as a folder of unrelated pictures wants.
+        let unlocked = frame_arriving(previous(), (4000, 3000), (1000, 800), 1.0, false);
+        assert_eq!(unlocked.mode(), FitMode::Fit, "an unlocked neighbour kept the previous framing");
+    }
+
+    /// A thumbnail being replaced by its own full image keeps its framing —
+    /// and the *next* file's thumbnail must not, which is what the path
+    /// comparison is for. Without it a zoomed-in view would jump onto a
+    /// different picture as though it were the same one.
+    #[test]
+    fn a_thumbnail_is_only_rebased_onto_the_file_it_stood_in_for() {
+        let mut zoomed = View::new((400, 300), (1000, 800), 1.0);
+        zoomed.zoom_to_at(4.0, (500.0, 400.0));
+
+        let same = frame_arriving(
+            Some(Previous {
+                view: zoomed,
+                fidelity: Fidelity::Thumbnail,
+                same_file: true,
+            }),
+            (4000, 3000),
+            (1000, 800),
+            1.0,
+            false,
+        );
+        assert_eq!(same.mode(), FitMode::Free, "the framing was thrown away when the full image arrived");
+
+        let other = frame_arriving(
+            Some(Previous {
+                view: zoomed,
+                fidelity: Fidelity::Thumbnail,
+                same_file: false,
+            }),
+            (4000, 3000),
+            (1000, 800),
+            1.0,
+            false,
+        );
+        assert_eq!(other.mode(), FitMode::Fit, "another file's thumbnail inherited this one's framing");
+    }
+
+    /// Even under the lock, a file's own full image replaces its thumbnail by
+    /// rebasing rather than by carrying: the two are the same picture, and
+    /// carrying would re-derive the framing from a fraction instead of
+    /// keeping it exactly.
+    #[test]
+    fn the_lock_does_not_disturb_a_thumbnail_becoming_its_own_image() {
+        let mut zoomed = View::new((400, 300), (1000, 800), 1.0);
+        zoomed.zoom_to_at(4.0, (500.0, 400.0));
+        zoomed.pan((80.0, 0.0));
+
+        let framed = frame_arriving(
+            Some(Previous {
+                view: zoomed,
+                fidelity: Fidelity::Thumbnail,
+                same_file: true,
+            }),
+            (4000, 3000),
+            (1000, 800),
+            1.0,
+            true,
+        );
+        // Rebasing keeps the picture the same size on screen: a thumbnail at
+        // 4x becomes the full image at 0.4x, ten times smaller in pixels.
+        assert!((framed.scale() - 0.4).abs() < 0.01, "the swap moved the picture: {}", framed.scale());
+    }
+
+    /// A redraw must not earn another layout, or the viewer never sleeps.
+    ///
+    /// Measured, not reasoned: letting it through ran at 573 layouts in three
+    /// seconds on a still picture. The fix for the dead toolbar buttons
+    /// introduced exactly this, and a hands-on run caught it — a still image
+    /// costing nothing is a promise from v0.12.0.
+    #[test]
+    fn a_redraw_does_not_earn_another_layout() {
+        // Real input, which is what should earn one. `Focused` stands for it
+        // here because a pointer event needs a `DeviceId`, which only the
+        // event loop can make.
+        assert!(
+            earns_a_layout(true, &WindowEvent::Focused(true)),
+            "real input earned no layout, so the toolbar would not answer",
+        );
+
+        // The redraw egui asks for in answer to the last one.
+        assert!(
+            !earns_a_layout(true, &WindowEvent::RedrawRequested),
+            "a redraw earned another layout, which is the loop that spent the idle promise",
+        );
+
+        // And an event egui does not want a frame for earns nothing either.
+        assert!(!earns_a_layout(false, &WindowEvent::RedrawRequested));
+        assert!(!earns_a_layout(false, &WindowEvent::Focused(true)));
+    }
+
+    /// A press on a toolbar button changes no status, and must still get a
+    /// frame laid out for it.
+    ///
+    /// This is the defect that shipped in v0.17.0: the interface was laid out
+    /// only when its own digest moved, and a click moves nothing in it. The
+    /// button drew and did nothing. Found by hand, not by 316 tests, and the
+    /// reason the condition lives in a function that can be asked.
+    #[test]
+    fn pending_input_earns_a_frame_even_when_nothing_else_changed() {
+        // The settled case: a picture up, nothing moving, nobody touching it.
+        assert!(!worth_laying_out(false, false, false, true), "an idle viewer laid out a frame for nothing");
+
+        // Each reason on its own earns one.
+        assert!(worth_laying_out(true, false, false, true), "a changed status did not earn a frame");
+        assert!(worth_laying_out(false, true, false, true), "a fading toast did not earn a frame");
+        assert!(
+            worth_laying_out(false, false, true, true),
+            "a press earned no frame, so a toolbar button would draw and do nothing",
+        );
+
+        // And with nothing drawn yet, there is always a first frame.
+        assert!(worth_laying_out(false, false, false, false), "the first frame was skipped");
+    }
+
+    /// A quarter turn exchanges what the picture presents; a half turn does
+    /// not, and must leave the framing where the user put it.
+    ///
+    /// Found by mutation: inverting this condition inside `turn` passed every
+    /// test and the whole gate, because the method needs a renderer and an
+    /// image on screen and nothing can call it.
+    #[test]
+    fn only_a_quarter_turn_changes_the_shape_a_picture_presents() {
+        let size = (4000, 3000);
+
+        // Upright to a quarter turn: the axes exchange.
+        assert_eq!(
+            size_after_turn(size, Orientation::Normal, Orientation::Rotate90),
+            Some((3000, 4000)),
+            "a quarter turn did not exchange the axes",
+        );
+        // A quarter turn onward from there: they exchange back.
+        assert_eq!(size_after_turn((3000, 4000), Orientation::Rotate90, Orientation::Rotate180), Some((4000, 3000)));
+
+        // A half turn presents the same rectangle, so the framing stands.
+        assert_eq!(
+            size_after_turn(size, Orientation::Normal, Orientation::Rotate180),
+            None,
+            "a half turn reframed a picture whose shape did not change",
+        );
+        assert_eq!(size_after_turn(size, Orientation::Rotate90, Orientation::Rotate270), None);
+
+        // And no turn at all changes nothing.
+        assert_eq!(size_after_turn(size, Orientation::Normal, Orientation::Normal), None);
+    }
+
+    /// Four quarter turns bring the picture back to the shape it started as,
+    /// which is what stops a series of turns from drifting.
+    #[test]
+    fn four_turns_return_the_shape_it_started_with() {
+        let mut size = (4000, 3000);
+        let mut orientation = Orientation::Normal;
+        for _ in 0..4 {
+            let next = orientation.turned(true);
+            if let Some(turned) = size_after_turn(size, orientation, next) {
+                size = turned;
+            }
+            orientation = next;
+        }
+        assert_eq!(size, (4000, 3000), "the shape drifted over four turns");
+        assert_eq!(orientation, Orientation::Normal);
+    }
+
     /// Every action the toolbar offers has to resolve to a key the viewer
     /// actually answers.
     ///
@@ -1295,6 +1687,10 @@ mod tests {
             Action::ZoomIn,
             Action::Fit,
             Action::Actual,
+            Action::TurnLeft,
+            Action::TurnRight,
+            Action::Backdrop,
+            Action::Lock,
             Action::FullScreen,
             Action::Keys,
         ] {
@@ -1314,6 +1710,10 @@ mod tests {
             Action::ZoomIn,
             Action::Fit,
             Action::Actual,
+            Action::TurnLeft,
+            Action::TurnRight,
+            Action::Backdrop,
+            Action::Lock,
             Action::FullScreen,
             Action::Keys,
         ];
@@ -1345,6 +1745,10 @@ mod tests {
             Key::Character("+".into()),
             Key::Character("-".into()),
             Key::Character("?".into()),
+            Key::Character("l".into()),
+            Key::Character("r".into()),
+            Key::Character("R".into()),
+            Key::Character("b".into()),
         ] {
             assert!(handled(&key), "the key sheet lists {key:?}, which the viewer ignores");
         }

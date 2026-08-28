@@ -32,6 +32,56 @@ pub struct Painted<'a> {
     pub pixels_per_point: f32,
 }
 
+/// What shows through a transparent pixel.
+///
+/// The scene behind a photograph stays dark by decision, so that is the
+/// default. The rest exist because judging a cut-out against one backdrop is
+/// judging it against one background: a logo bound for a white page has to be
+/// seen on white, and a checkerboard is how you tell "transparent" from "a
+/// flat grey that happens to match the scene".
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Backdrop {
+    #[default]
+    Scene,
+    Checker,
+    Black,
+    White,
+}
+
+impl Backdrop {
+    /// The next backdrop in the cycle the `B` key walks.
+    pub fn next(self) -> Self {
+        match self {
+            Self::Scene => Self::Checker,
+            Self::Checker => Self::Black,
+            Self::Black => Self::White,
+            Self::White => Self::Scene,
+        }
+    }
+
+    /// What the status line calls it, and `None` for the default — which needs
+    /// no name, because it is what the viewer always looks like.
+    pub fn name(self) -> Option<&'static str> {
+        match self {
+            Self::Scene => None,
+            Self::Checker => Some("checker"),
+            Self::Black => Some("black"),
+            Self::White => Some("white"),
+        }
+    }
+
+    /// The number the shader switches on, matching `backdrop_at` in
+    /// `shader.wgsl`.
+    fn code(self) -> u32 {
+        match self {
+            Self::Scene => 0,
+            Self::Checker => 1,
+            Self::Black => 2,
+            Self::White => 3,
+        }
+    }
+}
+
 /// The colour behind the image. It matches the shader's compositing background
 /// so a transparent PNG blends into the window rather than onto a seam.
 const BACKGROUND: wgpu::Color = wgpu::Color {
@@ -153,16 +203,15 @@ fn to_screen(orientation: Orientation, offset: [f32; 2], width: f32, height: f32
 /// Applying orientation here rather than by shuffling decoded bytes keeps a
 /// rotated 60-megapixel photo free of a second full-size copy.
 fn orientation_matrix(orientation: Orientation) -> [[f32; 2]; 2] {
-    match orientation {
-        Orientation::Normal => [[1.0, 0.0], [0.0, 1.0]],
-        Orientation::FlipHorizontal => [[-1.0, 0.0], [0.0, 1.0]],
-        Orientation::Rotate180 => [[-1.0, 0.0], [0.0, -1.0]],
-        Orientation::FlipVertical => [[1.0, 0.0], [0.0, -1.0]],
-        Orientation::Transpose => [[0.0, 1.0], [1.0, 0.0]],
-        Orientation::Rotate90 => [[0.0, 1.0], [-1.0, 0.0]],
-        Orientation::Transverse => [[0.0, -1.0], [-1.0, 0.0]],
-        Orientation::Rotate270 => [[0.0, -1.0], [1.0, 0.0]],
-    }
+    // The one statement of these eight matrices lives on `Orientation`, which
+    // also composes them for the viewing rotation. Two copies would be two
+    // places for a sign to drift, and the drift would only show on mirrored
+    // orientations that no ordinary photograph carries.
+    let matrix = orientation.matrix();
+    [
+        [f32::from(matrix[0][0]), f32::from(matrix[0][1])],
+        [f32::from(matrix[1][0]), f32::from(matrix[1][1])],
+    ]
 }
 
 /// Colour conversion state, laid out to match `Colour` in `shader.wgsl`.
@@ -181,7 +230,8 @@ struct ColourUniform {
     /// values above 1.0 are brighter than SDR white rather than an overflow to
     /// be clipped.
     extended_range: u32,
-    _padding: u32,
+    /// What shows through a transparent pixel; `Backdrop::code`.
+    backdrop: u32,
 }
 
 impl ColourUniform {
@@ -190,7 +240,7 @@ impl ColourUniform {
     /// and the shader's curves must, even when the transform itself would
     /// change nothing. The identity transform carries the sRGB curve for
     /// exactly this.
-    fn new(transform: &ColorTransform, output: Output, depth: Depth) -> Self {
+    fn new(transform: &ColorTransform, output: Output, depth: Depth, backdrop: Backdrop) -> Self {
         let mut matrix = [[0.0; 4]; 3];
         for (row, values) in transform.matrix.iter().enumerate() {
             matrix[row][..3].copy_from_slice(values);
@@ -204,7 +254,7 @@ impl ColourUniform {
             // linear surface, which wants the light itself.
             encode_srgb: u32::from(!output.encodes_srgb() && !output.is_hdr()),
             extended_range: u32::from(output.is_hdr()),
-            _padding: 0,
+            backdrop: backdrop.code(),
         }
     }
 }
@@ -265,6 +315,10 @@ pub struct Renderer {
     /// be rewritten when the surface changes under it — the same picture needs
     /// different encoding on an SDR and an HDR surface.
     transform: ColorTransform,
+    /// What shows through a transparent pixel. Held here for the same reason
+    /// as the transform: it outlives any one image and has to be restated
+    /// whenever the uniform is rewritten.
+    backdrop: Backdrop,
     /// Whether the device can hold sixteen-bit normalised textures.
     ///
     /// `Rgba16Unorm` is an optional wgpu feature. DX12 — the backend nitid
@@ -431,7 +485,7 @@ impl Renderer {
 
         let colour = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("nitid colour"),
-            contents: bytemuck::bytes_of(&ColourUniform::new(&ColorTransform::identity(), output, Depth::Eight)),
+            contents: bytemuck::bytes_of(&ColourUniform::new(&ColorTransform::identity(), output, Depth::Eight, Backdrop::default())),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -452,6 +506,7 @@ impl Renderer {
             curve_sampler,
             colour,
             transform: ColorTransform::identity(),
+            backdrop: Backdrop::default(),
             wide_textures,
             tile_limit,
             upload: None,
@@ -461,6 +516,45 @@ impl Renderer {
     /// The drawing surface size in physical pixels.
     pub fn size(&self) -> (u32, u32) {
         (self.config.width, self.config.height)
+    }
+
+    /// What shows through a transparent pixel.
+    pub fn backdrop(&self) -> Backdrop {
+        self.backdrop
+    }
+
+    /// Change what shows through a transparent pixel.
+    ///
+    /// Only the uniform is rewritten: the pixels, the pipeline and the
+    /// textures are all untouched, so this costs one 32-byte write and the
+    /// redraw the caller was going to ask for anyway.
+    pub fn set_backdrop(&mut self, backdrop: Backdrop) {
+        if self.backdrop == backdrop {
+            return;
+        }
+        self.backdrop = backdrop;
+        self.write_colour();
+    }
+
+    /// Restate the colour uniform from what the renderer currently holds.
+    ///
+    /// The one place that builds it for the live state, so a caller cannot
+    /// write a uniform that disagrees with the renderer's own fields.
+    ///
+    /// **Not covered by a test, and measured to be so.** Making this write the
+    /// default backdrop while `set_backdrop` still stored the choice passed
+    /// every test and the whole gate: the status line would say "white" and
+    /// the screen would stay dark. `Renderer` needs a window, so nothing in
+    /// the suite can hold one and ask it what it wrote — the same gap as
+    /// `set_image`, recorded in the hub's backlog since v0.15.0. Splitting the
+    /// build from the write was tried and changed nothing, because the split
+    /// half is still a method on a `Renderer` no test can build. What does
+    /// cover it is opening the viewer and pressing `B`, which is part of the
+    /// release checklist rather than of `cargo test`.
+    fn write_colour(&mut self) {
+        let depth = self.upload.as_ref().map_or(Depth::Eight, |upload| upload.depth);
+        let uniform = ColourUniform::new(&self.transform, self.output, depth, self.backdrop);
+        self.queue.write_buffer(&self.colour, 0, bytemuck::bytes_of(&uniform));
     }
 
     /// Point an existing interface layer at the surface as it is now.
@@ -526,10 +620,11 @@ impl Renderer {
         // changing means this one no longer applies.
         self.pipeline = build_pipeline(&self.device, &self.pipeline_layout, &self.shader, output.format);
         // The picture on screen was encoded for the surface that just went
-        // away; the uniform says how, so it is rewritten for the new one.
-        let depth = self.upload.as_ref().map_or(Depth::Eight, |upload| upload.depth);
-        self.queue
-            .write_buffer(&self.colour, 0, bytemuck::bytes_of(&ColourUniform::new(&self.transform, output, depth)));
+        // away; the uniform says how, so it is rewritten for the new one —
+        // through the same call the backdrop uses, so the two cannot come to
+        // disagree about what the live state is. `self.output` is already the
+        // new surface by here.
+        self.write_colour();
         true
     }
 
@@ -679,8 +774,11 @@ impl Renderer {
 
         self.transform = transform.clone();
         self.write_curves(transform);
-        self.queue
-            .write_buffer(&self.colour, 0, bytemuck::bytes_of(&ColourUniform::new(transform, self.output, depth)));
+        self.queue.write_buffer(
+            &self.colour,
+            0,
+            bytemuck::bytes_of(&ColourUniform::new(transform, self.output, depth, self.backdrop)),
+        );
 
         self.upload = Some(Upload { tiles: uploads, size, depth });
     }
@@ -1016,6 +1114,120 @@ mod tests {
             .expect("the shader should validate");
     }
 
+    /// A transparent pixel must actually show the chosen backdrop. Read back
+    /// from the frame buffer rather than compared against the constant that
+    /// produced it: the question is what reaches the screen, and a uniform
+    /// that never arrives would pass any check made of its own value.
+    #[test]
+    fn a_transparent_pixel_shows_the_backdrop_that_was_chosen() {
+        let clear = [0u8, 0, 0, 0];
+        let Some(scene) = draw_offscreen_on(srgb_surface(), &ColorTransform::identity(), &clear, Depth::Eight, Backdrop::Scene) else {
+            eprintln!("skipping: no graphics adapter here");
+            return;
+        };
+
+        let black = draw_offscreen_on(srgb_surface(), &ColorTransform::identity(), &clear, Depth::Eight, Backdrop::Black).expect("an adapter");
+        let white = draw_offscreen_on(srgb_surface(), &ColorTransform::identity(), &clear, Depth::Eight, Backdrop::White).expect("an adapter");
+
+        // Black is black, white is white, and the scene is the dark grey the
+        // viewer has always used.
+        assert!(black[0] < 0.01, "the black backdrop came out at {}", black[0]);
+        assert!(white[0] > 0.99, "the white backdrop came out at {}", white[0]);
+        assert!(scene[0] > 0.05 && scene[0] < 0.15, "the scene backdrop came out at {}", scene[0]);
+
+        // And they are actually different, or this test proves nothing.
+        assert!(white[0] - black[0] > 0.9, "the backdrops read the same");
+    }
+
+    /// The checkerboard has to actually be a checkerboard: two greys
+    /// alternating in squares of a fixed size on screen.
+    ///
+    /// Drawn across a row wider than one square, because it is a function of
+    /// the screen position and a one-pixel target can only ever show one
+    /// square of it — which would pass as a flat colour.
+    #[test]
+    fn the_checkerboard_alternates_in_squares_of_a_fixed_size() {
+        // Wide enough for three squares at CHECKER_SIZE = 12.
+        let width = 36;
+        let clear = [0u8, 0, 0, 0];
+        let Some(row) = draw_row_offscreen(srgb_surface(), &ColorTransform::identity(), &clear, Depth::Eight, Backdrop::Checker, width) else {
+            eprintln!("skipping: no graphics adapter here");
+            return;
+        };
+
+        // Two distinct greys, and no more than two.
+        let mut values: Vec<f32> = row.iter().map(|pixel| pixel[0]).collect();
+        values.sort_by(f32::total_cmp);
+        values.dedup_by(|a, b| (*a - *b).abs() < 0.001);
+        assert_eq!(values.len(), 2, "the checkerboard showed {} distinct greys: {values:?}", values.len());
+
+        // Both dark: this sits beside the viewer's own dark scene, and a
+        // checker that glares would be the brightest thing on screen.
+        for value in &values {
+            assert!(
+                *value < 0.2,
+                "a checker square came back at {value}, which is too bright to sit beside the scene"
+            );
+        }
+
+        // The squares are twelve pixels wide: the first pixel of each square
+        // matches the first pixel of the square two along, and differs from
+        // its neighbour.
+        assert!((row[0][0] - row[24][0]).abs() < 0.001, "squares two apart differ, so the period is not 12");
+        assert!(
+            (row[0][0] - row[12][0]).abs() > 0.01,
+            "adjacent squares are the same colour, so there is no pattern"
+        );
+        // And within one square nothing changes.
+        assert!((row[0][0] - row[11][0]).abs() < 0.001, "a square is not flat across its own width");
+    }
+
+    /// An opaque pixel must not be touched by any of it: the backdrop is what
+    /// shows *through* transparency, not a tint over the picture.
+    #[test]
+    fn the_backdrop_leaves_an_opaque_pixel_alone() {
+        let opaque = [128u8, 128, 128, 255];
+        let Some(scene) = draw_offscreen_on(srgb_surface(), &ColorTransform::identity(), &opaque, Depth::Eight, Backdrop::Scene) else {
+            eprintln!("skipping: no graphics adapter here");
+            return;
+        };
+        for backdrop in [Backdrop::Checker, Backdrop::Black, Backdrop::White] {
+            let drawn = draw_offscreen_on(srgb_surface(), &ColorTransform::identity(), &opaque, Depth::Eight, backdrop).expect("an adapter");
+            assert!(
+                (drawn[0] - scene[0]).abs() < 0.005,
+                "{backdrop:?} changed an opaque pixel: {} vs {}",
+                drawn[0],
+                scene[0],
+            );
+        }
+    }
+
+    /// The `B` key walks all four and comes back, so it can be pressed
+    /// forever without reaching a state it cannot leave.
+    #[test]
+    fn the_backdrop_cycle_visits_each_one_and_returns() {
+        let mut seen = Vec::new();
+        let mut backdrop = Backdrop::default();
+        for _ in 0..4 {
+            seen.push(backdrop);
+            backdrop = backdrop.next();
+        }
+        assert_eq!(backdrop, Backdrop::default(), "the cycle did not come back to the start");
+        for expected in [Backdrop::Scene, Backdrop::Checker, Backdrop::Black, Backdrop::White] {
+            assert!(seen.contains(&expected), "{expected:?} is not in the cycle");
+        }
+    }
+
+    /// Only the default goes unnamed in the status line — it is what the
+    /// viewer always looks like, so saying so would be noise.
+    #[test]
+    fn every_backdrop_but_the_default_says_what_it_is() {
+        assert_eq!(Backdrop::Scene.name(), None);
+        for named in [Backdrop::Checker, Backdrop::Black, Backdrop::White] {
+            assert!(named.name().is_some(), "{named:?} has no name for the status line");
+        }
+    }
+
     #[test]
     fn the_colour_uniform_matches_the_shader_layout() {
         // mat3x3 with 16-byte aligned columns, then two u32 and padding.
@@ -1053,7 +1265,7 @@ mod tests {
 
     #[test]
     fn an_identity_transform_asks_the_shader_to_do_nothing() {
-        let uniform = ColourUniform::new(&ColorTransform::identity(), srgb_surface(), Depth::Eight);
+        let uniform = ColourUniform::new(&ColorTransform::identity(), srgb_surface(), Depth::Eight, Backdrop::default());
         assert_eq!(uniform.convert, 0);
         assert_eq!(uniform.encode_srgb, 0);
         assert_eq!(uniform.extended_range, 0);
@@ -1061,7 +1273,7 @@ mod tests {
 
     #[test]
     fn a_conversion_onto_an_srgb_surface_leaves_encoding_to_the_hardware() {
-        let uniform = ColourUniform::new(&wide_gamut_transform(), srgb_surface(), Depth::Eight);
+        let uniform = ColourUniform::new(&wide_gamut_transform(), srgb_surface(), Depth::Eight, Backdrop::default());
 
         assert_eq!(uniform.convert, 1);
         // An sRGB surface encodes on write; doing it in the shader too would
@@ -1076,14 +1288,20 @@ mod tests {
         // to the conversion, which would have written linear light to a
         // surface expecting sRGB — dark, and only on hardware nitid had not
         // met.
-        assert_eq!(ColourUniform::new(&wide_gamut_transform(), plain_surface(), Depth::Eight).encode_srgb, 1);
-        assert_eq!(ColourUniform::new(&ColorTransform::identity(), plain_surface(), Depth::Eight).encode_srgb, 1);
+        assert_eq!(
+            ColourUniform::new(&wide_gamut_transform(), plain_surface(), Depth::Eight, Backdrop::default()).encode_srgb,
+            1
+        );
+        assert_eq!(
+            ColourUniform::new(&ColorTransform::identity(), plain_surface(), Depth::Eight, Backdrop::default()).encode_srgb,
+            1
+        );
     }
 
     #[test]
     fn an_extended_range_surface_is_given_light_rather_than_an_encoding() {
         for transform in [ColorTransform::identity(), wide_gamut_transform()] {
-            let uniform = ColourUniform::new(&transform, hdr_surface(), Depth::Eight);
+            let uniform = ColourUniform::new(&transform, hdr_surface(), Depth::Eight, Backdrop::default());
 
             assert_eq!(uniform.extended_range, 1);
             // Encoding here would apply a transfer function the surface does
@@ -1175,6 +1393,19 @@ mod tests {
     }
 
     fn draw_offscreen_at(output: Output, transform: &ColorTransform, pixel: &[u8], depth: Depth) -> Option<[f32; 4]> {
+        draw_offscreen_on(output, transform, pixel, depth, Backdrop::default())
+    }
+
+    fn draw_offscreen_on(output: Output, transform: &ColorTransform, pixel: &[u8], depth: Depth, backdrop: Backdrop) -> Option<[f32; 4]> {
+        draw_row_offscreen(output, transform, pixel, depth, backdrop, 1).map(|row| row[0])
+    }
+
+    /// The same, drawn into a target `width` pixels wide, returning the row.
+    ///
+    /// A wider target is what makes the checkerboard visible at all: it is a
+    /// function of the screen position, so a one-pixel target can only ever
+    /// show one square of it.
+    fn draw_row_offscreen(output: Output, transform: &ColorTransform, pixel: &[u8], depth: Depth, backdrop: Backdrop, width: u32) -> Option<Vec<[f32; 4]>> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
         let wide = adapter.features().contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM);
@@ -1204,13 +1435,18 @@ mod tests {
         });
         let pipeline = build_pipeline(&device, &pipeline_layout, &shader, output.format);
 
+        // The image spans the target: a one-pixel image in a wider window
+        // covers one pixel and leaves the rest of the row showing the pass's
+        // clear colour, which is not the shader's output at all. Measured —
+        // it reads as a flat scene-coloured row with a single odd pixel.
+        let pixels: Vec<u8> = pixel.repeat(width as usize);
         let extent = wgpu::Extent3d {
-            width: 1,
+            width,
             height: 1,
             depth_or_array_layers: 1,
         };
 
-        // One pixel of image, in the texture format `set_image` would choose.
+        // The image, in the texture format `set_image` would choose.
         let image = device.create_texture(&wgpu::TextureDescriptor {
             label: None,
             size: extent,
@@ -1227,10 +1463,10 @@ mod tests {
         });
         queue.write_texture(
             image.as_image_copy(),
-            pixel,
+            &pixels,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(4 * depth.bytes()),
+                bytes_per_row: Some(width * 4 * depth.bytes()),
                 rows_per_image: Some(1),
             },
             extent,
@@ -1269,12 +1505,12 @@ mod tests {
         // a 1x1 image in a 1x1 window fills the target exactly.
         let placement = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
-            contents: Placement::new(&View::new((1, 1), (1, 1), 1.0), (1, 1), Orientation::Normal).as_bytes(),
+            contents: Placement::new(&View::new((width, 1), (width, 1), 1.0), (width, 1), Orientation::Normal).as_bytes(),
             usage: wgpu::BufferUsages::UNIFORM,
         });
         let colour = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
-            contents: bytemuck::bytes_of(&ColourUniform::new(transform, output, depth)),
+            contents: bytemuck::bytes_of(&ColourUniform::new(transform, output, depth, backdrop)),
             usage: wgpu::BufferUsages::UNIFORM,
         });
 
@@ -1312,9 +1548,14 @@ mod tests {
         });
 
         // The target stands in for the swapchain texture.
+        let target_extent = wgpu::Extent3d {
+            width,
+            height: 1,
+            depth_or_array_layers: 1,
+        };
         let target = device.create_texture(&wgpu::TextureDescriptor {
             label: None,
-            size: extent,
+            size: target_extent,
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -1324,10 +1565,15 @@ mod tests {
         });
         let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
 
-        // 256 bytes is the row alignment a texture-to-buffer copy requires.
+        // 256 bytes is the row alignment a texture-to-buffer copy requires, and
+        // a wider row is rounded up to the next multiple of it. Stating this
+        // wrongly is not an error: the copy succeeds and the values read back
+        // are nonsense, which is how a measurement in v0.15.0 came back as all
+        // zeroes while its test stayed green.
+        let row_bytes = (width * 4).next_multiple_of(256);
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
-            size: 256,
+            size: u64::from(row_bytes),
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -1360,11 +1606,11 @@ mod tests {
                 buffer: &readback,
                 layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(256),
+                    bytes_per_row: Some(row_bytes),
                     rows_per_image: Some(1),
                 },
             },
-            extent,
+            target_extent,
         );
         queue.submit(Some(encoder.finish()));
 
@@ -1379,19 +1625,30 @@ mod tests {
 
         // Whatever the surface format holds, the answer comes back as linear
         // light, so the two paths can be compared with each other.
-        Some(match output.format {
-            wgpu::TextureFormat::Rgba16Float => {
-                let halves: &[half::f16] = bytemuck::cast_slice(&bytes[..8]);
-                [halves[0].to_f32(), halves[1].to_f32(), halves[2].to_f32(), halves[3].to_f32()]
-            }
-            // An `*Srgb` target holds encoded values; undoing the encoding
-            // gets back to the light the shader was working in.
-            format if format.is_srgb() => std::array::from_fn(|index| {
-                let value = f32::from(bytes[index]) / 255.0;
-                if index == 3 { value } else { srgb_to_linear(value) }
-            }),
-            _ => std::array::from_fn(|index| f32::from(bytes[index]) / 255.0),
-        })
+        let stride = match output.format {
+            wgpu::TextureFormat::Rgba16Float => 8,
+            _ => 4,
+        };
+        Some(
+            (0..width as usize)
+                .map(|x| {
+                    let at = x * stride;
+                    match output.format {
+                        wgpu::TextureFormat::Rgba16Float => {
+                            let halves: &[half::f16] = bytemuck::cast_slice(&bytes[at..at + 8]);
+                            [halves[0].to_f32(), halves[1].to_f32(), halves[2].to_f32(), halves[3].to_f32()]
+                        }
+                        // An `*Srgb` target holds encoded values; undoing the
+                        // encoding gets back to the light the shader worked in.
+                        format if format.is_srgb() => std::array::from_fn(|index| {
+                            let value = f32::from(bytes[at + index]) / 255.0;
+                            if index == 3 { value } else { srgb_to_linear(value) }
+                        }),
+                        _ => std::array::from_fn(|index| f32::from(bytes[at + index]) / 255.0),
+                    }
+                })
+                .collect(),
+        )
     }
 
     /// The same picture must reach the eye the same way on either surface.
@@ -1563,7 +1820,7 @@ mod tests {
         let curve_sampler = device.create_sampler(&wgpu::SamplerDescriptor::default());
         let colour = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
-            contents: bytemuck::bytes_of(&ColourUniform::new(&transform, output, Depth::Eight)),
+            contents: bytemuck::bytes_of(&ColourUniform::new(&transform, output, Depth::Eight, Backdrop::default())),
             usage: wgpu::BufferUsages::UNIFORM,
         });
 

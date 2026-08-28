@@ -64,6 +64,11 @@ pub struct Status {
     pub frame: Option<(usize, usize, bool)>,
     /// Whether the surface is carrying high dynamic range.
     pub hdr: bool,
+    /// Whether the framing is held across a step to the next image.
+    pub locked: bool,
+    /// What shows through a transparent pixel, when it is not the viewer's
+    /// own scene. `None` for the default, which needs no announcing.
+    pub backdrop: Option<&'static str>,
 }
 
 /// What a toolbar button asks the viewer to do.
@@ -79,6 +84,10 @@ pub enum Action {
     ZoomIn,
     Fit,
     Actual,
+    TurnLeft,
+    TurnRight,
+    Backdrop,
+    Lock,
     FullScreen,
     Keys,
 }
@@ -236,7 +245,7 @@ impl Interface {
     /// interface would draw anything different from last time.
     pub fn digest(&self, status: &Status) -> String {
         format!(
-            "{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:.3}|{:?}|{:?}|{}|{}|{}|{}",
+            "{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:.3}|{:?}|{:?}|{}|{}|{:?}|{}|{}|{}",
             status.name,
             status.position,
             status.size,
@@ -247,6 +256,8 @@ impl Interface {
             status.fit,
             status.frame,
             status.hdr,
+            status.locked,
+            status.backdrop,
             self.keys_shown,
             self.toolbar_shown,
             self.toasts.len(),
@@ -290,28 +301,66 @@ fn toolbar(ui: &mut egui::Ui, status: &Status) -> Option<Action> {
         )
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                let mut button = |ui: &mut egui::Ui, label: &str, hint: &str, enabled: bool, wanted: Action| {
-                    if ui.add_enabled(enabled, egui::Button::new(label)).on_hover_text(hint).clicked() {
-                        action = Some(wanted);
-                    }
-                };
+                action = button(ui, "◀", "Previous image  (←)", !alone, Action::Previous)
+                    .or(button(ui, "▶", "Next image  (→)", !alone, Action::Next))
+                    .or_else(|| {
+                        separator(ui);
+                        None
+                    })
+                    .or(button(ui, "−", "Zoom out  (-)", showing, Action::ZoomOut))
+                    .or(button(ui, "+", "Zoom in  (+)", showing, Action::ZoomIn))
+                    .or(button(ui, "Fit", "Fit to window  (0)", showing, Action::Fit))
+                    .or(button(ui, "1:1", "Actual size  (1)", showing, Action::Actual))
+                    .or_else(|| {
+                        separator(ui);
+                        None
+                    })
+                    .or(button(ui, "↺", "Turn anticlockwise  (Shift+R)", showing, Action::TurnLeft))
+                    .or(button(ui, "↻", "Turn clockwise  (R)", showing, Action::TurnRight));
 
-                button(ui, "◀", "Previous image  (←)", !alone, Action::Previous);
-                button(ui, "▶", "Next image  (→)", !alone, Action::Next);
-                separator(ui);
-                button(ui, "−", "Zoom out  (-)", showing, Action::ZoomOut);
-                button(ui, "+", "Zoom in  (+)", showing, Action::ZoomIn);
-                button(ui, "Fit", "Fit to window  (0)", showing, Action::Fit);
-                button(ui, "1:1", "Actual size  (1)", showing, Action::Actual);
-
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    button(ui, "?", "Keys  (?)", true, Action::Keys);
-                    button(ui, "⛶", "Full screen  (F11)", true, Action::FullScreen);
-                });
+                // The right-hand end, laid out from the right. The two that
+                // carry a state show which one they are in rather than only
+                // what they would do.
+                let from_the_right = ui
+                    .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        button(ui, "?", "Keys  (?)", true, Action::Keys)
+                            .or(button(ui, "⛶", "Full screen  (F11)", true, Action::FullScreen))
+                            .or_else(|| {
+                                separator(ui);
+                                None
+                            })
+                            .or(toggle(ui, "Lock", "Hold the framing across a step  (L)", !alone, status.locked, Action::Lock))
+                            .or(toggle(
+                                ui,
+                                status.backdrop.unwrap_or("scene"),
+                                "What shows through transparency  (B)",
+                                true,
+                                status.backdrop.is_some(),
+                                Action::Backdrop,
+                            ))
+                    })
+                    .inner;
+                action = action.or(from_the_right);
             });
         });
 
     action
+}
+
+/// One toolbar button, reporting what it asks for when pressed.
+fn button(ui: &mut egui::Ui, label: &str, hint: &str, enabled: bool, wanted: Action) -> Option<Action> {
+    ui.add_enabled(enabled, egui::Button::new(label))
+        .on_hover_text(hint)
+        .clicked()
+        .then_some(wanted)
+}
+
+/// A button that carries a state, and shows which one it is in.
+fn toggle(ui: &mut egui::Ui, label: &str, hint: &str, enabled: bool, on: bool, wanted: Action) -> Option<Action> {
+    ui.add_enabled(enabled, egui::Button::new(label).selected(on))
+        .on_hover_text(hint)
+        .clicked()
+        .then_some(wanted)
 }
 
 /// The bar along the bottom: what this picture is.
@@ -359,6 +408,13 @@ fn status_line(ui: &mut egui::Ui, status: &Status) {
                     ui.label(egui::RichText::new("HDR").strong());
                 }
 
+                // Only when it is not the viewer's own scene: the default
+                // needs no name, because it is what the viewer always is.
+                if let Some(backdrop) = status.backdrop {
+                    separator(ui);
+                    ui.label(backdrop).on_hover_text("What shows through a transparent pixel  (B)");
+                }
+
                 if let Some((frame, count, paused)) = status.frame {
                     separator(ui);
                     ui.label(monospace(format!("frame {frame}/{count}")));
@@ -372,6 +428,12 @@ fn status_line(ui: &mut egui::Ui, status: &Status) {
                 // the file name changes length.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(monospace(format!("{:.0}%", status.scale * 100.0)));
+                    // Beside the zoom, because that is what it holds.
+                    if status.locked {
+                        separator(ui);
+                        ui.label(egui::RichText::new("locked").strong())
+                            .on_hover_text("The framing is held across a step to the next image  (L)");
+                    }
                     if status.fit != FitMode::Free {
                         separator(ui);
                         ui.label(match status.fit {
@@ -417,6 +479,9 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Drag", "pan"),
     ("Middle click", "toggle fit and 100%"),
     ("0 1", "fit to window / actual size"),
+    ("L", "hold the framing across a step"),
+    ("R", "turn a quarter clockwise (Shift for the other way)"),
+    ("B", "what shows through transparency"),
     ("+ -", "zoom in / out"),
     ("F11", "full screen"),
     ("?", "this list"),
@@ -424,7 +489,7 @@ pub const KEYS: &[(&str, &str)] = &[
 ];
 
 /// What the toolbar is, said where a person looking for it would read it.
-const TOOLBAR_HINT: &str = "The toolbar appears when the pointer reaches the top of the window.";
+const TOOLBAR_HINT: &str = "Every one of these is on the toolbar too, which appears when the pointer reaches the top of the window.";
 
 /// Messages, stacked above the status line.
 fn toast_stack(ui: &mut egui::Ui, toasts: &[(String, f32)]) {
@@ -475,6 +540,8 @@ mod tests {
             fit: FitMode::Fit,
             frame: None,
             hdr: false,
+            locked: false,
+            backdrop: None,
         }
     }
 
@@ -667,7 +734,9 @@ mod tests {
     /// Where the first toolbar button ends up, found by walking across the
     /// strip rather than assuming a pixel: egui decides the widths.
     fn find_button(interface: &mut Interface, wanted: Action) -> egui::Pos2 {
-        for x in 8..600 {
+        // The whole strip, not just its left-hand end: the state buttons and
+        // the full-screen control lay out from the right.
+        for x in 4..896 {
             let at = egui::pos2(x as f32, TOOLBAR_HEIGHT / 2.0);
             // egui needs the frame before the click to have the widget in the
             // same place, so each probe is a move followed by a press.
@@ -694,6 +763,31 @@ mod tests {
         assert_eq!(press(&mut interface, at, true), Some(Action::Next));
     }
 
+    /// A press must reach the toolbar even though it changes no status.
+    ///
+    /// This is the defect that shipped in v0.17.0 and was found by hand, not
+    /// by the suite: the interface was laid out only when its own digest
+    /// changed, and a click on a button changes nothing in the digest — the
+    /// file, the zoom, the mode are all what they were. So the frame carrying
+    /// the press was never laid out and the button did nothing. The viewer
+    /// asks egui whether it wants a frame now; this holds the property that
+    /// made the answer necessary.
+    #[test]
+    fn a_press_changes_no_status_and_must_still_be_seen() {
+        let mut interface = Interface::new();
+        interface.follow_pointer(Some((400.0, 10.0)));
+        let at = find_button(&mut interface, Action::Next);
+
+        // Settle: lay out until the digest stops moving, which is the state
+        // the viewer is in while someone reaches for a button.
+        press(&mut interface, at, false);
+        interface.changed(&status());
+        assert!(!interface.changed(&status()), "the fixture never settled, so this proves nothing");
+
+        // The press itself still has to be answered.
+        assert_eq!(press(&mut interface, at, true), Some(Action::Next), "a press was lost on a settled interface");
+    }
+
     /// A hidden toolbar has no buttons to hit, whatever the pointer does.
     #[test]
     fn a_hidden_toolbar_cannot_be_pressed() {
@@ -710,7 +804,20 @@ mod tests {
     /// is a feature nobody has.
     #[test]
     fn every_toolbar_action_is_reachable() {
-        for wanted in [Action::Previous, Action::Next, Action::ZoomOut, Action::ZoomIn, Action::Fit, Action::Actual] {
+        for wanted in [
+            Action::Previous,
+            Action::Next,
+            Action::ZoomOut,
+            Action::ZoomIn,
+            Action::Fit,
+            Action::Actual,
+            Action::TurnLeft,
+            Action::TurnRight,
+            Action::Lock,
+            Action::Backdrop,
+            Action::FullScreen,
+            Action::Keys,
+        ] {
             let mut interface = Interface::new();
             interface.follow_pointer(Some((400.0, 10.0)));
             find_button(&mut interface, wanted);
