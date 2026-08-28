@@ -23,8 +23,11 @@ use crate::animation::Player;
 use crate::color::{self, ColorTransform};
 use crate::config::Config;
 use crate::folder::Folder;
+use crate::format::Format;
 use crate::gpu::Renderer;
-use crate::image_source::{self, Fidelity, LoadedImage, Orientation};
+use crate::gpu::{Overlay, Painted};
+use crate::image_source::{self, Depth, Fidelity, LoadedImage, Orientation};
+use crate::interface::{Action, Interface, Status};
 use crate::loader::{Decoded, Loader, Request};
 use crate::startup;
 use crate::vector::VectorImage;
@@ -122,6 +125,14 @@ struct Shown {
     /// The clock of an animated image. `None` for a still, which is to say
     /// nearly always.
     player: Option<Player>,
+    /// The image's own size in pixels, after orientation — what the status
+    /// line reports, and the one fact `View` keeps to itself.
+    size: (u32, u32),
+    /// What the bytes turned out to be, and at what depth.
+    format: Format,
+    depth: Depth,
+    /// What the colour transform does, in the words a person would use.
+    colour: String,
 }
 
 struct App {
@@ -144,6 +155,40 @@ struct App {
     /// A failure that must end the run; reported after the loop exits, since
     /// `ApplicationHandler` methods cannot return one.
     failure: Option<anyhow::Error>,
+    /// What the status line and the key sheet show.
+    interface: Interface,
+    /// egui's own view of the window: pointer, keys, scale factor. Built with
+    /// the window, so `None` until then.
+    input: Option<egui_winit::State>,
+    /// The interface's place on the GPU.
+    ///
+    /// Built the first time the interface is actually drawn, not with the
+    /// renderer: building it costs 64–69 ms — measured — and it sat squarely
+    /// between a ready GPU and the first pixels, which is the one stretch of
+    /// the run the whole product is a promise about. A viewer opened on a
+    /// photograph shows no chrome, so on that path it is never built at all.
+    overlay: Option<Overlay>,
+    /// What the last laid-out frame said, kept so it can be drawn again
+    /// without asking egui to lay it out a second time.
+    painted: Option<PaintedFrame>,
+    /// When a toast next needs a frame, while one is fading.
+    toast_deadline: Option<Instant>,
+    /// Whether a frame with a picture in it has reached the screen yet.
+    ///
+    /// The interface waits for that frame. Laying it out and building its
+    /// pipeline costs about forty milliseconds — measured — and putting that
+    /// in front of the photograph spends the promise the whole product is
+    /// built on. The status line arrives on the frame after, which is the
+    /// same order the viewer already uses for an embedded thumbnail: show the
+    /// picture first, then improve it.
+    shown_once: bool,
+}
+
+/// One laid-out interface frame, held between the layout and the draw.
+struct PaintedFrame {
+    jobs: Vec<egui::ClippedPrimitive>,
+    textures: egui::TexturesDelta,
+    pixels_per_point: f32,
 }
 
 impl App {
@@ -161,6 +206,12 @@ impl App {
             dragging: false,
             display_checked_at: None,
             failure: None,
+            interface: Interface::new(),
+            input: None,
+            overlay: None,
+            painted: None,
+            toast_deadline: None,
+            shown_once: false,
         }
     }
 
@@ -334,6 +385,10 @@ impl App {
             // An animated image starts playing the moment it is up; the
             // event loop reads the player's clock in `about_to_wait`.
             player: loaded.animation.clone().map(|animation| Player::new(animation, Instant::now())),
+            size: loaded.display_size(),
+            format: loaded.format,
+            depth: loaded.image.depth,
+            colour: describe_colour(loaded.profile.as_ref(), &transform),
         });
     }
 
@@ -459,7 +514,16 @@ impl App {
             Err(error) => {
                 // A file that will not open is a fact about the file, not a
                 // reason to close the viewer: name it and keep the window.
+                //
+                // The toast is how it gets said at all. The windowed binary
+                // has no console — `nitidw.exe` is linked for the GUI
+                // subsystem and its standard handles go nowhere — so until
+                // now this line reached nobody who double-clicked a broken
+                // file.
                 eprintln!("nitid: {}: {error}", path.display());
+                let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("that file");
+                self.interface.toast(format!("{name} will not open"), Instant::now());
+                self.request_redraw();
             }
         }
     }
@@ -530,7 +594,21 @@ impl App {
         (self.cursor.x as f32, self.cursor.y as f32)
     }
 
+    /// Tell the interface where the pointer is, in the units it lays out in.
+    ///
+    /// Returns whether the toolbar's visibility changed, which is the only
+    /// reason a bare pointer move would need a frame.
+    fn follow_pointer(&mut self, position: Option<PhysicalPosition<f64>>) -> bool {
+        let scale = self.window.as_ref().map_or(1.0, |window| window.scale_factor());
+        let logical = position.map(|position| ((position.x / scale) as f32, (position.y / scale) as f32));
+        self.interface.follow_pointer(logical)
+    }
+
     fn handle_key(&mut self, key: &Key, event_loop: &ActiveEventLoop) {
+        debug_assert!(
+            handled(key),
+            "the viewer was handed a key it does not answer: {key:?} — a toolbar button asking for it would do nothing",
+        );
         match key {
             Key::Named(NamedKey::Escape) => event_loop.exit(),
             // On an animated image the space bar is its pause; everywhere
@@ -556,6 +634,12 @@ impl App {
                 "-" | "_" => self.zoom(-1.0),
                 "0" => self.reframe(Reframe::Fit),
                 "1" => self.reframe(Reframe::Actual),
+                // The chrome disappears by design, so the list of what the
+                // keys do has to be reachable from the keys themselves.
+                "?" => {
+                    self.interface.toggle_keys();
+                    self.request_redraw();
+                }
                 _ => {}
             },
             _ => {}
@@ -597,7 +681,17 @@ impl App {
     /// on the events that can precede a change rather than on every redraw.
     /// The viewer's idle loop stays asleep either way.
     fn follow_display(&mut self) -> bool {
-        self.renderer.as_mut().is_some_and(Renderer::follow_display)
+        let changed = self.renderer.as_mut().is_some_and(Renderer::follow_display);
+        if changed {
+            // The interface is composited by a pipeline built against the
+            // format it writes, and encoded by a rule that depends on the
+            // surface. Both have just changed, so both are redone — the same
+            // reason the image pipeline is rebuilt next door.
+            if let (Some(overlay), Some(renderer)) = (self.overlay.as_mut(), self.renderer.as_ref()) {
+                renderer.follow_interface(overlay);
+            }
+        }
+        changed
     }
 
     /// Check on the display when the HDR surface is up and the check is due.
@@ -632,7 +726,12 @@ impl App {
     /// case the next check bounds it.
     fn idle_until(&self) -> ControlFlow {
         let watching = self.renderer.as_ref().is_some_and(Renderer::is_hdr);
-        match display_watch_deadline(watching, self.display_checked_at, Instant::now()) {
+        let display = display_watch_deadline(watching, self.display_checked_at, Instant::now());
+        // A fading toast has to be drawn to be seen, so it is the one thing
+        // the interface asks the loop to wake for — and only while one is up.
+        // With no toast and no HDR watch this is still `Wait`, which is the
+        // promise a still picture rests on.
+        match soonest(display, self.toast_deadline) {
             Some(due) => ControlFlow::WaitUntil(due),
             None => ControlFlow::Wait,
         }
@@ -649,7 +748,101 @@ impl App {
         window.set_fullscreen(next);
     }
 
+    /// What the status line should say about what is on screen.
+    fn status(&self) -> Status {
+        let name = self
+            .folder
+            .as_ref()
+            .map(Folder::current)
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_string();
+
+        let position = self
+            .folder
+            .as_ref()
+            .filter(|folder| folder.len() > 1)
+            .map(|folder| (folder.position() + 1, folder.len()));
+
+        Status {
+            name,
+            position,
+            size: self.shown.as_ref().map(|shown| shown.size),
+            format: self.shown.as_ref().map(|shown| shown.format),
+            depth: self.shown.as_ref().map(|shown| shown.depth),
+            colour: self.shown.as_ref().map(|shown| shown.colour.clone()),
+            scale: self.shown.as_ref().map_or(1.0, |shown| shown.view.scale()),
+            fit: self.shown.as_ref().map_or(FitMode::Fit, |shown| shown.view.mode()),
+            frame: self.shown.as_ref().and_then(|shown| shown.player.as_ref()).map(|player| {
+                let (frame, count) = player.position();
+                (frame, count, player.paused())
+            }),
+            hdr: self.renderer.as_ref().is_some_and(Renderer::is_hdr),
+        }
+    }
+
+    /// Lay out an interface frame, but only if it would look different.
+    ///
+    /// This is what keeps the interface from spending the idle promise: the
+    /// loop already wakes for real input, and an unchanged status is not laid
+    /// out at all, let alone drawn.
+    fn lay_out_interface(&mut self) -> Option<Action> {
+        // Everything read from `self` is gathered before the window and the
+        // input state are borrowed, because both of those borrows outlive the
+        // reads and the compiler is right to say so.
+        // Nothing is laid out until a picture has been on screen once: the
+        // first frame belongs to the photograph.
+        if !self.shown_once {
+            return None;
+        }
+
+        let status = self.status();
+        let now = Instant::now();
+        // A toast fades, so while one is up every frame differs from the last.
+        self.toast_deadline = self.interface.tick(now);
+        let fading = self.toast_deadline.is_some();
+        if !self.interface.changed(&status) && !fading && self.painted.is_some() {
+            return None;
+        }
+
+        let window = self.window.clone()?;
+        let input = self.input.as_mut()?;
+
+        let raw = input.take_egui_input(&window);
+        let (output, action) = self.interface.layout(raw, &status, now);
+        input.handle_platform_output(&window, output.platform_output);
+
+        // Worth a milestone of its own: this is where the interface could
+        // start costing the startup promise, and it is measured at about ten
+        // milliseconds rather than left to be assumed.
+        crate::startup::milestone("interface laid out");
+        self.painted = Some(PaintedFrame {
+            jobs: self.interface.context().tessellate(output.shapes, output.pixels_per_point),
+            textures: output.textures_delta,
+            pixels_per_point: output.pixels_per_point,
+        });
+        action
+    }
+
+    /// Do what a toolbar button asked for.
+    ///
+    /// The button does not do anything of its own: it names the key it stands
+    /// for and the key handler does the rest. A second implementation here
+    /// would be a place for the toolbar and the keyboard to drift apart, and
+    /// the drift would be invisible — both would work, differently.
+    fn act(&mut self, action: Action, event_loop: &ActiveEventLoop) {
+        self.handle_key(&key_for(action), event_loop);
+        // A button press changes what is on screen, and the frame it was
+        // pressed in was laid out before it happened.
+        self.request_redraw();
+    }
+
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(action) = self.lay_out_interface() {
+            self.act(action, event_loop);
+        }
+
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
@@ -658,10 +851,43 @@ impl App {
         let shown = self.shown.as_ref().map(|shown| (&shown.view, shown.orientation));
         let carries_image = shown.is_some();
 
-        if let Err(error) = renderer.render(shown) {
+        // The interface's place on the GPU is built here, the first time
+        // there is something to draw into it, and never on the path to a
+        // photograph with no chrome over it.
+        if self.painted.is_some() && self.overlay.is_none() {
+            self.overlay = Some(renderer.interface());
+            startup::milestone("interface ready");
+        }
+
+        let drew_interface = self.painted.is_some();
+        let interface = match (self.overlay.as_mut(), self.painted.as_ref()) {
+            (Some(layer), Some(frame)) => Some(Painted {
+                layer,
+                jobs: &frame.jobs,
+                textures: &frame.textures,
+                pixels_per_point: frame.pixels_per_point,
+            }),
+            _ => None,
+        };
+
+        if let Err(error) = renderer.render(shown, interface) {
             self.failure = Some(error);
             event_loop.exit();
             return;
+        }
+
+        // The deltas have been applied to the GPU; egui insists they are
+        // acknowledged rather than dropped, and a frame that is drawn again
+        // must not apply them twice.
+        if let Some(frame) = self.painted.as_mut() {
+            frame.textures.clear();
+        }
+
+        // A frame carrying both the picture and the chrome is what the gate
+        // waits for when it is checking the order of the two.
+        if drew_interface && carries_image && startup::exit_after_interface() {
+            startup::interface_drawn();
+            event_loop.exit();
         }
 
         // The frame is on screen now, and it has a picture in it. An empty
@@ -671,7 +897,88 @@ impl App {
             if startup::exit_after_first_frame() {
                 event_loop.exit();
             }
+            // The picture is up, so the interface may have its turn — on the
+            // next frame, which this asks for.
+            //
+            // Removing the request measured as harmless: the window is handed
+            // a frame by the system anyway, and the chrome still appeared. It
+            // stays because that is the system's choice and not a guarantee —
+            // on a still picture with nothing else asking, the viewer sleeps,
+            // and a frame that never comes is a status line that never
+            // appears. No test holds this down for the same reason: the thing
+            // it guards against is a frame *not* arriving, which nothing here
+            // can make happen on demand.
+            if !self.shown_once {
+                self.shown_once = true;
+                self.request_redraw();
+            }
         }
+    }
+}
+
+/// How to describe the colour of what is on screen, in a few words.
+///
+/// The distinction that matters to a person is not the matrix but whether the
+/// file said anything at all: an untagged image is shown exactly as it is
+/// (ADR 0005), and that is worth saying rather than leaving it to look like a
+/// conversion that happened to be the identity.
+fn describe_colour(profile: Option<&ColorProfile>, transform: &ColorTransform) -> String {
+    match profile {
+        None => "untagged".into(),
+        Some(_) if transform.is_identity => "matches the display".into(),
+        Some(_) => "converted".into(),
+    }
+}
+
+/// Whether the key handler answers this key at all.
+///
+/// Written from the same arms as `handle_key`, and the only reason it exists
+/// is that a toolbar button asking for a key nobody answers is a dead button
+/// that still looks live — the failure mutation testing found here, where the
+/// button was wired but the action went nowhere.
+fn handled(key: &Key) -> bool {
+    match key {
+        Key::Named(
+            NamedKey::Escape
+            | NamedKey::Space
+            | NamedKey::ArrowRight
+            | NamedKey::PageDown
+            | NamedKey::ArrowLeft
+            | NamedKey::PageUp
+            | NamedKey::Backspace
+            | NamedKey::Home
+            | NamedKey::End
+            | NamedKey::F11,
+        ) => true,
+        Key::Character(character) => matches!(character.as_str(), "+" | "=" | "-" | "_" | "0" | "1" | "?"),
+        _ => false,
+    }
+}
+
+/// The key a toolbar button stands for.
+///
+/// The toolbar carries nothing the keyboard does not, which is what lets the
+/// button reuse the key handler rather than repeat it. It is also what the
+/// tooltips promise, and a test holds this against the key sheet so the three
+/// cannot come apart.
+fn key_for(action: Action) -> Key {
+    match action {
+        Action::Previous => Key::Named(NamedKey::ArrowLeft),
+        Action::Next => Key::Named(NamedKey::ArrowRight),
+        Action::ZoomOut => Key::Character("-".into()),
+        Action::ZoomIn => Key::Character("+".into()),
+        Action::Fit => Key::Character("0".into()),
+        Action::Actual => Key::Character("1".into()),
+        Action::FullScreen => Key::Named(NamedKey::F11),
+        Action::Keys => Key::Character("?".into()),
+    }
+}
+
+/// The earlier of two deadlines, when there is one.
+fn soonest(left: Option<Instant>, right: Option<Instant>) -> Option<Instant> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (deadline, None) | (None, deadline) => deadline,
     }
 }
 
@@ -832,6 +1139,17 @@ impl ApplicationHandler<Event> for App {
         startup::milestone("gpu ready");
 
         self.window = Some(window.clone());
+        // egui's view of the window, and its place on the GPU. Both are built
+        // here because both need something that does not exist until now: the
+        // window for one, the device and the surface format for the other.
+        self.input = Some(egui_winit::State::new(
+            self.interface.context().clone(),
+            egui::ViewportId::ROOT,
+            &window,
+            Some(window.scale_factor() as f32),
+            None,
+            None,
+        ));
         self.renderer = Some(renderer);
 
         let initial = std::mem::take(&mut self.initial);
@@ -844,6 +1162,20 @@ impl ApplicationHandler<Event> for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        // The interface sees every event first, and says whether it wants one.
+        // A click on the status line is the interface's; a click on the
+        // photograph is the viewer's.
+        let claimed = match (self.window.clone(), self.input.as_mut()) {
+            (Some(window), Some(input)) => {
+                let response = input.on_window_event(&window, &event);
+                if response.repaint {
+                    window.request_redraw();
+                }
+                response.consumed
+            }
+            _ => false,
+        };
+
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
 
@@ -854,6 +1186,9 @@ impl ApplicationHandler<Event> for App {
                     if let Some(shown) = self.shown.as_mut() {
                         shown.view.resize(renderer.size(), scale_factor);
                     }
+                }
+                if let (Some(overlay), Some(renderer)) = (self.overlay.as_mut(), self.renderer.as_ref()) {
+                    overlay.resize(renderer.size());
                 }
                 self.follow_display();
                 self.request_redraw();
@@ -880,7 +1215,7 @@ impl ApplicationHandler<Event> for App {
                 self.refresh();
             }
 
-            WindowEvent::KeyboardInput { event, .. } if event.state.is_pressed() => {
+            WindowEvent::KeyboardInput { event, .. } if event.state.is_pressed() && !claimed => {
                 self.handle_key(&event.logical_key, event_loop);
             }
 
@@ -906,6 +1241,14 @@ impl ApplicationHandler<Event> for App {
             WindowEvent::CursorMoved { position, .. } => {
                 let delta = ((position.x - self.cursor.x) as f32, (position.y - self.cursor.y) as f32);
                 self.cursor = position;
+                // The toolbar comes back when the pointer reaches for it. egui
+                // lays out in logical points, so the reveal band is measured
+                // there too — on a scaled display the physical pixel count
+                // would name a different strip of the window than the one the
+                // toolbar occupies.
+                if self.follow_pointer(Some(position)) {
+                    self.request_redraw();
+                }
                 if self.dragging
                     && let Some(shown) = self.shown.as_mut()
                 {
@@ -914,7 +1257,14 @@ impl ApplicationHandler<Event> for App {
                 }
             }
 
-            WindowEvent::CursorLeft { .. } => self.dragging = false,
+            WindowEvent::CursorLeft { .. } => {
+                self.dragging = false;
+                // A pointer that has left the window is not reaching for
+                // anything, so the chrome goes away with it.
+                if self.follow_pointer(None) {
+                    self.request_redraw();
+                }
+            }
 
             WindowEvent::DroppedFile(path) => self.open(&[path]),
 
@@ -928,6 +1278,82 @@ impl ApplicationHandler<Event> for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every action the toolbar offers has to resolve to a key the viewer
+    /// actually answers.
+    ///
+    /// Found by mutation: with the button wired straight to its own `match`,
+    /// swapping two arms — the back button stepping forward — passed every
+    /// test and the whole gate. The button now names a key instead, and this
+    /// is what stops it naming one that does nothing.
+    #[test]
+    fn every_toolbar_action_names_a_key_the_viewer_answers() {
+        for action in [
+            Action::Previous,
+            Action::Next,
+            Action::ZoomOut,
+            Action::ZoomIn,
+            Action::Fit,
+            Action::Actual,
+            Action::FullScreen,
+            Action::Keys,
+        ] {
+            let key = key_for(action);
+            assert!(handled(&key), "the toolbar's {action:?} asks for {key:?}, which the viewer ignores");
+        }
+    }
+
+    /// Two buttons meaning the same key would be two buttons doing the same
+    /// thing, and one of them would be wrong.
+    #[test]
+    fn no_two_toolbar_actions_mean_the_same_key() {
+        let actions = [
+            Action::Previous,
+            Action::Next,
+            Action::ZoomOut,
+            Action::ZoomIn,
+            Action::Fit,
+            Action::Actual,
+            Action::FullScreen,
+            Action::Keys,
+        ];
+        for (index, action) in actions.iter().enumerate() {
+            for other in &actions[index + 1..] {
+                assert_ne!(
+                    format!("{:?}", key_for(*action)),
+                    format!("{:?}", key_for(*other)),
+                    "{action:?} and {other:?} both press the same key",
+                );
+            }
+        }
+    }
+
+    /// `handled` is written from the same arms as `handle_key` and would drift
+    /// if nothing held it down: every key the sheet advertises must be one.
+    #[test]
+    fn the_keys_the_sheet_advertises_are_all_answered() {
+        for key in [
+            Key::Named(NamedKey::ArrowLeft),
+            Key::Named(NamedKey::ArrowRight),
+            Key::Named(NamedKey::Home),
+            Key::Named(NamedKey::End),
+            Key::Named(NamedKey::Space),
+            Key::Named(NamedKey::F11),
+            Key::Named(NamedKey::Escape),
+            Key::Character("0".into()),
+            Key::Character("1".into()),
+            Key::Character("+".into()),
+            Key::Character("-".into()),
+            Key::Character("?".into()),
+        ] {
+            assert!(handled(&key), "the key sheet lists {key:?}, which the viewer ignores");
+        }
+
+        // And a key nobody claims is not answered, or this would pass on a
+        // `handled` that always says yes.
+        assert!(!handled(&Key::Character("q".into())), "an unclaimed key was reported as answered");
+        assert!(!handled(&Key::Named(NamedKey::Tab)));
+    }
 
     /// The redraw has to be worth its cost: a wheel gesture passes through
     /// many sizes, and rasterising at each one would spend the whole zoom in

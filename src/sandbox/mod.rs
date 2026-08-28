@@ -39,6 +39,7 @@ use std::io::{self, Read, Write};
 
 use anyhow::{Context, Result};
 
+use crate::format::Format;
 use crate::image_source::LoadedImage;
 
 /// The argument that turns this executable into a decoder.
@@ -76,8 +77,8 @@ fn timeout() -> std::time::Duration {
 /// error: the viewer says the file would not open and stays alive, which is
 /// the entire point of the boundary.
 #[cfg(windows)]
-pub fn decode(bytes: &[u8]) -> Result<LoadedImage> {
-    windows::decode(bytes, timeout())
+pub fn decode(bytes: &[u8], format: Format) -> Result<LoadedImage> {
+    windows::decode(bytes, format, timeout())
 }
 
 /// Bind `port` on loopback and report whether any connection arrives within
@@ -148,8 +149,10 @@ fn running_in_container() -> bool {
 /// nitid ships for Windows; this keeps the Linux CI build honest rather than
 /// pretending to a confinement it does not have.
 #[cfg(not(windows))]
-pub fn decode(bytes: &[u8]) -> Result<LoadedImage> {
-    decode_in_this_process(bytes)
+pub fn decode(bytes: &[u8], format: Format) -> Result<LoadedImage> {
+    let mut loaded = decode_in_this_process(bytes)?;
+    loaded.format = format;
+    Ok(loaded)
 }
 
 /// Which executable to launch as the decoder.

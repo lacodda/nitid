@@ -23,6 +23,7 @@ mod hdr;
 mod image_source;
 #[cfg(windows)]
 mod install;
+mod interface;
 mod isobmff;
 mod loader;
 mod sandbox;
@@ -44,6 +45,7 @@ mod view;
 #[doc(hidden)]
 pub mod testing {
     pub use crate::color::{ColorTransform, profile_from};
+    pub use crate::format::Format;
     pub use crate::image_source::{Depth, decode_here};
     pub use crate::sandbox::decode as decode_sandboxed;
 

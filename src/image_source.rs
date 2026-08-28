@@ -140,6 +140,9 @@ pub struct LoadedImage {
     pub image: DecodedImage,
     pub orientation: Orientation,
     pub fidelity: Fidelity,
+    /// The format the bytes turned out to be, decided by content rather than
+    /// by the file's extension. Shown in the status line.
+    pub format: Format,
     /// The ICC profile the file carries, if any.
     ///
     /// `None` means untagged, which by convention means sRGB — the assumption
@@ -222,7 +225,10 @@ fn decode_with(bytes: &[u8], confinement: Confinement) -> Result<LoadedImage> {
         // Reading the profile and the orientation again here would work for a
         // format that states them in its container, and lose them for one
         // that states them in the bitstream — which is the case for AVIF.
-        return crate::sandbox::decode(bytes).with_context(|| format!("decoding the {}", format.name()));
+        // The format itself is not part of that round trip: it is already
+        // known here from the same bytes, so it is set on this side rather
+        // than added to the protocol the sandboxed process speaks.
+        return crate::sandbox::decode(bytes, format).with_context(|| format!("decoding the {}", format.name()));
     }
 
     let malformed = || format!("the {} data is malformed", format.name());
@@ -241,6 +247,7 @@ fn decode_with(bytes: &[u8], confinement: Confinement) -> Result<LoadedImage> {
             // practice, and their decoders deliver the canvas as shown.
             orientation: Orientation::Normal,
             fidelity: Fidelity::Full,
+            format,
             profile: color::profile_from(bytes),
             vector: None,
             animation: (animation.frames.len() > 1).then(|| std::sync::Arc::new(animation)),
@@ -260,6 +267,7 @@ fn decode_with(bytes: &[u8], confinement: Confinement) -> Result<LoadedImage> {
             image,
             orientation: Orientation::Normal,
             fidelity: Fidelity::Full,
+            format,
             profile: None,
             vector: Some(vector),
             animation: None,
@@ -303,6 +311,7 @@ fn decode_with(bytes: &[u8], confinement: Confinement) -> Result<LoadedImage> {
         image,
         orientation,
         fidelity: Fidelity::Full,
+        format,
         profile,
         // A raster format is its pixels; there is nothing to redraw from.
         vector: None,
@@ -321,9 +330,11 @@ fn decode_with(bytes: &[u8], confinement: Confinement) -> Result<LoadedImage> {
 /// error: most PNGs and every screenshot lack one, and the full decode covers
 /// that case on its own.
 pub fn decode_thumbnail(bytes: &[u8]) -> Option<LoadedImage> {
+    let format = Format::detect(bytes)?;
+
     // HEIC keeps its thumbnail as a second coded image in the container rather
     // than in EXIF, so it is reached a different way.
-    if Format::detect(bytes) == Some(Format::Heic) {
+    if format == Format::Heic {
         return decode_heic_thumbnail(bytes);
     }
 
@@ -355,6 +366,7 @@ pub fn decode_thumbnail(bytes: &[u8]) -> Option<LoadedImage> {
         // sideways for the moment before the real one replaces it.
         orientation: orientation_from(&exif),
         fidelity: Fidelity::Thumbnail,
+        format,
         // The profile describes the file, so it covers the thumbnail too: the
         // quick frame and the image replacing it are the same colour.
         profile: color::profile_from(bytes),
@@ -402,6 +414,8 @@ fn decode_heic_thumbnail(bytes: &[u8]) -> Option<LoadedImage> {
         // items in the same file. See `Format::orients_itself`.
         orientation: Orientation::Normal,
         fidelity: Fidelity::Thumbnail,
+        // Only reached through the HEIC branch above.
+        format: Format::Heic,
         // The pixels arrive as sRGB, the same as the full decode: attaching a
         // profile would convert them twice (ADR 0007).
         profile: None,
@@ -1486,6 +1500,8 @@ mod tests {
             },
             orientation: Orientation::Rotate90,
             fidelity: Fidelity::Full,
+            // Irrelevant to this test; any variant would do.
+            format: Format::Png,
             profile: None,
             vector: None,
             animation: None,

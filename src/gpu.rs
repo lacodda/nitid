@@ -15,7 +15,22 @@ use crate::color::{CURVE_SAMPLES, ColorTransform};
 use crate::hdr::{self, Output};
 use crate::image_source::{DecodedImage, Depth, Orientation};
 use crate::tiles::{self, Grid, Span, Tile};
+
+mod overlay;
 use crate::view::View;
+pub use overlay::Overlay;
+
+/// One frame of interface, ready to be composited.
+///
+/// Bundled rather than passed as four arguments because it travels together:
+/// the jobs, the textures they refer to, and the scale they were laid out at
+/// are one answer from egui and are meaningless apart.
+pub struct Painted<'a> {
+    pub layer: &'a mut Overlay,
+    pub jobs: &'a [egui::ClippedPrimitive],
+    pub textures: &'a egui::TexturesDelta,
+    pub pixels_per_point: f32,
+}
 
 /// The colour behind the image. It matches the shader's compositing background
 /// so a transparent PNG blends into the window rather than onto a seam.
@@ -448,6 +463,23 @@ impl Renderer {
         (self.config.width, self.config.height)
     }
 
+    /// Point an existing interface layer at the surface as it is now.
+    ///
+    /// Called after `follow_display` reports a change: the layer's compositing
+    /// pipeline is bound to the format it writes, exactly like the image one.
+    pub fn follow_interface(&self, overlay: &mut Overlay) {
+        overlay.follow_surface(&self.device, &self.queue, self.output);
+    }
+
+    /// Build the interface layer for this device and surface.
+    ///
+    /// Handed out rather than held here because the interface belongs to the
+    /// application — what it draws is the viewer's business, and this module's
+    /// business is only that it reaches the screen correctly encoded.
+    pub fn interface(&self) -> Overlay {
+        Overlay::new(&self.device, self.output, self.size())
+    }
+
     /// Reconfigure the swapchain after the window changed size.
     pub fn resize(&mut self, size: (u32, u32)) {
         if size.0 == 0 || size.1 == 0 || self.size() == size {
@@ -731,7 +763,7 @@ impl Renderer {
     ///
     /// A lost or outdated swapchain is reconfigured and the frame skipped: the
     /// next redraw request paints it. Out of memory is fatal and propagates.
-    pub fn render(&mut self, shown: Option<(&View, Orientation)>) -> Result<()> {
+    pub fn render(&mut self, shown: Option<(&View, Orientation)>, interface: Option<Painted<'_>>) -> Result<()> {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
             // Suboptimal still presents; reconfiguring restores the fast path
@@ -750,9 +782,26 @@ impl Renderer {
         };
 
         let target = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let encoder = self.draw_into(&target, self.size(), shown);
+        let mut encoder = self.draw_into(&target, self.size(), shown);
 
-        self.queue.submit(Some(encoder.finish()));
+        // The interface goes into the same encoder, so it and the picture it
+        // sits on reach the screen in one frame rather than as two.
+        let extra = match interface {
+            Some(interface) => interface.layer.draw(
+                &self.device,
+                &self.queue,
+                &mut encoder,
+                &target,
+                overlay::Frame {
+                    jobs: interface.jobs,
+                    textures: interface.textures,
+                    pixels_per_point: interface.pixels_per_point,
+                },
+            ),
+            None => Vec::new(),
+        };
+
+        self.queue.submit(extra.into_iter().chain(std::iter::once(encoder.finish())));
         self.queue.present(frame);
         Ok(())
     }

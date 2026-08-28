@@ -104,7 +104,8 @@ fn from_base64(text: &str) -> Vec<u8> {
 /// the protocol's version 4 exercised for real, not just parsed.
 #[test]
 fn a_wide_image_crosses_at_its_own_depth() {
-    let decoded = with_decoder(|| nitid::testing::decode_sandboxed(&from_base64(HEIC_RAMP_10BIT))).expect("the sandboxed wide decode should succeed");
+    let decoded = with_decoder(|| nitid::testing::decode_sandboxed(&from_base64(HEIC_RAMP_10BIT), nitid::testing::Format::Heic))
+        .expect("the sandboxed wide decode should succeed");
 
     assert_eq!(decoded.image.depth, nitid::testing::Depth::Sixteen);
     assert_eq!((decoded.image.width, decoded.image.height), (64, 64));
@@ -133,7 +134,7 @@ fn png(width: u32, height: u32) -> Vec<u8> {
 /// never told the path of, and its pixels come back intact.
 #[test]
 fn a_file_decodes_in_the_sandboxed_process() {
-    let decoded = with_decoder(|| nitid::testing::decode_sandboxed(&png(7, 5))).expect("the sandboxed decode should succeed");
+    let decoded = with_decoder(|| nitid::testing::decode_sandboxed(&png(7, 5), nitid::testing::Format::Png)).expect("the sandboxed decode should succeed");
 
     assert_eq!((decoded.image.width, decoded.image.height), (7, 5));
     assert_eq!(decoded.image.pixels.len(), 7 * 5 * 4);
@@ -146,7 +147,8 @@ fn a_file_decodes_in_the_sandboxed_process() {
 /// is where a naive read would stop short and hand back half a picture.
 #[test]
 fn a_large_image_crosses_the_pipe_whole() {
-    let decoded = with_decoder(|| nitid::testing::decode_sandboxed(&png(800, 600))).expect("a large sandboxed decode should succeed");
+    let decoded =
+        with_decoder(|| nitid::testing::decode_sandboxed(&png(800, 600), nitid::testing::Format::Png)).expect("a large sandboxed decode should succeed");
 
     assert_eq!((decoded.image.width, decoded.image.height), (800, 600));
     assert_eq!(decoded.image.pixels.len(), 800 * 600 * 4);
@@ -158,12 +160,12 @@ fn a_large_image_crosses_the_pipe_whole() {
 #[test]
 fn a_broken_file_is_reported_rather_than_taking_the_viewer_down() {
     with_decoder(|| {
-        assert!(nitid::testing::decode_sandboxed(b"this is not an image at all").is_err());
-        assert!(nitid::testing::decode_sandboxed(&[]).is_err());
+        assert!(nitid::testing::decode_sandboxed(b"this is not an image at all", nitid::testing::Format::Png).is_err());
+        assert!(nitid::testing::decode_sandboxed(&[], nitid::testing::Format::Png).is_err());
 
         let mut truncated = png(4, 4);
         truncated.truncate(20);
-        assert!(nitid::testing::decode_sandboxed(&truncated).is_err());
+        assert!(nitid::testing::decode_sandboxed(&truncated, nitid::testing::Format::Heic).is_err());
     });
 }
 
@@ -179,7 +181,7 @@ fn corrupted_files_never_take_the_viewer_down() {
             let mut broken = original.clone();
             if cut < broken.len() {
                 broken.truncate(cut);
-                let _ = nitid::testing::decode_sandboxed(&broken);
+                let _ = nitid::testing::decode_sandboxed(&broken, nitid::testing::Format::Heic);
             }
         }
 
@@ -187,7 +189,7 @@ fn corrupted_files_never_take_the_viewer_down() {
             let mut broken = original.clone();
             if flip < broken.len() {
                 broken[flip] ^= 0xFF;
-                let _ = nitid::testing::decode_sandboxed(&broken);
+                let _ = nitid::testing::decode_sandboxed(&broken, nitid::testing::Format::Heic);
             }
         }
     });
@@ -212,7 +214,7 @@ fn corrupted_files_never_take_the_viewer_down() {
 fn a_decoder_that_hangs_is_killed_rather_than_waited_for() {
     let started = std::time::Instant::now();
     let result = with_environment(&[("NITID_DECODER_HANGS", "1"), ("NITID_DECODE_TIMEOUT_MS", "1500")], || {
-        nitid::testing::decode_sandboxed(&png(4, 4))
+        nitid::testing::decode_sandboxed(&png(4, 4), nitid::testing::Format::Png)
     });
     let waited = started.elapsed();
 
@@ -235,8 +237,10 @@ fn a_decoder_that_hangs_is_killed_rather_than_waited_for() {
 #[cfg(windows)]
 #[test]
 fn a_slow_but_working_decode_is_not_cut_short() {
-    let decoded =
-        with_environment(&[("NITID_DECODE_TIMEOUT_MS", "20000")], || nitid::testing::decode_sandboxed(&png(800, 600))).expect("a working decode was cut short");
+    let decoded = with_environment(&[("NITID_DECODE_TIMEOUT_MS", "20000")], || {
+        nitid::testing::decode_sandboxed(&png(800, 600), nitid::testing::Format::Png)
+    })
+    .expect("a working decode was cut short");
 
     assert_eq!((decoded.image.width, decoded.image.height), (800, 600));
 }
@@ -248,8 +252,10 @@ fn a_slow_but_working_decode_is_not_cut_short() {
 #[cfg(windows)]
 #[test]
 fn pixels_still_cross_when_shared_memory_is_unavailable() {
-    let decoded =
-        with_environment(&[("NITID_SHM_DISABLED", "1")], || nitid::testing::decode_sandboxed(&png(800, 600))).expect("the decode should fall back to the pipe");
+    let decoded = with_environment(&[("NITID_SHM_DISABLED", "1")], || {
+        nitid::testing::decode_sandboxed(&png(800, 600), nitid::testing::Format::Png)
+    })
+    .expect("the decode should fall back to the pipe");
 
     assert_eq!((decoded.image.width, decoded.image.height), (800, 600));
     assert!(decoded.image.pixels.as_chunks::<4>().0.iter().all(|pixel| pixel == &[10, 200, 90, 255]));
@@ -262,8 +268,10 @@ fn pixels_still_cross_when_shared_memory_is_unavailable() {
 #[cfg(windows)]
 #[test]
 fn pixels_cross_through_the_section_and_not_by_accident() {
-    let decoded = with_environment(&[("NITID_SHM_REQUIRED", "1")], || nitid::testing::decode_sandboxed(&png(800, 600)))
-        .expect("the shared memory path should carry the pixels");
+    let decoded = with_environment(&[("NITID_SHM_REQUIRED", "1")], || {
+        nitid::testing::decode_sandboxed(&png(800, 600), nitid::testing::Format::Png)
+    })
+    .expect("the shared memory path should carry the pixels");
     assert_eq!((decoded.image.width, decoded.image.height), (800, 600));
     assert!(decoded.image.pixels.as_chunks::<4>().0.iter().all(|pixel| pixel == &[10, 200, 90, 255]));
 
@@ -271,7 +279,7 @@ fn pixels_cross_through_the_section_and_not_by_accident() {
     // the same requirement must fail the decode. A lever that cannot fail
     // would prove nothing above.
     let refused = with_environment(&[("NITID_SHM_REQUIRED", "1"), ("NITID_SHM_DISABLED", "1")], || {
-        nitid::testing::decode_sandboxed(&png(8, 8))
+        nitid::testing::decode_sandboxed(&png(8, 8), nitid::testing::Format::Png)
     });
     assert!(refused.is_err(), "the decode used the pipe although the section was required");
 }
@@ -294,7 +302,7 @@ fn measure_the_boundary() {
     for run in 1..=5 {
         let tiny = png(16, 16);
         let started = std::time::Instant::now();
-        with_decoder(|| nitid::testing::decode_sandboxed(&tiny)).expect("the tiny decode should succeed");
+        with_decoder(|| nitid::testing::decode_sandboxed(&tiny, nitid::testing::Format::Png)).expect("the tiny decode should succeed");
         eprintln!("fixed cost run {run}: {:.0} ms", started.elapsed().as_secs_f64() * 1000.0);
     }
 
@@ -314,7 +322,10 @@ fn measure_the_boundary() {
     for (label, variables) in [("section", &[][..]), ("pipe", &[("NITID_SHM_DISABLED", "1")][..])] {
         for run in 1..=5 {
             let started = std::time::Instant::now();
-            let decoded = with_environment(variables, || nitid::testing::decode_sandboxed(&bytes)).expect("the bench decode should succeed");
+            let decoded = with_environment(variables, || {
+                nitid::testing::decode_sandboxed(&bytes, nitid::testing::Format::detect(&bytes).expect("the bench file is a format nitid knows"))
+            })
+            .expect("the bench decode should succeed");
             eprintln!(
                 "{label} run {run}: {:.0} ms for {}x{}",
                 started.elapsed().as_secs_f64() * 1000.0,
@@ -344,7 +355,9 @@ fn the_container_closes_the_network_outward() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a listener for the probe");
     let address = listener.local_addr().expect("the listener has an address").to_string();
 
-    let result = with_environment(&[("NITID_DECODER_PROBES_NETWORK", &address)], || nitid::testing::decode_sandboxed(&png(4, 4)));
+    let result = with_environment(&[("NITID_DECODER_PROBES_NETWORK", &address)], || {
+        nitid::testing::decode_sandboxed(&png(4, 4), nitid::testing::Format::Png)
+    });
 
     let Err(error) = result else {
         panic!("the probe answers through the failure channel, not with an image");
@@ -395,7 +408,9 @@ fn the_container_closes_the_network_inward() {
     });
 
     let probe = format!("accept:{port}");
-    let result = with_environment(&[("NITID_DECODER_PROBES_NETWORK", &probe)], || nitid::testing::decode_sandboxed(&png(4, 4)));
+    let result = with_environment(&[("NITID_DECODER_PROBES_NETWORK", &probe)], || {
+        nitid::testing::decode_sandboxed(&png(4, 4), nitid::testing::Format::Png)
+    });
 
     let reached = hammering.join().expect("the hammering thread finished");
     let Err(error) = result else {
@@ -417,15 +432,17 @@ fn the_container_closes_the_network_inward() {
 #[cfg(windows)]
 #[test]
 fn the_fallback_still_decodes_and_its_network_stays_observably_open() {
-    let decoded = with_environment(&[("NITID_NO_CONTAINER", "1")], || nitid::testing::decode_sandboxed(&png(5, 4)))
-        .expect("the decode should fall back to the restricted token and succeed");
+    let decoded = with_environment(&[("NITID_NO_CONTAINER", "1")], || {
+        nitid::testing::decode_sandboxed(&png(5, 4), nitid::testing::Format::Png)
+    })
+    .expect("the decode should fall back to the restricted token and succeed");
     assert_eq!((decoded.image.width, decoded.image.height), (5, 4));
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a listener for the probe");
     let address = listener.local_addr().expect("the listener has an address").to_string();
 
     let result = with_environment(&[("NITID_NO_CONTAINER", "1"), ("NITID_DECODER_PROBES_NETWORK", &address)], || {
-        nitid::testing::decode_sandboxed(&png(4, 4))
+        nitid::testing::decode_sandboxed(&png(4, 4), nitid::testing::Format::Png)
     });
     let Err(error) = result else {
         panic!("the probe answers through the failure channel, not with an image");
@@ -442,7 +459,7 @@ fn the_fallback_still_decodes_and_its_network_stays_observably_open() {
 fn repeated_decodes_do_not_accumulate_processes() {
     with_decoder(|| {
         for _ in 0..8 {
-            let decoded = nitid::testing::decode_sandboxed(&png(16, 16)).expect("each decode should succeed");
+            let decoded = nitid::testing::decode_sandboxed(&png(16, 16), nitid::testing::Format::Png).expect("each decode should succeed");
             assert_eq!(decoded.image.pixels.len(), 16 * 16 * 4);
         }
     });

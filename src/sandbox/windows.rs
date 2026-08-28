@@ -41,6 +41,7 @@ use windows::core::{PCWSTR, w};
 use super::protocol;
 use super::section::Section;
 use super::spawn::{AppContainer, SpawnedChild};
+use crate::format::Format;
 use crate::image_source::{DecodedImage, Depth, Fidelity, LoadedImage, Orientation};
 
 /// The attribute marking a token's mandatory label group.
@@ -109,7 +110,7 @@ fn launch(exe: &std::path::Path) -> Result<SpawnedChild> {
 }
 
 /// Decode `bytes` in a confined child process.
-pub fn decode(bytes: &[u8], timeout: Duration) -> Result<LoadedImage> {
+pub fn decode(bytes: &[u8], format: Format, timeout: Duration) -> Result<LoadedImage> {
     // Created suspended, so the confinement is in place before the child runs
     // a single instruction; no window, so a decode does not flash a console
     // over the picture.
@@ -180,6 +181,10 @@ pub fn decode(bytes: &[u8], timeout: Duration) -> Result<LoadedImage> {
             depth: if image.depth == 16 { Depth::Sixteen } else { Depth::Eight },
         },
         fidelity: Fidelity::Full,
+        // Named by the caller, which detected it from the same bytes. It does
+        // not cross the protocol: the decoder is the untrusted side, and what
+        // the file *is* was settled before anything was handed to it.
+        format,
         // A vector document does not cross the boundary: the formats that
         // need a sandbox are all raster, and re-rasterising on zoom would
         // mean a round trip per frame.

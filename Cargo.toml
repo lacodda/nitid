@@ -2,7 +2,7 @@
 name = "nitid"
 version = "0.16.0"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.95"
 description = "A fast image viewer for Windows with honest color and HDR: first pixels in milliseconds, ICC on the GPU, modern formats"
 license = "MIT"
 repository = "https://github.com/lacodda/nitid"
@@ -67,6 +67,22 @@ rav1d = "1.1.0"
 avif-parse = "1.4"
 
 # Metadata
+# The interface: toolbar, status line, key sheet, toasts. `egui` draws into
+# nitid's own render pass rather than owning the surface — the swapchain has to
+# stay ours for HDR (ADR 0001), and `eframe` would configure it itself.
+#
+# 0.36 is the first release built against wgpu 30, and it is what raised the
+# MSRV to 1.95: the alternatives were holding wgpu back to 29 or drawing every
+# widget by hand.
+# `default_fonts` is the only default kept: without a font egui draws no
+# text at all, and the interface is almost entirely text.
+egui = { version = "0.36.1", default-features = false, features = ["default_fonts"] }
+egui-wgpu = "0.36.1"
+# `default-features = false` drops the clipboard (`arboard`), accessibility
+# (`accesskit`) and the X11/Wayland backends: none of them are this stage's
+# subject, and the clipboard has a version of its own later on.
+egui-winit = { version = "0.36.1", default-features = false }
+
 kamadak-exif = "0.6"
 bytemuck = { version = "1.25.2", features = ["derive"] }
 moxcms = "0.9"
