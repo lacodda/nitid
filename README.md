@@ -154,6 +154,29 @@ Nothing here polls. A frame is laid out only when it would look different from
 the last one, and the only thing that asks the loop to wake is a message while
 it is fading.
 
+## What the file says
+
+Press `I` and a panel comes down the right-hand edge with everything the file
+has to say: its size, format, bit depth and colour, its weight on disk and
+where it lives, and — for a photograph — what the camera wrote. Make and model,
+lens, shutter speed, aperture, ISO, focal length with its 35 mm equivalent, and
+when the picture was taken. A photograph carrying GPS gets its coordinates.
+
+It is an overlay, so the picture keeps its framing while the panel is up.
+
+**Every row copies its value when clicked.** A lens name, a shutter speed or a
+coordinate is nearly always wanted somewhere else — a caption, a search, a map
+— and reading it off the screen to type it back in is the part that wastes the
+panel.
+
+Values are shown the way a photographer reads them, not the way the standard
+stores them: `1/250 s` rather than 0.004, `f/2.8` rather than 28/10. A maker
+that repeats itself in the model is printed once.
+
+The coordinates stay on your machine. nitid does not open a map, or ask any
+service where a photograph was taken — a viewer that reached out to place your
+pictures would be telling somebody else where you have been.
+
 ## Controlling the view
 
 Three things you can do to a picture without touching the file.
@@ -289,7 +312,7 @@ has no size limit to hide behind.
 
 ## Status
 
-Early development — v0.18.0 is out. Startup, colour and format coverage hold:
+Early development — v0.19.0 is out. Startup, colour and format coverage hold:
 every modern still format opens, a phone's photographs included, every one of
 them reaches the screen without a wait, and the ones that animate play. The
 process that decodes the heavy formats runs with no network in either
@@ -303,8 +326,8 @@ what multi-select should have done all along. **And it has an interface now**:
 a status line saying what is on screen, a toolbar that comes down when the
 pointer reaches for it, and a key sheet — none of it in front of the
 photograph. The framing can be held across a step for comparing a series, the
-picture turned, and the backdrop behind transparency chosen. Development runs
-in small
+picture turned, and the backdrop behind transparency chosen, and `I` says what
+the file says about itself. Development runs in small
 versions, each one theme; the road to 1.0 is fixed:
 
 | Version | What lands |
@@ -329,7 +352,8 @@ versions, each one theme; the road to 1.0 is fixed:
 | ✅ v0.16.0 | One window: a second launch hands its file over; multi-select arrives as one list |
 | ✅ v0.17.0 | The interface: status line, a toolbar that appears on approach, key sheet, messages |
 | ✅ v0.18.0 | Controlling the view: zoom lock across a step, viewing rotation, backdrop for transparency |
-| v0.19.0 – v0.35.0 | The everyday viewer: EXIF panel, clipboard, file operations, culling, comparison, settings |
+| ✅ v0.19.0 | The Info panel: EXIF, the place a photograph was taken, every row copyable |
+| v0.20.0 – v0.35.0 | The everyday viewer: histogram and loupe, colour tools, clipboard, file operations, culling, comparison, settings |
 | v0.36.0 – v0.39.0 | Windows integration: context menu, installer, auto-update, thumbnails |
 | v0.40.0 – v0.41.0 | Documentation site, stabilisation |
 | v1.0.0 | Public release — the default viewer, nothing missing |
