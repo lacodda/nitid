@@ -144,6 +144,11 @@ struct Shown {
     depth: Depth,
     /// What the colour transform does, in the words a person would use.
     colour: String,
+    /// What the file says about itself: camera, exposure, place.
+    metadata: crate::metadata::Metadata,
+    /// The file's size on disk. `None` when it cannot be asked for, which is
+    /// a fact about the moment rather than about the file.
+    file_size: Option<u64>,
 }
 
 struct App {
@@ -422,6 +427,8 @@ impl App {
             format: loaded.format,
             depth: loaded.image.depth,
             colour: describe_colour(loaded.profile.as_ref(), &transform),
+            metadata: loaded.metadata.clone(),
+            file_size: std::fs::metadata(path).ok().map(|entry| entry.len()),
         });
     }
 
@@ -667,6 +674,12 @@ impl App {
                 "-" | "_" => self.zoom(-1.0),
                 "0" => self.reframe(Reframe::Fit),
                 "1" => self.reframe(Reframe::Actual),
+                // What the file says about itself. The panel is an overlay,
+                // so the picture keeps its framing while it is up.
+                "i" | "I" => {
+                    self.interface.toggle_info();
+                    self.request_redraw();
+                }
                 // What shows through a transparent pixel. A cut-out judged
                 // against one backdrop is a cut-out judged against one
                 // background, which is how a halo reaches a customer.
@@ -870,6 +883,9 @@ impl App {
             hdr: self.renderer.as_ref().is_some_and(Renderer::is_hdr),
             locked: self.zoom_locked,
             backdrop: self.renderer.as_ref().and_then(|renderer| renderer.backdrop().name()),
+            metadata: self.shown.as_ref().map(|shown| shown.metadata.clone()).unwrap_or_default(),
+            path: self.shown.as_ref().map(|shown| shown.path.clone()),
+            file_size: self.shown.as_ref().and_then(|shown| shown.file_size),
         }
     }
 
@@ -1043,7 +1059,10 @@ fn handled(key: &Key) -> bool {
             | NamedKey::End
             | NamedKey::F11,
         ) => true,
-        Key::Character(character) => matches!(character.as_str(), "+" | "=" | "-" | "_" | "0" | "1" | "?" | "l" | "L" | "r" | "R" | "b" | "B"),
+        Key::Character(character) => matches!(
+            character.as_str(),
+            "+" | "=" | "-" | "_" | "0" | "1" | "?" | "l" | "L" | "r" | "R" | "b" | "B" | "i" | "I"
+        ),
         _ => false,
     }
 }
@@ -1065,6 +1084,7 @@ fn key_for(action: Action) -> Key {
         Action::TurnRight => Key::Character("r".into()),
         Action::TurnLeft => Key::Character("R".into()),
         Action::Backdrop => Key::Character("b".into()),
+        Action::Info => Key::Character("i".into()),
         Action::Lock => Key::Character("l".into()),
         Action::FullScreen => Key::Named(NamedKey::F11),
         Action::Keys => Key::Character("?".into()),
@@ -1691,6 +1711,7 @@ mod tests {
             Action::TurnRight,
             Action::Backdrop,
             Action::Lock,
+            Action::Info,
             Action::FullScreen,
             Action::Keys,
         ] {
@@ -1714,6 +1735,7 @@ mod tests {
             Action::TurnRight,
             Action::Backdrop,
             Action::Lock,
+            Action::Info,
             Action::FullScreen,
             Action::Keys,
         ];
@@ -1749,6 +1771,7 @@ mod tests {
             Key::Character("r".into()),
             Key::Character("R".into()),
             Key::Character("b".into()),
+            Key::Character("i".into()),
         ] {
             assert!(handled(&key), "the key sheet lists {key:?}, which the viewer ignores");
         }

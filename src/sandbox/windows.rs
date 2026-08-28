@@ -185,6 +185,9 @@ pub fn decode(bytes: &[u8], format: Format, timeout: Duration) -> Result<LoadedI
         // not cross the protocol: the decoder is the untrusted side, and what
         // the file *is* was settled before anything was handed to it.
         format,
+        // The same, for the same reason: what the file *says* is read on this
+        // side, from bytes the caller already holds.
+        metadata: Default::default(),
         // A vector document does not cross the boundary: the formats that
         // need a sandbox are all raster, and re-rasterising on zoom would
         // mean a round trip per frame.

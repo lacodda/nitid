@@ -26,6 +26,7 @@ mod install;
 mod interface;
 mod isobmff;
 mod loader;
+mod metadata;
 mod sandbox;
 // The whole mechanism is Windows shell behaviour: the pipe, the election, and
 // the multi-select it answers. There is nothing here for another platform to
@@ -47,6 +48,7 @@ pub mod testing {
     pub use crate::color::{ColorTransform, profile_from};
     pub use crate::format::Format;
     pub use crate::image_source::{Depth, decode_here};
+    pub use crate::metadata::read as read_metadata;
     pub use crate::sandbox::decode as decode_sandboxed;
 
     /// Whether a viewer is listening on the channel `id` names.

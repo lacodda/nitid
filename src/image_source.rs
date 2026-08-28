@@ -209,6 +209,14 @@ pub struct LoadedImage {
     /// The format the bytes turned out to be, decided by content rather than
     /// by the file's extension. Shown in the status line.
     pub format: Format,
+    /// What the file says about itself: the camera, the exposure, the place.
+    ///
+    /// Read on this side of the sandbox from the same bytes, never carried
+    /// across the protocol — the decoder is the untrusted half, and what a
+    /// file *says* is settled before anything is handed to it. Reading costs
+    /// 0.03 to 1.7 ms measured, so it happens on every open rather than being
+    /// deferred to the first time the panel is asked for.
+    pub metadata: crate::metadata::Metadata,
     /// The ICC profile the file carries, if any.
     ///
     /// `None` means untagged, which by convention means sRGB — the assumption
@@ -291,10 +299,13 @@ fn decode_with(bytes: &[u8], confinement: Confinement) -> Result<LoadedImage> {
         // Reading the profile and the orientation again here would work for a
         // format that states them in its container, and lose them for one
         // that states them in the bitstream — which is the case for AVIF.
-        // The format itself is not part of that round trip: it is already
-        // known here from the same bytes, so it is set on this side rather
-        // than added to the protocol the sandboxed process speaks.
-        return crate::sandbox::decode(bytes, format).with_context(|| format!("decoding the {}", format.name()));
+        // Neither the format nor the metadata is part of that round trip:
+        // both are already known here from the same bytes, so they are set on
+        // this side rather than added to the protocol the sandboxed process
+        // speaks — the decoder is the untrusted half.
+        let mut loaded = crate::sandbox::decode(bytes, format).with_context(|| format!("decoding the {}", format.name()))?;
+        loaded.metadata = crate::metadata::read(bytes);
+        return Ok(loaded);
     }
 
     let malformed = || format!("the {} data is malformed", format.name());
@@ -312,6 +323,7 @@ fn decode_with(bytes: &[u8], confinement: Confinement) -> Result<LoadedImage> {
             // None of the three formats states an EXIF orientation in
             // practice, and their decoders deliver the canvas as shown.
             orientation: Orientation::Normal,
+            metadata: crate::metadata::read(bytes),
             fidelity: Fidelity::Full,
             format,
             profile: color::profile_from(bytes),
@@ -334,6 +346,7 @@ fn decode_with(bytes: &[u8], confinement: Confinement) -> Result<LoadedImage> {
             orientation: Orientation::Normal,
             fidelity: Fidelity::Full,
             format,
+            metadata: crate::metadata::read(bytes),
             profile: None,
             vector: Some(vector),
             animation: None,
@@ -378,6 +391,7 @@ fn decode_with(bytes: &[u8], confinement: Confinement) -> Result<LoadedImage> {
         orientation,
         fidelity: Fidelity::Full,
         format,
+        metadata: crate::metadata::read(bytes),
         profile,
         // A raster format is its pixels; there is nothing to redraw from.
         vector: None,
@@ -427,6 +441,9 @@ pub fn decode_thumbnail(bytes: &[u8]) -> Option<LoadedImage> {
 
     Some(LoadedImage {
         image: thumbnail,
+        // The same file, so the same metadata: the quick frame is what the
+        // panel describes until the full image replaces it.
+        metadata: crate::metadata::read(bytes),
         // The orientation tag lives in the primary IFD and applies to both the
         // full image and its thumbnail, so the quick frame is not shown
         // sideways for the moment before the real one replaces it.
@@ -475,6 +492,7 @@ fn decode_heic_thumbnail(bytes: &[u8]) -> Option<LoadedImage> {
 
     Some(LoadedImage {
         image,
+        metadata: crate::metadata::read(bytes),
         // HEIC states its rotation in the container and the decoder applies
         // it — to the thumbnail as much as to the full image, since both are
         // items in the same file. See `Format::orients_itself`.
@@ -1672,6 +1690,7 @@ mod tests {
             fidelity: Fidelity::Full,
             // Irrelevant to this test; any variant would do.
             format: Format::Png,
+            metadata: Default::default(),
             profile: None,
             vector: None,
             animation: None,

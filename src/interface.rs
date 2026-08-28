@@ -15,8 +15,11 @@
 
 use std::time::{Duration, Instant};
 
+use std::path::PathBuf;
+
 use crate::format::Format;
 use crate::image_source::Depth;
+use crate::metadata::Metadata;
 use crate::view::FitMode;
 
 /// How long a toast stays up before it fades.
@@ -69,6 +72,12 @@ pub struct Status {
     /// What shows through a transparent pixel, when it is not the viewer's
     /// own scene. `None` for the default, which needs no announcing.
     pub backdrop: Option<&'static str>,
+    /// What the file says about itself, for the Info panel.
+    pub metadata: Metadata,
+    /// What the viewer knows without asking the file: the path and the bytes
+    /// on disk. Shown in the panel beside the camera's own account.
+    pub path: Option<PathBuf>,
+    pub file_size: Option<u64>,
 }
 
 /// What a toolbar button asks the viewer to do.
@@ -88,6 +97,7 @@ pub enum Action {
     TurnRight,
     Backdrop,
     Lock,
+    Info,
     FullScreen,
     Keys,
 }
@@ -122,6 +132,8 @@ impl Toast {
 pub struct Interface {
     context: egui::Context,
     keys_shown: bool,
+    /// Whether the Info panel is showing.
+    info_shown: bool,
     /// Whether the toolbar is showing, decided by where the pointer is.
     ///
     /// Kept here rather than asked of egui each frame because it is also what
@@ -154,6 +166,7 @@ impl Interface {
         Self {
             context,
             keys_shown: false,
+            info_shown: false,
             toolbar_shown: false,
             toasts: Vec::new(),
             last: None,
@@ -167,6 +180,11 @@ impl Interface {
     /// Show or hide the key sheet.
     pub fn toggle_keys(&mut self) {
         self.keys_shown = !self.keys_shown;
+    }
+
+    /// Show or hide the Info panel.
+    pub fn toggle_info(&mut self) {
+        self.info_shown = !self.info_shown;
     }
 
     /// Follow the pointer, and say whether the toolbar's visibility changed.
@@ -218,6 +236,7 @@ impl Interface {
     /// frame, and it is the interface's whole say in what the viewer does.
     pub fn layout(&mut self, raw: egui::RawInput, status: &Status, now: Instant) -> (egui::FullOutput, Option<Action>) {
         let keys_shown = self.keys_shown;
+        let info_shown = self.info_shown;
         let toolbar_shown = self.toolbar_shown;
         let toasts: Vec<(String, f32)> = self
             .toasts
@@ -230,9 +249,12 @@ impl Interface {
         // 0.36 panels are shown inside a `Ui`, and this is the one they sit in.
         let output = self.context.clone().run_ui(raw, |ui| {
             if toolbar_shown {
-                action = toolbar(ui, status);
+                action = toolbar(ui, status, info_shown);
             }
             status_line(ui, status);
+            if info_shown {
+                info_panel(ui, status);
+            }
             if keys_shown {
                 key_sheet(ui);
             }
@@ -245,7 +267,7 @@ impl Interface {
     /// interface would draw anything different from last time.
     pub fn digest(&self, status: &Status) -> String {
         format!(
-            "{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:.3}|{:?}|{:?}|{}|{}|{:?}|{}|{}|{}",
+            "{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:.3}|{:?}|{:?}|{}|{}|{:?}|{}|{}|{}|{}",
             status.name,
             status.position,
             status.size,
@@ -259,6 +281,7 @@ impl Interface {
             status.locked,
             status.backdrop,
             self.keys_shown,
+            self.info_shown,
             self.toolbar_shown,
             self.toasts.len(),
         )
@@ -288,7 +311,7 @@ impl Interface {
 /// A button is disabled rather than hidden when it would do nothing: a strip
 /// whose contents move about as folders change is harder to aim at than one
 /// that is always the same shape.
-fn toolbar(ui: &mut egui::Ui, status: &Status) -> Option<Action> {
+fn toolbar(ui: &mut egui::Ui, status: &Status, info_shown: bool) -> Option<Action> {
     let mut action = None;
     let alone = status.position.is_none_or(|(_, count)| count <= 1);
     let showing = status.size.is_some();
@@ -325,6 +348,7 @@ fn toolbar(ui: &mut egui::Ui, status: &Status) -> Option<Action> {
                     .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         button(ui, "?", "Keys  (?)", true, Action::Keys)
                             .or(button(ui, "⛶", "Full screen  (F11)", true, Action::FullScreen))
+                            .or(toggle(ui, "Info", "What the file says about itself  (I)", showing, info_shown, Action::Info))
                             .or_else(|| {
                                 separator(ui);
                                 None
@@ -447,6 +471,122 @@ fn status_line(ui: &mut egui::Ui, status: &Status) {
         });
 }
 
+/// What the file says about itself, down the right-hand edge.
+///
+/// An overlay rather than a column that pushes the picture aside: the chrome
+/// disappears by design, and a panel that reflowed the framing every time it
+/// opened would move the thing being looked at.
+///
+/// Every row copies its value when clicked. A lens name, a shutter speed or a
+/// coordinate is nearly always wanted somewhere else — a caption, a search, a
+/// map — and reading it off the screen to type it back in is the part that
+/// wastes the panel.
+fn info_panel(ui: &mut egui::Ui, status: &Status) {
+    egui::Panel::right("info")
+        .exact_size(300.0)
+        .resizable(false)
+        .frame(
+            egui::Frame::new()
+                .fill(egui::Color32::from_rgba_unmultiplied(14, 16, 20, 235))
+                .inner_margin(egui::Margin::symmetric(12, 10)),
+        )
+        .show(ui, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.label(egui::RichText::new("Info").strong());
+                ui.add_space(6.0);
+
+                // What the viewer knows without asking the file. Always
+                // present, so a screenshot with no EXIF still says something.
+                if let Some((width, height)) = status.size {
+                    row(ui, "Size", &format!("{width} × {height}"), true);
+                }
+                if let Some(format) = status.format {
+                    row(ui, "Format", format.name(), false);
+                }
+                if let Some(depth) = status.depth {
+                    row(
+                        ui,
+                        "Depth",
+                        match depth {
+                            Depth::Eight => "8-bit",
+                            Depth::Sixteen => "16-bit",
+                        },
+                        true,
+                    );
+                }
+                if let Some(colour) = &status.colour {
+                    row(ui, "Colour", colour, false);
+                }
+                if let Some(bytes) = status.file_size {
+                    row(ui, "File", &file_size(bytes), true);
+                }
+                if let Some(path) = &status.path {
+                    row(ui, "Path", &path.display().to_string(), false);
+                }
+
+                // What the camera wrote. Absent for every screenshot and most
+                // PNGs, which is why the section only appears when there is
+                // something in it.
+                if !status.metadata.camera.is_empty() {
+                    ui.add_space(10.0);
+                    ui.label(egui::RichText::new("Camera").strong());
+                    ui.add_space(4.0);
+                    for entry in &status.metadata.camera {
+                        row(ui, entry.label, &entry.value, entry.label != "Lens");
+                    }
+                }
+
+                if let Some(place) = status.metadata.location {
+                    ui.add_space(10.0);
+                    ui.label(egui::RichText::new("Place").strong());
+                    ui.add_space(4.0);
+                    row(ui, "Coordinates", &place.as_text(), true);
+                }
+            });
+        });
+}
+
+/// One row of the panel: a label, a value, and a click that copies the value.
+///
+/// `measurable` picks the font: monospace for anything with digits in it, so
+/// they do not jitter, which is the reference layout's rule.
+fn row(ui: &mut egui::Ui, label: &str, value: &str, measurable: bool) {
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(label).weak());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let text = if measurable {
+                monospace(value.to_string())
+            } else {
+                egui::RichText::new(value)
+            };
+            // A label rather than a button: the panel is a reading surface,
+            // and eighteen buttons in a column would read as a form.
+            let response = ui.add(egui::Label::new(text).sense(egui::Sense::click()).truncate());
+            if response.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if response.on_hover_text("Click to copy").clicked() {
+                ui.ctx().copy_text(value.to_string());
+            }
+        });
+    });
+}
+
+/// A file size the way a person reads one.
+fn file_size(bytes: u64) -> String {
+    const UNITS: [(&str, u64); 3] = [("MB", 1024 * 1024), ("kB", 1024), ("bytes", 1)];
+    for (unit, scale) in UNITS {
+        if bytes >= scale {
+            return if scale == 1 {
+                format!("{bytes} {unit}")
+            } else {
+                format!("{:.1} {unit}", bytes as f64 / scale as f64)
+            };
+        }
+    }
+    format!("{bytes} bytes")
+}
+
 /// Every key there is, because the chrome does not advertise them.
 fn key_sheet(ui: &mut egui::Ui) {
     egui::Window::new("Keys")
@@ -482,6 +622,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("L", "hold the framing across a step"),
     ("R", "turn a quarter clockwise (Shift for the other way)"),
     ("B", "what shows through transparency"),
+    ("I", "what the file says about itself"),
     ("+ -", "zoom in / out"),
     ("F11", "full screen"),
     ("?", "this list"),
@@ -542,6 +683,9 @@ mod tests {
             hdr: false,
             locked: false,
             backdrop: None,
+            metadata: Metadata::default(),
+            path: None,
+            file_size: None,
         }
     }
 
@@ -788,6 +932,133 @@ mod tests {
         assert_eq!(press(&mut interface, at, true), Some(Action::Next), "a press was lost on a settled interface");
     }
 
+    /// Lay out one frame with the Info panel up, and report what it copied.
+    fn info_frame(interface: &mut Interface, status: &Status, click: Option<egui::Pos2>) -> Vec<String> {
+        let mut events = Vec::new();
+        if let Some(at) = click {
+            events.push(egui::Event::PointerMoved(at));
+            events.push(egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            });
+            events.push(egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 700.0))),
+            events,
+            ..Default::default()
+        };
+        let (mut output, _) = interface.layout(raw, status, Instant::now());
+        output.textures_delta.clear();
+        output
+            .platform_output
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                egui::OutputCommand::CopyText(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A status with the metadata a camera writes.
+    fn photographed() -> Status {
+        let mut status = status();
+        status.metadata = Metadata {
+            camera: vec![
+                crate::metadata::Entry {
+                    label: "Camera",
+                    value: "NITID Probe One".into(),
+                },
+                crate::metadata::Entry {
+                    label: "ISO",
+                    value: "400".into(),
+                },
+            ],
+            location: Some(crate::metadata::Location {
+                latitude: -25.2637,
+                longitude: -57.5759,
+            }),
+        };
+        status.file_size = Some(3_500_000);
+        status
+    }
+
+    /// Clicking a row copies its value. That is what makes the panel useful
+    /// rather than only readable: a coordinate or a lens name is nearly always
+    /// wanted somewhere else, and reading it off the screen to type it back in
+    /// is the part that wastes it.
+    #[test]
+    fn a_row_of_the_panel_copies_what_it_shows() {
+        let mut interface = Interface::new();
+        interface.toggle_info();
+        let status = photographed();
+
+        // Settle, then walk the panel's own column looking for the row that
+        // copies the coordinates.
+        info_frame(&mut interface, &status, None);
+        let wanted = crate::metadata::Location {
+            latitude: -25.2637,
+            longitude: -57.5759,
+        }
+        .as_text();
+
+        let mut copied = Vec::new();
+        for y in 20..680 {
+            // The panel is 300 points wide at the right-hand edge of a 900
+            // point window, so its values sit near the right.
+            let at = egui::pos2(760.0, y as f32);
+            info_frame(&mut interface, &status, None);
+            copied.extend(info_frame(&mut interface, &status, Some(at)));
+            if copied.contains(&wanted) {
+                break;
+            }
+        }
+
+        assert!(copied.contains(&wanted), "no row copied the coordinates; what was copied: {copied:?}",);
+    }
+
+    /// A panel that is not up copies nothing, whatever is clicked.
+    #[test]
+    fn a_hidden_panel_copies_nothing() {
+        let mut interface = Interface::new();
+        let status = photographed();
+        info_frame(&mut interface, &status, None);
+
+        let mut copied = Vec::new();
+        for y in (20..680).step_by(7) {
+            copied.extend(info_frame(&mut interface, &status, Some(egui::pos2(760.0, y as f32))));
+        }
+        assert!(copied.is_empty(), "a hidden panel copied {copied:?}");
+    }
+
+    /// The panel opening and closing is a change worth drawing.
+    #[test]
+    fn opening_the_panel_is_a_change() {
+        let mut interface = Interface::new();
+        interface.changed(&status());
+        interface.toggle_info();
+        assert!(interface.changed(&status()), "opening the panel went unnoticed");
+        interface.toggle_info();
+        assert!(interface.changed(&status()), "closing the panel went unnoticed");
+    }
+
+    /// A file size is read by a person, not by a machine.
+    #[test]
+    fn a_file_size_is_written_the_way_it_is_read() {
+        assert_eq!(file_size(0), "0 bytes");
+        assert_eq!(file_size(512), "512 bytes");
+        assert_eq!(file_size(2048), "2.0 kB");
+        assert_eq!(file_size(3_500_000), "3.3 MB");
+    }
+
     /// A hidden toolbar has no buttons to hit, whatever the pointer does.
     #[test]
     fn a_hidden_toolbar_cannot_be_pressed() {
@@ -815,6 +1086,7 @@ mod tests {
             Action::TurnRight,
             Action::Lock,
             Action::Backdrop,
+            Action::Info,
             Action::FullScreen,
             Action::Keys,
         ] {

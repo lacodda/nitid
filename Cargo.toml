@@ -74,10 +74,12 @@ avif-parse = "2.1"
 # text at all, and the interface is almost entirely text.
 egui = { version = "0.36.1", default-features = false, features = ["default_fonts"] }
 egui-wgpu = "0.36.1"
-# `default-features = false` drops the clipboard (`arboard`), accessibility
-# (`accesskit`) and the X11/Wayland backends: none of them are this stage's
-# subject, and the clipboard has a version of its own later on.
-egui-winit = { version = "0.36.1", default-features = false }
+# `default-features = false` drops accessibility (`accesskit`) and the
+# X11/Wayland backends; `clipboard` is taken back because the Info panel copies
+# a field on click, which is what makes a coordinate or a lens name useful
+# rather than only visible. The full clipboard — the image itself, the path —
+# is still its own version later.
+egui-winit = { version = "0.36.1", default-features = false, features = ["clipboard"] }
 
 kamadak-exif = "0.6"
 bytemuck = { version = "1.25.2", features = ["derive"] }
