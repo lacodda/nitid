@@ -2,6 +2,10 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.20.1] - 2026-08-31
+
+### Bug Fixes
+- Put the install directory on the PATH
 ## [0.20.0] - 2026-08-31
 
 ### Documentation
