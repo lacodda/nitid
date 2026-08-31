@@ -16,7 +16,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use windows_registry::CURRENT_USER;
+use windows_registry::{CURRENT_USER, Type};
 
 use crate::image_source::supported_extensions;
 
@@ -53,6 +53,12 @@ const LEGACY_APPLICATION_KEYS: [&str; 1] = [r"Software\Classes\Applications\niti
 /// The registered-applications entry that puts nitid in Settings.
 const CAPABILITIES_KEY: &str = r"Software\lacodda\nitid\Capabilities";
 
+/// Where the per-user `PATH` lives.
+///
+/// The user hive, not the machine one: an install that needs no administrator
+/// has no business editing the PATH every account on the machine shares.
+const ENVIRONMENT_KEY: &str = "Environment";
+
 /// Install this executable for the current user.
 ///
 /// Returns the directory it was installed into.
@@ -85,6 +91,15 @@ pub fn install() -> Result<PathBuf> {
 
     let extensions = supported_extensions();
     println!("Registered {} file types: {}", extensions.len(), extensions.join(", "));
+
+    // Reported, never fatal: a viewer the shell can open pictures with is
+    // installed even if its directory could not reach the PATH.
+    match add_to_path(&target_dir) {
+        Ok(true) => println!("Added {} to your PATH", target_dir.display()),
+        Ok(false) => {}
+        Err(error) => eprintln!("nitid: could not add {} to your PATH: {error:#}", target_dir.display()),
+    }
+
     println!();
     println!("nitid is now offered in \"Open with\". Windows reserves the choice");
     println!("of default application for you: right-click an image, choose");
@@ -99,6 +114,13 @@ pub fn uninstall() -> Result<()> {
     unregister()?;
     println!("Removed the file type registration");
 
+    let dir = install_dir()?;
+    match remove_from_path(&dir) {
+        Ok(true) => println!("Removed {} from your PATH", dir.display()),
+        Ok(false) => {}
+        Err(error) => eprintln!("nitid: could not remove {} from your PATH: {error:#}", dir.display()),
+    }
+
     // The decoder's AppContainer profile is machine state nitid registered on
     // its first sandboxed decode; uninstalling takes it too. A machine that
     // never decoded a HEIC has nothing to remove, which is not an error.
@@ -106,7 +128,6 @@ pub fn uninstall() -> Result<()> {
         println!("Removed the decoder's container profile");
     }
 
-    let dir = install_dir()?;
     let running = env::current_exe().unwrap_or_default();
     let mut removed = false;
     let mut deferred = false;
@@ -145,6 +166,146 @@ pub fn uninstall() -> Result<()> {
     println!("Removed {}", dir.display());
 
     Ok(())
+}
+
+/// Put the install directory on the user's `PATH`, if it is not there already.
+///
+/// Without this `nitid --version` in a terminal finds nothing: the shell
+/// association is registry work and says nothing about the command line, and
+/// an installer that leaves a command you cannot run has only half installed
+/// the program. Reported rather than fatal — a viewer that opens pictures from
+/// Explorer is still installed, and a PATH that cannot be written is not a
+/// reason to fail the whole command.
+///
+/// Returns whether the directory was added.
+fn add_to_path(dir: &Path) -> Result<bool> {
+    let environment = CURRENT_USER
+        .options()
+        .read()
+        .write()
+        .create()
+        .open(ENVIRONMENT_KEY)
+        .context("opening the user's environment")?;
+
+    // A user who has never had a per-user PATH has no value here at all, which
+    // is an empty PATH rather than an error.
+    let current = environment.get_string("Path").unwrap_or_default();
+    let Some(updated) = path_with(&current, dir) else {
+        return Ok(false);
+    };
+
+    // The type has to be preserved. A PATH is nearly always `REG_EXPAND_SZ`
+    // because entries like `%JAVA_HOME%\bin` are written unexpanded; storing
+    // it back as a plain string would leave those entries as literal text and
+    // silently break every one of them. Only a value that is already a plain
+    // string — or absent — is written as one.
+    match environment.get_type("Path") {
+        Ok(Type::String) => environment.set_string("Path", &updated)?,
+        // Absent, expandable, or something unexpected: the expandable form is
+        // what Windows itself writes and is correct either way, since a string
+        // with nothing to expand expands to itself.
+        _ => environment.set_expand_string("Path", &updated)?,
+    }
+
+    announce_environment_change();
+    Ok(true)
+}
+
+/// Take the install directory back off the user's `PATH`.
+///
+/// Silent about a PATH that never had it: uninstalling something that was
+/// never there is not a failure.
+fn remove_from_path(dir: &Path) -> Result<bool> {
+    let Ok(environment) = CURRENT_USER.options().read().write().open(ENVIRONMENT_KEY) else {
+        return Ok(false);
+    };
+    let Ok(current) = environment.get_string("Path") else {
+        return Ok(false);
+    };
+    let Some(updated) = path_without(&current, dir) else {
+        return Ok(false);
+    };
+
+    match environment.get_type("Path") {
+        Ok(Type::String) => environment.set_string("Path", &updated)?,
+        _ => environment.set_expand_string("Path", &updated)?,
+    }
+
+    announce_environment_change();
+    Ok(true)
+}
+
+/// `path` with `dir` appended, or `None` if it is already there.
+///
+/// Kept apart from the registry so the rules that matter — how an entry is
+/// matched, what happens to a trailing separator — are testable without
+/// touching the machine's environment.
+fn path_with(path: &str, dir: &Path) -> Option<String> {
+    if path_contains(path, dir) {
+        return None;
+    }
+    let trimmed = path.trim_end_matches(';');
+    Some(if trimmed.is_empty() {
+        dir.display().to_string()
+    } else {
+        format!("{trimmed};{}", dir.display())
+    })
+}
+
+/// `path` with every entry naming `dir` removed, or `None` if there were none.
+fn path_without(path: &str, dir: &Path) -> Option<String> {
+    if !path_contains(path, dir) {
+        return None;
+    }
+    let kept: Vec<&str> = path.split(';').filter(|entry| !entry.trim().is_empty() && !same_entry(entry, dir)).collect();
+    Some(kept.join(";"))
+}
+
+/// Whether `path` already names `dir`.
+fn path_contains(path: &str, dir: &Path) -> bool {
+    path.split(';').any(|entry| same_entry(entry, dir))
+}
+
+/// Whether one `PATH` entry names this directory.
+///
+/// Compared case-insensitively and without a trailing separator, because
+/// Windows treats `C:\Programs\nitid`, `c:\programs\nitid\` and the same path
+/// with surrounding spaces as one directory — and adding a second spelling of
+/// a directory already on the PATH is how a PATH grows a duplicate on every
+/// upgrade.
+fn same_entry(entry: &str, dir: &Path) -> bool {
+    let normalise = |text: &str| text.trim().trim_end_matches(['\\', '/']).to_lowercase();
+    !entry.trim().is_empty() && normalise(entry) == normalise(&dir.display().to_string())
+}
+
+/// Tell the system the environment changed.
+///
+/// Without this the new `PATH` reaches only processes started after the next
+/// sign-in: Explorer caches the environment it hands to everything it
+/// launches, and it re-reads it when this message arrives. Already-open
+/// terminals keep the environment they started with either way — nothing can
+/// change that from outside.
+///
+/// Best effort by construction: it is a courtesy to the shell, and a machine
+/// where the broadcast fails still has the correct PATH in the registry.
+fn announce_environment_change() {
+    use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{HWND_BROADCAST, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_SETTINGCHANGE};
+
+    let environment = windows::core::w!("Environment");
+    unsafe {
+        // A timeout, and `ABORTIFHUNG`: broadcasting to every top-level window
+        // means one wedged application must not hold up an install.
+        SendMessageTimeoutW(
+            HWND(HWND_BROADCAST.0),
+            WM_SETTINGCHANGE,
+            WPARAM(0),
+            LPARAM(environment.as_ptr() as isize),
+            SMTO_ABORTIFHUNG,
+            5000,
+            None,
+        );
+    }
 }
 
 /// `%LOCALAPPDATA%\Programs\nitid` — where a per-user install belongs.
@@ -323,6 +484,88 @@ mod tests {
     #[test]
     fn different_paths_are_not_the_same_file() {
         assert!(!same_file(Path::new(r"C:\a\nitid.exe"), Path::new(r"C:\b\nitid.exe")));
+    }
+
+    /// The whole point of the patch: after an install the directory is on the
+    /// PATH, so `nitid` is a command a terminal can find.
+    #[test]
+    fn the_install_directory_joins_the_path() {
+        let dir = Path::new(r"C:\Users\a\AppData\Local\Programs\nitid");
+        let updated = path_with(r"C:\Windows;C:\Windows\System32", dir).expect("the directory was not added");
+
+        assert!(updated.ends_with(r"\nitid"), "{updated}");
+        assert!(
+            updated.starts_with(r"C:\Windows;C:\Windows\System32;"),
+            "the existing PATH was disturbed: {updated}"
+        );
+    }
+
+    /// An upgrade runs `install` again. Adding the directory a second time is
+    /// how a PATH collects one copy of itself per release.
+    #[test]
+    fn installing_twice_does_not_add_the_directory_twice() {
+        let dir = Path::new(r"C:\Programs\nitid");
+        let once = path_with(r"C:\Windows", dir).expect("the first install added nothing");
+        assert_eq!(path_with(&once, dir), None, "a second install added the directory again");
+    }
+
+    /// Windows treats these as one directory, so a PATH already carrying any
+    /// spelling of it must not gain another.
+    #[test]
+    fn a_directory_already_on_the_path_is_recognised_however_it_is_spelt() {
+        let dir = Path::new(r"C:\Programs\nitid");
+        for spelling in [r"C:\Programs\nitid", r"c:\programs\NITID", r"C:\Programs\nitid\", r" C:\Programs\nitid "] {
+            assert_eq!(
+                path_with(&format!(r"C:\Windows;{spelling};C:\Other"), dir),
+                None,
+                "{spelling} was not recognised as the install directory",
+            );
+        }
+    }
+
+    /// A PATH is the user's, and most of it belongs to other programs. The
+    /// unexpanded entry is the one that matters: it is why the value has to go
+    /// back as `REG_EXPAND_SZ`, and it must survive the edit untouched.
+    #[test]
+    fn adding_and_removing_leave_every_other_entry_alone() {
+        let dir = Path::new(r"C:\Programs\nitid");
+        let original = r"C:\Windows;%JAVA_HOME%\bin;C:\Program Files\Git\cmd";
+
+        let added = path_with(original, dir).expect("nothing was added");
+        assert!(added.contains(r"%JAVA_HOME%\bin"), "an unexpanded entry was mangled: {added}");
+
+        let removed = path_without(&added, dir).expect("nothing was removed");
+        assert_eq!(removed, original, "a round trip through the PATH changed it");
+    }
+
+    /// Uninstalling takes back exactly what installing added, and nothing when
+    /// there is nothing of ours there.
+    #[test]
+    fn uninstalling_removes_the_directory_and_only_it() {
+        let dir = Path::new(r"C:\Programs\nitid");
+        assert_eq!(path_without(r"C:\Windows;C:\Other", dir), None, "a PATH without us was rewritten anyway");
+
+        // Every spelling goes, including a duplicate an earlier version left.
+        let crowded = r"C:\Windows;C:\Programs\nitid;C:\Other;c:\programs\nitid\";
+        assert_eq!(path_without(crowded, dir), Some(r"C:\Windows;C:\Other".to_string()));
+    }
+
+    /// A user who has never had a per-user PATH gets one with just this in it,
+    /// rather than a leading separator and an empty first entry.
+    #[test]
+    fn an_empty_path_becomes_the_directory_alone() {
+        let dir = Path::new(r"C:\Programs\nitid");
+        assert_eq!(path_with("", dir), Some(r"C:\Programs\nitid".to_string()));
+        assert_eq!(path_with(";", dir), Some(r"C:\Programs\nitid".to_string()));
+    }
+
+    /// A PATH ending in a separator is common and must not grow an empty entry.
+    #[test]
+    fn a_trailing_separator_does_not_become_an_empty_entry() {
+        let dir = Path::new(r"C:\Programs\nitid");
+        let updated = path_with(r"C:\Windows;", dir).expect("nothing was added");
+        assert_eq!(updated, r"C:\Windows;C:\Programs\nitid");
+        assert!(!updated.contains(";;"), "an empty entry crept in: {updated}");
     }
 
     /// The registration covers exactly what the build can open, so a version

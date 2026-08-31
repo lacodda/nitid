@@ -344,7 +344,7 @@ has no size limit to hide behind.
 
 ## Status
 
-Early development — v0.20.0 is out. Startup, colour and format coverage hold:
+Early development — v0.20.1 is out. Startup, colour and format coverage hold:
 every modern still format opens, a phone's photographs included, every one of
 them reaches the screen without a wait, and the ones that animate play. The
 process that decodes the heavy formats runs with no network in either
@@ -388,6 +388,7 @@ versions, each one theme; the road to 1.0 is fixed:
 | ✅ v0.18.0 | Controlling the view: zoom lock across a step, viewing rotation, backdrop for transparency |
 | ✅ v0.19.0 | The Info panel: EXIF, the place a photograph was taken, every row copyable |
 | ✅ v0.20.0 | Reading the picture: a live histogram of the file's own values, and a loupe held at 100% |
+| ✅ v0.20.1 | `nitid install` puts itself on the `PATH`, so the command works from a terminal |
 | v0.21.0 – v0.35.0 | The everyday viewer: colour tools, clipboard, file operations, culling, comparison, settings |
 | v0.36.0 – v0.39.0 | Windows integration: context menu, installer, auto-update, thumbnails |
 | v0.40.0 – v0.41.0 | Documentation site, stabilisation |
@@ -422,9 +423,14 @@ unpack it anywhere, and run:
 nitid install
 ```
 
-This copies nitid to `%LOCALAPPDATA%\Programs\nitid` and registers the file
-types it can open — no administrator, nothing outside your own user account.
-Re-running it upgrades an existing install, even while the viewer is open.
+This copies nitid to `%LOCALAPPDATA%\Programs\nitid`, registers the file types
+it can open, and puts that directory on your `PATH` so `nitid` works as a
+command — no administrator, nothing outside your own user account. Re-running
+it upgrades an existing install, even while the viewer is open, and does not
+add the directory to the `PATH` a second time.
+
+A terminal that was already open keeps the environment it started with, so
+`nitid` becomes available there once it is restarted.
 
 The zip carries two executables and both are installed: `nitid.exe` is the one
 to run from a terminal, and `nitidw.exe` is what the shell opens files with.
@@ -437,7 +443,7 @@ with** — right-click an image, choose *Open with* → *Choose another app*, pi
 nitid and tick *Always use this app*. It also shows up in *Settings → Apps →
 Default apps*.
 
-`nitid uninstall` removes both the files and the registration.
+`nitid uninstall` removes the files, the registration, and the `PATH` entry.
 
 ## Using it
 
