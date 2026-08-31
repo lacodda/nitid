@@ -130,8 +130,8 @@ and the zoom — and everything else appears when you reach for it.
 
 Move the pointer to the top of the window and a toolbar comes down: step
 through the folder, zoom, fit, actual size, turn, the zoom lock, the backdrop,
-full screen. It carries nothing the keyboard does not, and every button names
-its key. Press `?` for the full list.
+the Info panel, the histogram, full screen. It carries nothing the keyboard
+does not, and every button names its key. Press `?` for the full list.
 
 **It is not on the way to the picture.** Laying the interface out and building
 its place on the GPU costs around forty milliseconds, so the first frame is the
@@ -205,6 +205,38 @@ seen on white, and a checkerboard is how you tell "transparent" from "a flat
 grey that happens to match the scene". The checker is measured in screen
 pixels, so it stays the same size at any zoom rather than reading as part of
 the picture.
+
+## Reading the picture
+
+Two things that answer questions the picture on screen cannot.
+
+**The histogram**, with `H`: what tones the picture is actually made of, in the
+corner rather than across the frame. The three channels are drawn in their own
+colours and add where they overlap, so a colour cast shows as the curves
+pulling apart; luminance goes over the top as a line, because that is the curve
+an exposure is judged by. All four share one scale — drawn against their own
+maxima a flat channel and a peaked one would look alike.
+
+It counts **the values in the file**, before the colour transform. A
+photographer judging an exposure is judging what the camera recorded, not what
+this display can show: measured after the profile, the same photograph's
+histogram would move when the window was dragged to another monitor, and would
+report clipping belonging to the screen rather than to the picture. See
+[ADR 0019](docs/adr/0019-the-histogram-counts-the-file-not-the-display.md).
+
+The count is not on the way to the first pixel. A file nobody has asked to
+measure is never measured, and when you do ask, the counting runs on a worker
+thread over the pixels the loader is already holding — nothing is decoded
+twice. A large photograph is sampled rather than counted whole: the shape of a
+sixty-megapixel frame is settled long before the last pixel.
+
+**The loupe**, by holding `Z`: 100% under the cursor for as long as the key is
+down, and the framing you had back the moment you let go. It answers the one
+question a fitted photograph cannot — is this actually sharp — without the pan
+in, zoom, and pan back that asking it otherwise costs. Because it is held
+rather than toggled there is no mode to be left in: stepping to the next image
+while it is down carries the framing underneath it, not the loupe's, and a key
+let go while another window is in front drops it too.
 
 ## Large images
 
@@ -312,7 +344,7 @@ has no size limit to hide behind.
 
 ## Status
 
-Early development — v0.19.0 is out. Startup, colour and format coverage hold:
+Early development — v0.20.0 is out. Startup, colour and format coverage hold:
 every modern still format opens, a phone's photographs included, every one of
 them reaches the screen without a wait, and the ones that animate play. The
 process that decodes the heavy formats runs with no network in either
@@ -327,7 +359,9 @@ a status line saying what is on screen, a toolbar that comes down when the
 pointer reaches for it, and a key sheet — none of it in front of the
 photograph. The framing can be held across a step for comparing a series, the
 picture turned, and the backdrop behind transparency chosen, and `I` says what
-the file says about itself. Development runs in small
+the file says about itself. **And the picture can be read now**: `H` draws a
+histogram of the file's own values, and holding `Z` puts 100% under the cursor
+for as long as the key is down. Development runs in small
 versions, each one theme; the road to 1.0 is fixed:
 
 | Version | What lands |
@@ -353,7 +387,8 @@ versions, each one theme; the road to 1.0 is fixed:
 | ✅ v0.17.0 | The interface: status line, a toolbar that appears on approach, key sheet, messages |
 | ✅ v0.18.0 | Controlling the view: zoom lock across a step, viewing rotation, backdrop for transparency |
 | ✅ v0.19.0 | The Info panel: EXIF, the place a photograph was taken, every row copyable |
-| v0.20.0 – v0.35.0 | The everyday viewer: histogram and loupe, colour tools, clipboard, file operations, culling, comparison, settings |
+| ✅ v0.20.0 | Reading the picture: a live histogram of the file's own values, and a loupe held at 100% |
+| v0.21.0 – v0.35.0 | The everyday viewer: colour tools, clipboard, file operations, culling, comparison, settings |
 | v0.36.0 – v0.39.0 | Windows integration: context menu, installer, auto-update, thumbnails |
 | v0.40.0 – v0.41.0 | Documentation site, stabilisation |
 | v1.0.0 | Public release — the default viewer, nothing missing |
@@ -420,8 +455,16 @@ Opening a file opens its folder: the arrow keys walk the images beside it.
 | Wheel | zoom around the cursor |
 | Drag | pan |
 | Middle click | toggle fit and 100% |
+| `+` `-` | zoom in / out |
 | `0` `1` | fit to window / actual size |
+| `Z` | hold for 100% under the cursor |
+| `L` | hold the framing across a step |
+| `R` | turn a quarter clockwise (`Shift+R` the other way) |
+| `B` | what shows through transparency |
+| `I` | what the file says about itself |
+| `H` | what tones the picture is made of |
 | `F11` | fullscreen |
+| `?` | every key there is |
 | `Esc` | quit |
 
 "100%" means one image pixel per logical pixel, so a photo is the same size
