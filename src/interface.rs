@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use std::path::PathBuf;
 
 use crate::format::Format;
+use crate::histogram::{BUCKETS, Histogram};
 use crate::image_source::Depth;
 use crate::metadata::Metadata;
 use crate::view::FitMode;
@@ -78,6 +79,11 @@ pub struct Status {
     /// on disk. Shown in the panel beside the camera's own account.
     pub path: Option<PathBuf>,
     pub file_size: Option<u64>,
+    /// What tones the picture is made of, once it has been counted.
+    ///
+    /// `None` while the count is still running, which is what the panel shows
+    /// as "counting" rather than as an empty pair of axes.
+    pub histogram: Option<Histogram>,
 }
 
 /// What a toolbar button asks the viewer to do.
@@ -98,6 +104,7 @@ pub enum Action {
     Backdrop,
     Lock,
     Info,
+    Histogram,
     FullScreen,
     Keys,
 }
@@ -134,6 +141,8 @@ pub struct Interface {
     keys_shown: bool,
     /// Whether the Info panel is showing.
     info_shown: bool,
+    /// Whether the histogram is showing.
+    histogram_shown: bool,
     /// Whether the toolbar is showing, decided by where the pointer is.
     ///
     /// Kept here rather than asked of egui each frame because it is also what
@@ -167,6 +176,7 @@ impl Interface {
             context,
             keys_shown: false,
             info_shown: false,
+            histogram_shown: false,
             toolbar_shown: false,
             toasts: Vec::new(),
             last: None,
@@ -185,6 +195,19 @@ impl Interface {
     /// Show or hide the Info panel.
     pub fn toggle_info(&mut self) {
         self.info_shown = !self.info_shown;
+    }
+
+    /// Show or hide the histogram.
+    pub fn toggle_histogram(&mut self) {
+        self.histogram_shown = !self.histogram_shown;
+    }
+
+    /// Whether the histogram is showing.
+    ///
+    /// Asked by the application before it starts a count: the tones are
+    /// measured only while something is there to read them.
+    pub fn histogram_shown(&self) -> bool {
+        self.histogram_shown
     }
 
     /// Follow the pointer, and say whether the toolbar's visibility changed.
@@ -237,6 +260,7 @@ impl Interface {
     pub fn layout(&mut self, raw: egui::RawInput, status: &Status, now: Instant) -> (egui::FullOutput, Option<Action>) {
         let keys_shown = self.keys_shown;
         let info_shown = self.info_shown;
+        let histogram_shown = self.histogram_shown;
         let toolbar_shown = self.toolbar_shown;
         let toasts: Vec<(String, f32)> = self
             .toasts
@@ -249,11 +273,14 @@ impl Interface {
         // 0.36 panels are shown inside a `Ui`, and this is the one they sit in.
         let output = self.context.clone().run_ui(raw, |ui| {
             if toolbar_shown {
-                action = toolbar(ui, status, info_shown);
+                action = toolbar(ui, status, info_shown, histogram_shown);
             }
             status_line(ui, status);
             if info_shown {
                 info_panel(ui, status);
+            }
+            if histogram_shown {
+                histogram_panel(ui, status);
             }
             if keys_shown {
                 key_sheet(ui);
@@ -284,6 +311,14 @@ impl Interface {
             self.info_shown,
             self.toolbar_shown,
             self.toasts.len(),
+        ) + &format!(
+            "|{}|{:?}",
+            self.histogram_shown,
+            // The counted total stands in for the whole shape: a histogram
+            // that arrives, or one replaced by the next picture's, changes it.
+            // Without this the panel would open empty and stay empty, because
+            // nothing else in the digest moves when a count lands.
+            status.histogram.as_ref().map(|histogram| histogram.counted),
         )
     }
 
@@ -311,7 +346,7 @@ impl Interface {
 /// A button is disabled rather than hidden when it would do nothing: a strip
 /// whose contents move about as folders change is harder to aim at than one
 /// that is always the same shape.
-fn toolbar(ui: &mut egui::Ui, status: &Status, info_shown: bool) -> Option<Action> {
+fn toolbar(ui: &mut egui::Ui, status: &Status, info_shown: bool, histogram_shown: bool) -> Option<Action> {
     let mut action = None;
     let alone = status.position.is_none_or(|(_, count)| count <= 1);
     let showing = status.size.is_some();
@@ -349,6 +384,14 @@ fn toolbar(ui: &mut egui::Ui, status: &Status, info_shown: bool) -> Option<Actio
                         button(ui, "?", "Keys  (?)", true, Action::Keys)
                             .or(button(ui, "⛶", "Full screen  (F11)", true, Action::FullScreen))
                             .or(toggle(ui, "Info", "What the file says about itself  (I)", showing, info_shown, Action::Info))
+                            .or(toggle(
+                                ui,
+                                "Tones",
+                                "What tones the picture is made of  (H)",
+                                showing,
+                                histogram_shown,
+                                Action::Histogram,
+                            ))
                             .or_else(|| {
                                 separator(ui);
                                 None
@@ -587,6 +630,203 @@ fn file_size(bytes: u64) -> String {
     format!("{bytes} bytes")
 }
 
+/// How tall the histogram's plot is, in logical points.
+///
+/// Tall enough for the shape of a curve to be legible, short enough that it
+/// sits over a corner of the photograph rather than across it.
+const HISTOGRAM_HEIGHT: f32 = 96.0;
+
+/// How wide the histogram panel is.
+///
+/// One logical point per bucket plus its margins, so no column is dropped or
+/// doubled by the rounding a narrower panel would force.
+const HISTOGRAM_WIDTH: f32 = BUCKETS as f32 + 20.0;
+
+/// How tall the whole panel comes out: the plot, the axis labels under it, and
+/// the frame's own margins.
+///
+/// Used to place the panel from the bottom of the free area upwards, so it sits
+/// on the status line rather than through it.
+const HISTOGRAM_PANEL_HEIGHT: f32 = HISTOGRAM_HEIGHT + 34.0;
+
+/// How much of the plot is left empty above the tallest column.
+///
+/// Without it the peak bucket runs into the ceiling and is drawn clipped, which
+/// reads as a column that continues past the top — exactly the wrong thing for
+/// a plot whose job is to show where the picture's values *stop*. Measured on a
+/// flat-toned file, where one bucket holds nearly everything.
+const HISTOGRAM_HEADROOM: f32 = 0.94;
+
+// The two invariants the drawing depends on, held where the numbers are and
+// checked as the crate builds rather than as a test runs: the peak column has
+// to stay clear of the ceiling without wasting most of the plot, and the panel
+// has to declare a height that covers the plot plus the labels under it — the
+// figure it is placed by. Both were wrong in the build that reached a hands-on
+// run, one clipping the tallest column and one hanging the panel through the
+// status line.
+const _: () = {
+    assert!(HISTOGRAM_HEADROOM < 1.0, "the peak column is drawn right up to the ceiling");
+    assert!(HISTOGRAM_HEADROOM > 0.8, "the plot wastes too much of its height");
+    assert!(
+        HISTOGRAM_PANEL_HEIGHT >= HISTOGRAM_HEIGHT + 30.0,
+        "the panel does not cover the plot and the axis labels under it",
+    );
+};
+
+/// What tones the picture is made of.
+///
+/// An overlay in the corner rather than a panel that takes a strip of window:
+/// the picture keeps its framing while this is up, which is the same decision
+/// the Info panel was built on — a histogram that reflows the photograph
+/// changes the thing it is measuring.
+///
+/// It sits at the bottom left, clear of the Info panel on the right and of the
+/// toolbar at the top, so the two can be read together.
+///
+/// Placed against the area the panels have left rather than against the window,
+/// which is what a fixed offset from the bottom would do: the status line's
+/// height is its text and its margins, so an offset guessed to clear it is a
+/// guess that a different font size or a taller line silently invalidates.
+/// Measured, the guess was already wrong — the panel hung past the bottom edge
+/// and took the status line with it.
+fn histogram_panel(ui: &mut egui::Ui, status: &Status) {
+    // What is left of the window once the status line and any toolbar have
+    // taken their strips. `available_rect_before_wrap` is what the panels
+    // actually shrink; `max_rect` is the root allocation and still spans the
+    // whole window, which is how the first attempt drew the panel through the
+    // status line.
+    let free = ui.available_rect_before_wrap();
+    egui::Area::new("histogram".into())
+        .fixed_pos(egui::pos2(free.left() + 12.0, free.bottom() - HISTOGRAM_PANEL_HEIGHT - 12.0))
+        .interactable(false)
+        .show(ui.ctx(), |ui| {
+            egui::Frame::new()
+                .fill(egui::Color32::from_rgba_unmultiplied(14, 16, 20, 235))
+                .inner_margin(egui::Margin::symmetric(10, 8))
+                .corner_radius(6)
+                .show(ui, |ui| {
+                    ui.set_width(HISTOGRAM_WIDTH);
+                    match &status.histogram {
+                        Some(histogram) if !histogram.is_empty() => plot_histogram(ui, histogram),
+                        // Counted, and there was nothing to count.
+                        Some(_) => {
+                            ui.label(egui::RichText::new("Tones").strong());
+                            ui.label(egui::RichText::new("nothing but transparency").weak());
+                        }
+                        // The count is on its way. Said rather than shown as
+                        // empty axes, which would read as a picture with no
+                        // tones in it.
+                        None => {
+                            ui.label(egui::RichText::new("Tones").strong());
+                            ui.label(egui::RichText::new("counting…").weak());
+                        }
+                    }
+                });
+        });
+}
+
+/// Draw the four curves.
+///
+/// The three channels are drawn in their own colours and **added** where they
+/// overlap, so a grey picture reads as one white shape rather than as whichever
+/// channel happened to be painted last. Drawn as opaque rectangles in order the
+/// third channel simply covers the other two: measured on a grey gradient, the
+/// whole plot came out blue, because blue is drawn last. Luminance goes over
+/// the top in outline: it is the curve an exposure is judged by, and it has to
+/// stay readable through whatever the channels are doing underneath.
+fn plot_histogram(ui: &mut egui::Ui, histogram: &Histogram) {
+    let (response, painter) = ui.allocate_painter(egui::vec2(BUCKETS as f32, HISTOGRAM_HEIGHT), egui::Sense::hover());
+    let rect = response.rect;
+
+    // One scale for all four curves: drawn against their own maxima, a flat
+    // channel and a peaked one would look alike and a colour cast would
+    // disappear. The headroom keeps the tallest column clear of the ceiling.
+    let peak = histogram.peak().max(1) as f32;
+    let width = rect.width() / BUCKETS as f32;
+    let plot = |count: u32| (count as f32 / peak).min(1.0) * rect.height() * HISTOGRAM_HEADROOM;
+
+    // The plot's own ground, so the curves are read against something rather
+    // than against whatever part of the photograph is behind them.
+    painter.rect_filled(rect, 2.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 140));
+
+    // One column per bucket, its colour mixed from whichever channels reach
+    // that height. Walking the buckets rather than the channels is what makes
+    // the addition possible: all three counts for a bucket are in hand at once.
+    for bucket in 0..BUCKETS {
+        let heights = [
+            plot(histogram.channels[0][bucket]),
+            plot(histogram.channels[1][bucket]),
+            plot(histogram.channels[2][bucket]),
+        ];
+        let tallest = heights[0].max(heights[1]).max(heights[2]);
+        if tallest <= 0.0 {
+            continue;
+        }
+
+        // The column is drawn in bands from the bottom up, each band coloured
+        // by the channels still present at that height. Sorting the three
+        // heights gives the band boundaries directly.
+        let mut steps = heights;
+        steps.sort_by(f32::total_cmp);
+
+        let x = rect.left() + bucket as f32 * width;
+        let mut from = 0.0f32;
+        for boundary in steps {
+            if boundary <= from {
+                continue;
+            }
+            // Which channels still reach into this band.
+            let colour = band_colour([heights[0] >= boundary, heights[1] >= boundary, heights[2] >= boundary]);
+            painter.rect_filled(
+                egui::Rect::from_min_max(egui::pos2(x, rect.bottom() - boundary), egui::pos2(x + width, rect.bottom() - from)),
+                0.0,
+                colour,
+            );
+            from = boundary;
+        }
+    }
+
+    // Luminance last, as a line over the channels rather than a filled shape,
+    // so it is legible whatever they are doing underneath.
+    let line: Vec<egui::Pos2> = histogram
+        .luma
+        .iter()
+        .enumerate()
+        .map(|(bucket, count)| egui::pos2(rect.left() + bucket as f32 * width + width / 2.0, rect.bottom() - plot(*count)))
+        .collect();
+    painter.add(egui::Shape::line(
+        line,
+        egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(240, 240, 245, 210)),
+    ));
+
+    ui.add_space(2.0);
+    // What the axis means, because a histogram measured somewhere else answers
+    // a different question — see the module for why it is the file's values.
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("shadows").weak().small());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(egui::RichText::new("highlights").weak().small());
+        });
+    });
+}
+
+/// The colour of one band of a histogram column: the channels present in it,
+/// added.
+///
+/// This is what stops the plot from being a picture of whichever channel was
+/// painted last. All three present is white — a neutral picture reads as one
+/// grey shape — and any two make the secondary between them, so a cast shows
+/// as the colour of the channels that are *missing* from a band.
+fn band_colour(lit: [bool; 3]) -> egui::Color32 {
+    /// How bright a channel is where it is present, and where it is not. The
+    /// floor is not zero: a band with one channel in it still has to read as a
+    /// column against the plot's dark ground.
+    const ON: u8 = 235;
+    const OFF: u8 = 30;
+
+    egui::Color32::from_rgb(if lit[0] { ON } else { OFF }, if lit[1] { ON } else { OFF }, if lit[2] { ON } else { OFF })
+}
+
 /// Every key there is, because the chrome does not advertise them.
 fn key_sheet(ui: &mut egui::Ui) {
     egui::Window::new("Keys")
@@ -619,10 +859,12 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Drag", "pan"),
     ("Middle click", "toggle fit and 100%"),
     ("0 1", "fit to window / actual size"),
+    ("Z", "hold for 100% under the cursor"),
     ("L", "hold the framing across a step"),
     ("R", "turn a quarter clockwise (Shift for the other way)"),
     ("B", "what shows through transparency"),
     ("I", "what the file says about itself"),
+    ("H", "what tones the picture is made of"),
     ("+ -", "zoom in / out"),
     ("F11", "full screen"),
     ("?", "this list"),
@@ -686,6 +928,149 @@ mod tests {
             metadata: Metadata::default(),
             path: None,
             file_size: None,
+            histogram: None,
+        }
+    }
+
+    /// The channels add rather than cover one another.
+    ///
+    /// Found by a hands-on run, not by a test: the plot was drawn as three
+    /// passes of opaque rectangles, so blue — painted last — covered the other
+    /// two and a grey gradient came out solid blue. The counting was right the
+    /// whole time; the drawing was the lie.
+    #[test]
+    fn the_channels_add_where_they_overlap() {
+        // All three present is neutral: a grey picture is one grey shape.
+        let all = band_colour([true, true, true]);
+        assert_eq!(all.r(), all.g(), "a neutral band came out tinted");
+        assert_eq!(all.g(), all.b(), "a neutral band came out tinted");
+        assert!(all.r() > 200, "a band with every channel in it is not bright");
+
+        // Two channels make the secondary between them rather than the last
+        // one drawn: red and green are yellow, not green.
+        let yellow = band_colour([true, true, false]);
+        assert!(yellow.r() > 200 && yellow.g() > 200, "red and green did not add");
+        assert!(yellow.b() < 60, "a channel that is not in this band showed up in it");
+
+        // And one channel alone is that channel, still legible against the
+        // plot's dark ground.
+        let blue = band_colour([false, false, true]);
+        assert!(blue.b() > 200 && blue.r() < 60 && blue.g() < 60);
+        assert!(blue.b() > 60, "a lone channel is too dark to read as a column");
+    }
+
+    /// Every combination is distinguishable from every other, or two different
+    /// mixtures of channels would look the same and the plot would say less
+    /// than it appears to.
+    #[test]
+    fn every_mixture_of_channels_looks_different() {
+        let mut seen = Vec::new();
+        for red in [false, true] {
+            for green in [false, true] {
+                for blue in [false, true] {
+                    let colour = band_colour([red, green, blue]);
+                    assert!(!seen.contains(&colour), "[{red}, {green}, {blue}] draws the same colour as another mixture",);
+                    seen.push(colour);
+                }
+            }
+        }
+    }
+
+    /// Where a named area actually landed, measured from what egui laid out.
+    ///
+    /// The panels decide their own heights from their text and margins, so the
+    /// only honest way to ask whether two of them overlap is to lay a frame out
+    /// and look at the rectangles that came back.
+    fn laid_out_rect(interface: &mut Interface, status: &Status, id: egui::Id, height: f32) -> Option<egui::Rect> {
+        // Twice: an `Area` reports the size it was on the previous pass, so the
+        // first frame gives the position it took before its contents were
+        // measured. The second is where it settles.
+        for _ in 0..2 {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, height))),
+                ..Default::default()
+            };
+            let (mut output, _) = interface.layout(raw, status, Instant::now());
+            output.textures_delta.clear();
+        }
+        interface.context().memory(|memory| memory.area_rect(id))
+    }
+
+    /// A histogram with something in it, so the panel lays out at the height it
+    /// really draws at.
+    fn counted_histogram() -> Histogram {
+        let pixels: Vec<u8> = (0..64u32).flat_map(|index| [(index * 4) as u8, 128, 64, 255]).collect();
+        Histogram::of(&crate::image_source::DecodedImage {
+            width: 8,
+            height: 8,
+            pixels,
+            depth: Depth::Eight,
+        })
+    }
+
+    /// Where the area left to overlays ends, in a laid-out frame.
+    ///
+    /// Measured through the same call the panel places itself by, so the test
+    /// cannot pass by agreeing with a number the drawing does not use.
+    fn free_area_bottom(interface: &mut Interface, status: &Status, height: f32) -> f32 {
+        let bottom = std::sync::Arc::new(std::sync::Mutex::new(height));
+        let seen = std::sync::Arc::clone(&bottom);
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, height))),
+            ..Default::default()
+        };
+        let mut output = interface.context().clone().run_ui(raw, |ui| {
+            status_line(ui, status);
+            *seen.lock().expect("the probe is poisoned") = ui.available_rect_before_wrap().bottom();
+        });
+        output.textures_delta.clear();
+        *bottom.lock().expect("the probe is poisoned")
+    }
+
+    /// The histogram sits above the status line rather than through it.
+    ///
+    /// Found by a hands-on run: the panel was anchored a guessed distance up
+    /// from the bottom of the window, and the guess did not match what the
+    /// status line actually occupies — so the axis labels were drawn straight
+    /// over the file name. A guess is what this test exists to forbid; the
+    /// heights belong to egui and only egui can be asked for them.
+    #[test]
+    fn the_histogram_does_not_cover_the_status_line() {
+        for height in [500.0, 600.0, 900.0] {
+            let mut interface = Interface::new();
+            interface.toggle_histogram();
+            // A counted histogram, not the "counting…" placeholder: the plot
+            // is three times the height of that, and measuring the placeholder
+            // is how a first version of this test passed while the panel drew
+            // straight through the status line on screen.
+            let mut status = status();
+            status.histogram = Some(counted_histogram());
+
+            let Some(plot) = laid_out_rect(&mut interface, &status, egui::Id::new("histogram"), height) else {
+                panic!("the histogram laid out nothing at a window height of {height}");
+            };
+            assert!(
+                plot.height() > HISTOGRAM_HEIGHT,
+                "the panel measured {} tall, which is the placeholder rather than the plot",
+                plot.height(),
+            );
+
+            // The status line takes a strip off the bottom, so anything the
+            // panels have left ends above it. Asking egui for that is the
+            // whole point: the strip's height is its text and its margins.
+            let free_bottom = free_area_bottom(&mut interface, &status, height);
+            assert!(
+                free_bottom < height,
+                "the status line took no strip at all, so this test would pass on any placement",
+            );
+            assert!(
+                plot.bottom() <= free_bottom + 0.5,
+                "at a window height of {height} the histogram reaches {} and the status line starts at {free_bottom}",
+                plot.bottom(),
+            );
+            // And it is actually on screen, not pushed off the top by a
+            // placement that only avoids the status line by leaving the window.
+            assert!(plot.top() >= 0.0, "the histogram was pushed off the top of the window");
         }
     }
 

@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
@@ -26,6 +26,7 @@ use crate::folder::Folder;
 use crate::format::Format;
 use crate::gpu::Renderer;
 use crate::gpu::{Overlay, Painted};
+use crate::histogram::Histogram;
 use crate::image_source::{self, Depth, Fidelity, LoadedImage, Orientation};
 use crate::interface::{Action, Interface, Status};
 use crate::loader::{Decoded, Loader, Request};
@@ -89,7 +90,7 @@ fn start(paths: Vec<PathBuf>, #[cfg(windows)] listener: Option<crate::single::ch
         let _ = proxy.send_event(Event::Decoded(Box::new(decoded)));
     });
 
-    let mut app = App::new(paths, loader);
+    let mut app = App::new(paths, loader, event_loop.create_proxy());
     event_loop.run_app(&mut app).context("running the viewer")?;
 
     app.into_result()
@@ -103,6 +104,12 @@ enum Event {
     /// list of paths: without it every event in the queue would be the size of
     /// the larger one.
     Decoded(Box<Decoded>),
+    /// A histogram finished counting, for the file it names.
+    ///
+    /// The path is what makes it safe to arrive late: the user may have
+    /// stepped to another image while the count ran, and a histogram of the
+    /// picture they left is not a histogram of the one they are looking at.
+    Counted(PathBuf, Box<Histogram>),
     /// Another instance handed these files over rather than opening a window.
     #[cfg(windows)]
     Open(Vec<PathBuf>),
@@ -149,6 +156,15 @@ struct Shown {
     /// The file's size on disk. `None` when it cannot be asked for, which is
     /// a fact about the moment rather than about the file.
     file_size: Option<u64>,
+    /// What tones this picture is made of, once something has asked.
+    ///
+    /// Counted only when the histogram is actually on screen, and on a worker
+    /// thread when it is: a file nobody has asked to measure is not measured,
+    /// which is what keeps the count off the path to the first pixel.
+    histogram: Option<Histogram>,
+    /// Whether a count for this picture is already running, so opening and
+    /// closing the panel does not start a second one.
+    counting: bool,
 }
 
 struct App {
@@ -159,6 +175,8 @@ struct App {
     folder: Option<Folder>,
     shown: Option<Shown>,
     loader: Loader,
+    /// A way to hand a finished background count back to this thread.
+    proxy: EventLoopProxy<Event>,
     config: Config,
     /// The profile Windows has assigned to the display.
     display_profile: ColorProfile,
@@ -221,7 +239,7 @@ struct PaintedFrame {
 }
 
 impl App {
-    fn new(initial: Vec<PathBuf>, loader: Loader) -> Self {
+    fn new(initial: Vec<PathBuf>, loader: Loader, proxy: EventLoopProxy<Event>) -> Self {
         Self {
             initial,
             window: None,
@@ -229,6 +247,7 @@ impl App {
             folder: None,
             shown: None,
             loader,
+            proxy,
             config: Config::load(),
             display_profile: color::display_profile(),
             cursor: PhysicalPosition::new(0.0, 0.0),
@@ -429,7 +448,17 @@ impl App {
             colour: describe_colour(loaded.profile.as_ref(), &transform),
             metadata: loaded.metadata.clone(),
             file_size: std::fs::metadata(path).ok().map(|entry| entry.len()),
+            // A thumbnail is not the picture: its histogram would be the
+            // shape of a few hundred pixels standing in for millions, and it
+            // would be replaced moments later anyway. The count waits for the
+            // real image.
+            histogram: None,
+            counting: false,
         });
+
+        // If the panel is already open — the user stepped to this image with
+        // the histogram up — the new picture has to be counted for itself.
+        self.count_if_wanted();
     }
 
     /// Draw a vector image again for the size it now occupies on screen.
@@ -711,6 +740,18 @@ impl App {
                         .toast(if self.zoom_locked { "zoom locked" } else { "zoom unlocked" }, Instant::now());
                     self.request_redraw();
                 }
+                // A look at the pixels, held rather than toggled. The release
+                // is answered in the event loop, not here.
+                "z" | "Z" => self.hold_loupe(),
+                // What tones the picture is made of. The count is started
+                // here rather than at load: a file nobody asked to measure
+                // stays unmeasured, which is what keeps this off the path to
+                // the first pixel.
+                "h" | "H" => {
+                    self.interface.toggle_histogram();
+                    self.count_if_wanted();
+                    self.request_redraw();
+                }
                 // The chrome disappears by design, so the list of what the
                 // keys do has to be reachable from the keys themselves.
                 "?" => {
@@ -721,6 +762,93 @@ impl App {
             },
             _ => {}
         }
+    }
+
+    /// Count the tones of the picture on screen, if the histogram is showing
+    /// and this picture has not been counted yet.
+    ///
+    /// The count runs on a worker thread and comes back as an event, for the
+    /// same reason a decode does: a 60-megapixel file takes long enough that
+    /// doing it here would stall the key that asked for it. The pixels are
+    /// taken from the loader's cache, which is already holding them for the
+    /// picture on screen — nothing is decoded twice.
+    fn count_if_wanted(&mut self) {
+        if !self.interface.histogram_shown() {
+            return;
+        }
+        let Some(shown) = self.shown.as_ref() else {
+            return;
+        };
+        // Already counted, already counting, or standing in for the real
+        // image — in each case there is nothing to start.
+        if shown.histogram.is_some() || shown.counting || shown.fidelity != Fidelity::Full {
+            return;
+        }
+        let path = shown.path.clone();
+        let Request::Ready(image) = self.loader.request(&path) else {
+            // The full decode is still on its way. `upload` calls back here
+            // when it lands, so the count is not lost — only deferred.
+            return;
+        };
+
+        if let Some(shown) = self.shown.as_mut() {
+            shown.counting = true;
+        }
+
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let histogram = Histogram::of(&image.image);
+            // The window may be gone by the time this finishes; there is
+            // nobody left to tell, and that is fine.
+            let _ = proxy.send_event(Event::Counted(path, Box::new(histogram)));
+        });
+    }
+
+    /// A background count came back.
+    fn counted(&mut self, path: PathBuf, histogram: Histogram) {
+        let Some(shown) = self.shown.as_mut() else {
+            return;
+        };
+        // The user may have stepped away while it ran. A histogram of the
+        // picture they left is not a histogram of the one they are looking at.
+        if shown.path != path {
+            return;
+        }
+        shown.histogram = Some(histogram);
+        shown.counting = false;
+        self.request_redraw();
+    }
+
+    /// Hold the loupe: 100% under the cursor, until the key comes back up.
+    ///
+    /// The cursor is where the eye already is, which is what makes this
+    /// cheaper than zooming: no pan to the place, no pan back.
+    fn hold_loupe(&mut self) {
+        let cursor = self.cursor_position();
+        if let Some(shown) = self.shown.as_mut() {
+            if shown.view.loupe_held() {
+                return;
+            }
+            shown.view.hold_loupe(cursor);
+            self.refresh();
+        }
+    }
+
+    /// Give the framing back.
+    ///
+    /// Called on the key's release, and again whenever the window loses focus:
+    /// a key let go while another window is in front sends its release there,
+    /// and without this the picture would stay at 100% with nothing holding
+    /// it — a mode entered by accident and with no key to leave by.
+    fn release_loupe(&mut self) {
+        let held = self.shown.as_ref().is_some_and(|shown| shown.view.loupe_held());
+        if !held {
+            return;
+        }
+        if let Some(shown) = self.shown.as_mut() {
+            shown.view.release_loupe();
+        }
+        self.refresh();
     }
 
     fn zoom(&mut self, notches: f32) {
@@ -886,6 +1014,7 @@ impl App {
             metadata: self.shown.as_ref().map(|shown| shown.metadata.clone()).unwrap_or_default(),
             path: self.shown.as_ref().map(|shown| shown.path.clone()),
             file_size: self.shown.as_ref().and_then(|shown| shown.file_size),
+            histogram: self.shown.as_ref().and_then(|shown| shown.histogram.clone()),
         }
     }
 
@@ -1061,10 +1190,18 @@ fn handled(key: &Key) -> bool {
         ) => true,
         Key::Character(character) => matches!(
             character.as_str(),
-            "+" | "=" | "-" | "_" | "0" | "1" | "?" | "l" | "L" | "r" | "R" | "b" | "B" | "i" | "I"
+            "+" | "=" | "-" | "_" | "0" | "1" | "?" | "l" | "L" | "r" | "R" | "b" | "B" | "i" | "I" | "z" | "Z" | "h" | "H"
         ),
         _ => false,
     }
+}
+
+/// Whether this is the loupe's key.
+///
+/// Its own function because the loupe is answered twice — on the press and on
+/// the release — and the two must name the same key or it would stick down.
+fn is_loupe(key: &Key) -> bool {
+    matches!(key, Key::Character(character) if matches!(character.as_str(), "z" | "Z"))
 }
 
 /// The key a toolbar button stands for.
@@ -1085,6 +1222,7 @@ fn key_for(action: Action) -> Key {
         Action::TurnLeft => Key::Character("R".into()),
         Action::Backdrop => Key::Character("b".into()),
         Action::Info => Key::Character("i".into()),
+        Action::Histogram => Key::Character("h".into()),
         Action::Lock => Key::Character("l".into()),
         Action::FullScreen => Key::Named(NamedKey::F11),
         Action::Keys => Key::Character("?".into()),
@@ -1241,6 +1379,7 @@ impl ApplicationHandler<Event> for App {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: Event) {
         match event {
             Event::Decoded(decoded) => self.decoded(*decoded),
+            Event::Counted(path, histogram) => self.counted(path, *histogram),
             #[cfg(windows)]
             Event::Open(paths) => self.handed_over(paths),
         }
@@ -1420,6 +1559,10 @@ impl ApplicationHandler<Event> for App {
                 }
             }
 
+            // A key let go while another window is in front sends its release
+            // there, so the loupe would stay down with nothing holding it.
+            WindowEvent::Focused(false) => self.release_loupe(),
+
             // Dragged onto a monitor with different scaling: the surface size
             // follows in a `Resized` event, but the framing must be redone
             // against the new scale factor either way.
@@ -1432,6 +1575,17 @@ impl ApplicationHandler<Event> for App {
 
             WindowEvent::KeyboardInput { event, .. } if event.state.is_pressed() && !claimed => {
                 self.handle_key(&event.logical_key, event_loop);
+            }
+
+            // The loupe is the one key that does something on the way up: it
+            // is held rather than toggled, so the release is what gives the
+            // framing back. It is answered even when egui claimed the press —
+            // a release swallowed by a panel that opened mid-press would leave
+            // the picture stuck at 100% with nothing holding it there.
+            WindowEvent::KeyboardInput { event, .. } if !event.state.is_pressed() => {
+                if is_loupe(&event.logical_key) {
+                    self.release_loupe();
+                }
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
@@ -1691,6 +1845,63 @@ mod tests {
         assert_eq!(orientation, Orientation::Normal);
     }
 
+    /// Every action there is.
+    ///
+    /// Held against the enum by a match below rather than written out and
+    /// trusted: a hand-kept list is one an added action is forgotten from, and
+    /// the two tests over it would then pass while saying nothing about the
+    /// new button. Adding a variant now fails to compile until it is listed.
+    const EVERY_ACTION: [Action; 14] = [
+        Action::Previous,
+        Action::Next,
+        Action::ZoomOut,
+        Action::ZoomIn,
+        Action::Fit,
+        Action::Actual,
+        Action::TurnLeft,
+        Action::TurnRight,
+        Action::Backdrop,
+        Action::Lock,
+        Action::Info,
+        Action::Histogram,
+        Action::FullScreen,
+        Action::Keys,
+    ];
+
+    /// What makes `EVERY_ACTION` exhaustive: this match has no catch-all, so a
+    /// new variant stops the build here, and the assertion catches one that
+    /// was added to the enum and to this match but not to the list.
+    #[test]
+    fn every_action_is_in_the_list_the_tests_walk() {
+        for action in EVERY_ACTION {
+            // The arms exist to be exhaustive; what they map to is unused.
+            let _ = match action {
+                Action::Previous => 0,
+                Action::Next => 1,
+                Action::ZoomOut => 2,
+                Action::ZoomIn => 3,
+                Action::Fit => 4,
+                Action::Actual => 5,
+                Action::TurnLeft => 6,
+                Action::TurnRight => 7,
+                Action::Backdrop => 8,
+                Action::Lock => 9,
+                Action::Info => 10,
+                Action::Histogram => 11,
+                Action::FullScreen => 12,
+                Action::Keys => 13,
+            };
+        }
+
+        // Every variant appears once: a list with a duplicate would be the
+        // right length while leaving an action unwalked.
+        let mut seen: Vec<String> = EVERY_ACTION.iter().map(|action| format!("{action:?}")).collect();
+        seen.sort();
+        let before = seen.len();
+        seen.dedup();
+        assert_eq!(seen.len(), before, "an action is listed twice, so another one is missing");
+    }
+
     /// Every action the toolbar offers has to resolve to a key the viewer
     /// actually answers.
     ///
@@ -1700,21 +1911,7 @@ mod tests {
     /// is what stops it naming one that does nothing.
     #[test]
     fn every_toolbar_action_names_a_key_the_viewer_answers() {
-        for action in [
-            Action::Previous,
-            Action::Next,
-            Action::ZoomOut,
-            Action::ZoomIn,
-            Action::Fit,
-            Action::Actual,
-            Action::TurnLeft,
-            Action::TurnRight,
-            Action::Backdrop,
-            Action::Lock,
-            Action::Info,
-            Action::FullScreen,
-            Action::Keys,
-        ] {
+        for action in EVERY_ACTION {
             let key = key_for(action);
             assert!(handled(&key), "the toolbar's {action:?} asks for {key:?}, which the viewer ignores");
         }
@@ -1724,21 +1921,7 @@ mod tests {
     /// thing, and one of them would be wrong.
     #[test]
     fn no_two_toolbar_actions_mean_the_same_key() {
-        let actions = [
-            Action::Previous,
-            Action::Next,
-            Action::ZoomOut,
-            Action::ZoomIn,
-            Action::Fit,
-            Action::Actual,
-            Action::TurnLeft,
-            Action::TurnRight,
-            Action::Backdrop,
-            Action::Lock,
-            Action::Info,
-            Action::FullScreen,
-            Action::Keys,
-        ];
+        let actions = EVERY_ACTION;
         for (index, action) in actions.iter().enumerate() {
             for other in &actions[index + 1..] {
                 assert_ne!(
@@ -1772,6 +1955,8 @@ mod tests {
             Key::Character("R".into()),
             Key::Character("b".into()),
             Key::Character("i".into()),
+            Key::Character("z".into()),
+            Key::Character("h".into()),
         ] {
             assert!(handled(&key), "the key sheet lists {key:?}, which the viewer ignores");
         }
@@ -1780,6 +1965,29 @@ mod tests {
         // `handled` that always says yes.
         assert!(!handled(&Key::Character("q".into())), "an unclaimed key was reported as answered");
         assert!(!handled(&Key::Named(NamedKey::Tab)));
+    }
+
+    /// The loupe is the one key answered on the way up as well as on the way
+    /// down, and the two have to name the same key or it would stick down:
+    /// pressed with one spelling, released with another, and nothing left to
+    /// let go of.
+    #[test]
+    fn the_loupe_is_recognised_on_the_press_and_on_the_release() {
+        for key in [Key::Character("z".into()), Key::Character("Z".into())] {
+            assert!(handled(&key), "the loupe's {key:?} is not answered on the press");
+            assert!(is_loupe(&key), "the loupe's {key:?} is not recognised on the release");
+        }
+
+        // And nothing else is taken for it, or an unrelated key coming up
+        // would drop a loupe somebody was holding.
+        for key in [
+            Key::Character("i".into()),
+            Key::Character("h".into()),
+            Key::Character("1".into()),
+            Key::Named(NamedKey::Space),
+        ] {
+            assert!(!is_loupe(&key), "{key:?} was taken for the loupe");
+        }
     }
 
     /// The redraw has to be worth its cost: a wheel gesture passes through

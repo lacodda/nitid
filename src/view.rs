@@ -45,6 +45,21 @@ pub struct View {
     /// Offset of the image centre from the window centre.
     offset: (f32, f32),
     mode: FitMode,
+    /// The framing the loupe interrupted, kept while it is held down.
+    ///
+    /// `Some` means the loupe is up. What is stored is the whole framing the
+    /// user had — scale, offset and mode — because that is what letting go has
+    /// to put back, and reconstructing it from a rule ("go back to fit") would
+    /// be right only for the framing that happens to be the default.
+    held: Option<Held>,
+}
+
+/// A framing set aside for the loupe to give back.
+#[derive(Clone, Copy, Debug)]
+struct Held {
+    scale: f32,
+    offset: (f32, f32),
+    mode: FitMode,
 }
 
 impl View {
@@ -60,6 +75,7 @@ impl View {
             scale_factor: if scale_factor.is_finite() && scale_factor > 0.0 { scale_factor } else { 1.0 },
             offset: (0.0, 0.0),
             mode: FitMode::Fit,
+            held: None,
         };
         view.fit();
         view
@@ -110,9 +126,14 @@ impl View {
     /// image answers it for itself. `Actual` is a choice — "show me this
     /// pixel for pixel" — so it carries, which is how a series is walked at
     /// 100% to compare sharpness.
+    ///
+    /// A loupe held down at the moment of the step carries nothing of itself:
+    /// what is carried is the framing underneath it. Looking closely at one
+    /// frame is not a decision about the next one.
     pub fn carry_onto(&self, image: (u32, u32), window: (u32, u32), scale_factor: f32) -> Self {
+        let (scale, offset, mode) = self.settled();
         let mut next = Self::new(image, window, scale_factor);
-        match self.mode {
+        match mode {
             FitMode::Fit => return next,
             FitMode::Actual => {
                 next.set_actual();
@@ -122,12 +143,12 @@ impl View {
         }
 
         // The zoom the user reads, restated in the new view's physical terms.
-        next.scale = (self.scale() * next.scale_factor).clamp(MIN_SCALE, MAX_SCALE);
+        next.scale = (scale / self.scale_factor * next.scale_factor).clamp(MIN_SCALE, MAX_SCALE);
         next.mode = FitMode::Free;
 
         // Where they were looking, as a fraction of the image, mapped onto
         // whatever the new image's overhang allows.
-        let fraction = self.looking_at();
+        let fraction = self.looking_at_with(scale, offset);
         let (width, height) = next.scaled_size();
         let limit_x = ((width - next.window.0) / 2.0).max(0.0);
         let limit_y = ((height - next.window.1) / 2.0).max(0.0);
@@ -140,13 +161,21 @@ impl View {
     ///
     /// Zero is centred; ±1 is against an edge. Expressed this way it means the
     /// same thing on an image of any size, which is what the zoom lock needs.
+    #[cfg(test)]
     fn looking_at(&self) -> (f32, f32) {
-        let (width, height) = self.scaled_size();
+        let (scale, offset, _) = self.settled();
+        self.looking_at_with(scale, offset)
+    }
+
+    /// The same, for a framing that is not the one on screen — the one the
+    /// loupe is holding.
+    fn looking_at_with(&self, scale: f32, offset: (f32, f32)) -> (f32, f32) {
+        let (width, height) = (self.image.0 * scale, self.image.1 * scale);
         let limit_x = ((width - self.window.0) / 2.0).max(0.0);
         let limit_y = ((height - self.window.1) / 2.0).max(0.0);
         (
-            if limit_x > 0.0 { self.offset.0 / limit_x } else { 0.0 },
-            if limit_y > 0.0 { self.offset.1 / limit_y } else { 0.0 },
+            if limit_x > 0.0 { offset.0 / limit_x } else { 0.0 },
+            if limit_y > 0.0 { offset.1 / limit_y } else { 0.0 },
         )
     }
 
@@ -163,6 +192,18 @@ impl View {
         let ratio = self.image.0 / width;
 
         self.image = (width, height);
+        // The framing the loupe is holding is in the old resolution's terms
+        // too, so it is rebased alongside the one on screen — otherwise
+        // letting go after a thumbnail-to-full handover would restore a zoom
+        // meant for an image several times smaller.
+        if let Some(held) = self.held.as_mut() {
+            match held.mode {
+                FitMode::Free => held.scale = (held.scale * ratio).clamp(MIN_SCALE, MAX_SCALE),
+                // Recomputed on release from the size that is current then.
+                FitMode::Fit | FitMode::Actual => {}
+            }
+        }
+
         // `Fit` and `Actual` are recomputed from the new size; only a framing
         // the user chose has to be carried across by hand.
         match self.mode {
@@ -253,6 +294,81 @@ impl View {
         self.scale = target;
         self.mode = FitMode::Free;
         self.clamp_offset();
+    }
+
+    /// Whether the loupe is up.
+    pub fn loupe_held(&self) -> bool {
+        self.held.is_some()
+    }
+
+    /// Hold the current framing aside and jump to 100% under the cursor.
+    ///
+    /// The loupe answers the question a fitted photograph cannot: is this
+    /// actually sharp? At fit, a 24-megapixel frame is shown at a tenth of its
+    /// size and every picture looks sharp — the check needs one image pixel per
+    /// screen pixel, at the place the eye is already on, without the pan and
+    /// zoom and pan back that would otherwise cost.
+    ///
+    /// Holding rather than toggling is what makes it a loupe: the framing
+    /// comes back by itself, so there is no mode to be left in and nothing to
+    /// undo. A second call while it is up does nothing — a key repeat is one
+    /// press held down, and taking the held framing from itself would leave
+    /// 100% as the thing to return to.
+    pub fn hold_loupe(&mut self, cursor: (f32, f32)) {
+        if self.held.is_some() {
+            return;
+        }
+        self.held = Some(Held {
+            scale: self.scale,
+            offset: self.offset,
+            mode: self.mode,
+        });
+
+        // 100% as the user reads it, which on a scaled display is more than
+        // one texel per physical pixel — the same rule `set_actual` follows.
+        let target = self.scale_factor.clamp(MIN_SCALE, MAX_SCALE);
+        // `zoom_to_at` returns early when the scale is already there, which
+        // would leave the cursor unanswered on an image already at 100%. The
+        // framing is still held, so letting go still restores the place.
+        self.zoom_to_at(target, cursor);
+    }
+
+    /// Give back the framing the loupe interrupted.
+    ///
+    /// Does nothing if the loupe was not up, so a key release with no press
+    /// behind it — the window regained focus mid-press, say — cannot invent a
+    /// framing to jump to.
+    pub fn release_loupe(&mut self) {
+        let Some(held) = self.held.take() else {
+            return;
+        };
+        // `Fit` and `Actual` are rules rather than numbers, so they are asked
+        // again: the window may have been resized or moved to another display
+        // while the loupe was up, and a stored scale would restore the framing
+        // that window used to have.
+        match held.mode {
+            FitMode::Fit => self.fit(),
+            FitMode::Actual => self.set_actual(),
+            FitMode::Free => {
+                self.scale = held.scale;
+                self.offset = held.offset;
+                self.mode = FitMode::Free;
+                self.clamp_offset();
+            }
+        }
+    }
+
+    /// The framing the user set, which is the held one while the loupe is up.
+    ///
+    /// What the loupe shows is a look, not a decision: stepping to the next
+    /// image or resizing the window must act on the framing the user chose,
+    /// or a glance through the loupe would silently become the new framing of
+    /// everything after it.
+    fn settled(&self) -> (f32, (f32, f32), FitMode) {
+        match self.held {
+            Some(held) => (held.scale, held.offset, held.mode),
+            None => (self.scale, self.offset, self.mode),
+        }
     }
 
     /// Drag the image by a mouse delta in physical pixels.
@@ -505,6 +621,184 @@ mod tests {
         let next = first.carry_onto((4000, 3000), (2000, 1600), 2.0);
         assert!(about(next.scale(), 2.0), "the zoom read {} on the scaled display", next.scale());
         assert!(about(next.physical_scale(), 4.0), "the physical scale did not follow the display");
+    }
+
+    /// What the loupe is for: a fitted photograph is shown too small to judge
+    /// sharpness, and holding the key answers the question at the place the
+    /// eye is already on.
+    #[test]
+    fn the_loupe_shows_a_fitted_image_at_a_hundred_percent_under_the_cursor() {
+        let mut view = view((4000, 3000), (1000, 800));
+        assert!(view.scale() < 0.3, "the fixture is not actually fitted small");
+
+        let cursor = (250.0, 200.0);
+        let before = image_point_under(&view, cursor);
+        view.hold_loupe(cursor);
+
+        assert!(about(view.scale(), 1.0), "the loupe came out at {}", view.scale());
+        let after = image_point_under(&view, cursor);
+        assert!(about(before.0, after.0), "the loupe moved the picture sideways: {before:?} vs {after:?}");
+        assert!(about(before.1, after.1), "the loupe moved the picture vertically: {before:?} vs {after:?}");
+    }
+
+    /// Letting go puts back what was there, exactly — the loupe is a look,
+    /// not a change.
+    #[test]
+    fn letting_go_restores_the_framing_exactly() {
+        let mut view = view((4000, 3000), (1000, 800));
+        view.zoom_to_at(0.4, (500.0, 400.0));
+        view.pan((120.0, -60.0));
+        let (scale, offset, mode) = (view.scale(), view.offset(), view.mode());
+
+        view.hold_loupe((250.0, 200.0));
+        assert!(view.loupe_held());
+        view.release_loupe();
+
+        assert!(!view.loupe_held());
+        assert!(about(view.scale(), scale), "the zoom came back as {} rather than {scale}", view.scale());
+        assert!(about(view.offset().0, offset.0), "the horizontal place moved");
+        assert!(about(view.offset().1, offset.1), "the vertical place moved");
+        assert_eq!(view.mode(), mode);
+    }
+
+    /// A key held down repeats. Every repeat but the first must be ignored, or
+    /// the second one would store 100% as the framing to return to and letting
+    /// go would leave the user where the loupe put them.
+    #[test]
+    fn a_repeated_press_does_not_swallow_the_framing_to_return_to() {
+        let mut view = view((4000, 3000), (1000, 800));
+        let fitted = view.scale();
+
+        view.hold_loupe((250.0, 200.0));
+        view.hold_loupe((250.0, 200.0));
+        view.hold_loupe((300.0, 250.0));
+        view.release_loupe();
+
+        assert!(
+            about(view.scale(), fitted),
+            "the loupe kept its own zoom: {} rather than {fitted}",
+            view.scale()
+        );
+        assert_eq!(view.mode(), FitMode::Fit);
+    }
+
+    /// A release with no press behind it — the window regained focus
+    /// mid-press, say — must not invent a framing to jump to.
+    #[test]
+    fn a_release_without_a_press_changes_nothing() {
+        let mut view = view((4000, 3000), (1000, 800));
+        view.zoom_to_at(0.4, (500.0, 400.0));
+        let (scale, offset) = (view.scale(), view.offset());
+
+        view.release_loupe();
+
+        assert!(about(view.scale(), scale));
+        assert_eq!(view.offset(), offset);
+    }
+
+    /// An image already at 100% has nothing to zoom, but the loupe still holds
+    /// the framing — so letting go restores the place, which is what the pan
+    /// underneath it was.
+    #[test]
+    fn the_loupe_on_an_image_already_at_a_hundred_percent_still_gives_the_place_back() {
+        let mut view = view((4000, 3000), (1000, 800));
+        view.set_actual();
+        // Panning is what makes this a place worth giving back — and it is
+        // also what makes the framing `Free` rather than `Actual`.
+        view.pan((10_000.0, 10_000.0));
+        let (offset, mode) = (view.offset(), view.mode());
+
+        view.hold_loupe((900.0, 700.0));
+        assert!(about(view.scale(), 1.0));
+        view.release_loupe();
+
+        assert!(
+            about(view.offset().0, offset.0),
+            "the place was not given back: {:?} vs {offset:?}",
+            view.offset()
+        );
+        assert!(about(view.offset().1, offset.1));
+        assert_eq!(view.mode(), mode);
+    }
+
+    /// The loupe reads 100% the way the rest of the viewer does: one image
+    /// pixel per *logical* pixel, so a scaled display does not halve it.
+    #[test]
+    fn the_loupe_reads_a_hundred_percent_on_a_scaled_display() {
+        let mut view = View::new((4000, 3000), (2560, 1600), 2.0);
+        view.hold_loupe((1280.0, 800.0));
+
+        assert!(about(view.scale(), 1.0), "the loupe read {} to the user", view.scale());
+        assert!(about(view.physical_scale(), 2.0), "the loupe did not follow the display");
+    }
+
+    /// A glance through the loupe is not a decision about the next picture:
+    /// stepping while it is held carries the framing underneath it.
+    #[test]
+    fn a_step_taken_through_the_loupe_carries_the_framing_underneath_it() {
+        let mut first = view((4000, 3000), (1000, 800));
+        first.zoom_to_at(0.4, (500.0, 400.0));
+        let settled = first.scale();
+        first.hold_loupe((250.0, 200.0));
+        assert!(about(first.scale(), 1.0), "the fixture is not actually magnified");
+
+        let next = first.carry_onto((4000, 3000), (1000, 800), 1.0);
+
+        assert!(
+            about(next.scale(), settled),
+            "the loupe's own zoom was carried onto the next image: {} rather than {settled}",
+            next.scale()
+        );
+        assert!(!next.loupe_held(), "the next image arrived with a loupe held on it");
+    }
+
+    /// A fitted framing glanced at through the loupe is still fitted, so the
+    /// neighbour is fitted for itself rather than shown at the loupe's 100%.
+    #[test]
+    fn a_step_taken_through_the_loupe_does_not_turn_a_fitted_framing_into_a_choice() {
+        let mut first = view((4000, 3000), (1000, 800));
+        first.hold_loupe((250.0, 200.0));
+
+        let next = first.carry_onto((8000, 6000), (1000, 800), 1.0);
+
+        assert_eq!(next.mode(), FitMode::Fit, "the loupe made a fitted framing look like a chosen one");
+        assert!(next.scale() < 0.3, "the neighbour came up at {} rather than fitted", next.scale());
+    }
+
+    /// The thumbnail-to-full handover can land while the loupe is held: the
+    /// held framing is in the thumbnail's terms and has to be rebased too, or
+    /// letting go restores a zoom meant for an image eight times smaller.
+    #[test]
+    fn a_handover_under_the_loupe_rebases_the_framing_it_will_give_back() {
+        // A thumbnail standing in for a 4000-pixel picture.
+        let mut view = view((500, 375), (1000, 800));
+        view.zoom_to_at(1.6, (500.0, 400.0));
+        // What the user sees: the picture at this size on screen.
+        let (on_screen, _) = view.scaled_size();
+
+        view.hold_loupe((400.0, 300.0));
+        view.rebase((4000, 3000));
+        view.release_loupe();
+
+        let (restored, _) = view.scaled_size();
+        assert!(
+            about(restored, on_screen),
+            "the picture changed size across the handover: {restored} rather than {on_screen}",
+        );
+    }
+
+    /// The window can be resized while the loupe is up. A fitted framing is a
+    /// rule, not a number, so it is asked again rather than restored stale.
+    #[test]
+    fn a_resize_under_the_loupe_gives_back_a_framing_that_fits_the_new_window() {
+        let mut view = view((4000, 3000), (1000, 800));
+        view.hold_loupe((250.0, 200.0));
+        view.resize((500, 400), 1.0);
+        view.release_loupe();
+
+        assert_eq!(view.mode(), FitMode::Fit);
+        let (width, height) = view.scaled_size();
+        assert!(width <= 501.0 && height <= 401.0, "the restored framing does not fit: {width}x{height}");
     }
 
     #[test]

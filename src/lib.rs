@@ -20,6 +20,7 @@ mod folder;
 mod format;
 mod gpu;
 mod hdr;
+mod histogram;
 mod image_source;
 #[cfg(windows)]
 mod install;
