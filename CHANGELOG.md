@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.22.0] - 2026-09-01
+
+### Documentation
+- Describe the clipboard, and why a paste is not saved
+
+### Features
+- The picture out, a picture in, and the path for a terminal
 ## [0.21.0] - 2026-09-01
 
 ### Documentation
