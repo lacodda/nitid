@@ -58,6 +58,26 @@ Consequences that follow from it:
   decode. It runs only when the panel is open, on a worker thread, and a large
   picture is sampled rather than counted whole.
 
+## What followed from it
+
+The same question came back in v0.21.0, twice, and the answer here settled both
+without another decision:
+
+- **The clipping zebra** marks what the *file* clipped. A highlight outside
+  this monitor's gamut is not a highlight the camera lost, and hatching it
+  would tell the photographer to fix something that is not wrong with the
+  picture. It also keeps the two tools agreeing: a peak against the right-hand
+  end of the histogram and a red hatch over the sky are the same fact.
+- **The eyedropper** reports both — the file's numbers and what they become on
+  this display — because "what colour is this" means the first to someone
+  matching a brand colour and the second to someone matching what they see. But
+  the value it *copies* is the file's, for the reason above: it is the one that
+  is still true on another monitor.
+
+The passport (`K`) exists because of this decision rather than despite it: once
+the tools report the file rather than the screen, the conversion between them
+becomes the thing a person needs explained.
+
 ## What this is not
 
 It is not a claim that the on-screen measurement is worthless. A soft-proofing

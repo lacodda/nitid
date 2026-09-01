@@ -130,8 +130,9 @@ and the zoom — and everything else appears when you reach for it.
 
 Move the pointer to the top of the window and a toolbar comes down: step
 through the folder, zoom, fit, actual size, turn, the zoom lock, the backdrop,
-the Info panel, the histogram, full screen. It carries nothing the keyboard
-does not, and every button names its key. Press `?` for the full list.
+the Info panel, the histogram, the clipping zebra, the eyedropper, full
+screen. It carries nothing the keyboard does not, and every button names its
+key. Press `?` for the full list.
 
 **It is not on the way to the picture.** Laying the interface out and building
 its place on the GPU costs around forty milliseconds, so the first frame is the
@@ -237,6 +238,32 @@ in, zoom, and pan back that asking it otherwise costs. Because it is held
 rather than toggled there is no mode to be left in: stepping to the next image
 while it is down carries the framing underneath it, not the loupe's, and a key
 let go while another window is in front drops it too.
+
+## Colour tools
+
+Three things that answer questions about colour rather than about the picture.
+
+**The clipping zebra**, with `C`: diagonal hatching over the pixels that hit
+the ends of the scale — red where a highlight is blown, blue where a shadow is
+blocked. It marks **what the file clipped**, not what this display cannot
+reproduce, which is the same decision the histogram is built on
+([ADR 0019](docs/adr/0019-the-histogram-counts-the-file-not-the-display.md)): a
+colour outside this monitor's gamut is not a colour the camera lost. The
+marking happens in the shader that was going to run anyway, so turning it on
+and off costs one uniform write and no re-decode.
+
+**The eyedropper**, with `P`: the colour under the pointer, in both the terms
+that matter — the numbers the file holds, and what they become on this display.
+They differ whenever the image carries a profile the display does not share,
+and a viewer reporting only one of them would be answering a question nobody
+asked. Clicking copies the file's value as hex, because that is the one that
+stays true when the window moves to another monitor.
+
+**The colour passport**, with `K` or by clicking the colour in the status line:
+what the file says its numbers mean, what the display says it can show, and
+what is being done between them. Colour management is invisible when it works
+and inexplicable when it does not — a photograph that looks wrong here and
+right elsewhere is a question nobody can answer by looking harder at it.
 
 ## Large images
 
@@ -344,7 +371,7 @@ has no size limit to hide behind.
 
 ## Status
 
-Early development — v0.20.1 is out. Startup, colour and format coverage hold:
+Early development — v0.21.0 is out. Startup, colour and format coverage hold:
 every modern still format opens, a phone's photographs included, every one of
 them reaches the screen without a wait, and the ones that animate play. The
 process that decodes the heavy formats runs with no network in either
@@ -361,7 +388,10 @@ photograph. The framing can be held across a step for comparing a series, the
 picture turned, and the backdrop behind transparency chosen, and `I` says what
 the file says about itself. **And the picture can be read now**: `H` draws a
 histogram of the file's own values, and holding `Z` puts 100% under the cursor
-for as long as the key is down. Development runs in small
+for as long as the key is down. **And the colour can be interrogated now**: `C`
+marks what the file clipped, `P` reads the pixel under the pointer in the
+file's terms and the display's, and `K` spells out the path between the two.
+Development runs in small
 versions, each one theme; the road to 1.0 is fixed:
 
 | Version | What lands |
@@ -389,7 +419,8 @@ versions, each one theme; the road to 1.0 is fixed:
 | ✅ v0.19.0 | The Info panel: EXIF, the place a photograph was taken, every row copyable |
 | ✅ v0.20.0 | Reading the picture: a live histogram of the file's own values, and a loupe held at 100% |
 | ✅ v0.20.1 | `nitid install` puts itself on the `PATH`, so the command works from a terminal |
-| v0.21.0 – v0.35.0 | The everyday viewer: colour tools, clipboard, file operations, culling, comparison, settings |
+| ✅ v0.21.0 | Colour tools: the clipping zebra, the eyedropper, and the colour passport |
+| v0.22.0 – v0.35.0 | The everyday viewer: clipboard, file operations, culling, comparison, settings |
 | v0.36.0 – v0.39.0 | Windows integration: context menu, installer, auto-update, thumbnails |
 | v0.40.0 – v0.41.0 | Documentation site, stabilisation |
 | v1.0.0 | Public release — the default viewer, nothing missing |
@@ -469,6 +500,9 @@ Opening a file opens its folder: the arrow keys walk the images beside it.
 | `B` | what shows through transparency |
 | `I` | what the file says about itself |
 | `H` | what tones the picture is made of |
+| `C` | mark what the file clipped |
+| `P` | read the colour under the pointer; click to copy |
+| `K` | what is happening to this image's colour |
 | `F11` | fullscreen |
 | `?` | every key there is |
 | `Esc` | quit |
