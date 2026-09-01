@@ -306,6 +306,29 @@ mod windows_clipboard {
 #[cfg(windows)]
 pub use windows_clipboard::{get_dib, set_dib};
 
+/// The same surface where there is no Windows clipboard to talk to.
+///
+/// The whole feature is Windows shell behaviour, but the code that calls it is
+/// not: giving the callers a function that says "nothing here" keeps them free
+/// of `cfg` attributes, which is what the rest of the viewer does with its
+/// Windows-only parts. Caught by CI rather than here — the MSRV job builds on
+/// Linux, and this file compiled cleanly on the machine it was written on.
+#[cfg(not(windows))]
+mod elsewhere {
+    use anyhow::{Result, bail};
+
+    pub fn set_dib(_payload: &[u8]) -> Result<()> {
+        bail!("the clipboard is a Windows feature")
+    }
+
+    pub fn get_dib() -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+}
+
+#[cfg(not(windows))]
+pub use elsewhere::{get_dib, set_dib};
+
 #[cfg(test)]
 mod tests {
     use super::*;
