@@ -132,6 +132,13 @@ struct Shown {
     view: View,
     /// Whether this is the real image or the thumbnail standing in for it.
     fidelity: Fidelity,
+    /// Whether this picture came from the clipboard rather than from a file.
+    ///
+    /// It has no path, so everything that names one has to know: the title,
+    /// the Info panel, the eyedropper's lookup, and `Ctrl+Shift+C`, which has
+    /// no path to copy. Kept as its own fact rather than inferred from an
+    /// invented path, which would leak into the folder and the loader's cache.
+    pasted: bool,
     /// The document a vector image was drawn from, kept so the picture can be
     /// drawn again when the zoom moves. `None` for raster images.
     vector: Option<VectorImage>,
@@ -147,7 +154,11 @@ struct Shown {
     /// line reports, and the one fact `View` keeps to itself.
     size: (u32, u32),
     /// What the bytes turned out to be, and at what depth.
-    format: Format,
+    ///
+    /// `None` for a picture pasted from the clipboard, which was never a file
+    /// and so is in no format — said rather than answered with an invented
+    /// variant nothing else would know what to do with.
+    format: Option<Format>,
     depth: Depth,
     /// What the colour transform does, in the words a person would use.
     colour: String,
@@ -182,6 +193,12 @@ struct App {
     display_profile: ColorProfile,
     cursor: PhysicalPosition<f64>,
     dragging: bool,
+    /// Which modifier keys are down.
+    ///
+    /// winit reports these as their own event rather than on each key, so the
+    /// state has to be kept: without it `Ctrl+C` arrives indistinguishable
+    /// from `C`, and copying the picture would toggle the clipping zebra.
+    modifiers: winit::keyboard::ModifiersState,
     /// When the display was last asked about its dynamic range. `None` until
     /// the first ask; only set while the viewer is on an HDR surface, which is
     /// the only state that can go stale unannounced.
@@ -214,6 +231,12 @@ struct App {
     /// changes no status: the toolbar drew and did nothing, which is how it
     /// shipped in v0.17.0 and what a hands-on run found.
     wants_frame: bool,
+    /// The pixels of a picture pasted from the clipboard.
+    ///
+    /// The loader's cache is keyed by path and a pasted picture has none, so
+    /// the one copy of it lives here — read by the histogram, the eyedropper
+    /// and a second `Ctrl+C`.
+    pasted: Option<crate::image_source::DecodedImage>,
     /// Whether the eyedropper is up.
     ///
     /// A mode rather than a held key, because its whole purpose is to be
@@ -264,6 +287,7 @@ impl App {
             display_profile: color::display_profile(),
             cursor: PhysicalPosition::new(0.0, 0.0),
             dragging: false,
+            modifiers: winit::keyboard::ModifiersState::empty(),
             display_checked_at: None,
             failure: None,
             interface: Interface::new(),
@@ -273,6 +297,7 @@ impl App {
             toast_deadline: None,
             wants_frame: false,
             zoom_locked: false,
+            pasted: None,
             picking: false,
             reading: None,
             shown_once: false,
@@ -451,13 +476,14 @@ impl App {
             orientation: loaded.orientation,
             view,
             fidelity: loaded.fidelity,
+            pasted: false,
             vector: loaded.vector.clone(),
             rasterised_at: (loaded.image.width, loaded.image.height),
             // An animated image starts playing the moment it is up; the
             // event loop reads the player's clock in `about_to_wait`.
             player: loaded.animation.clone().map(|animation| Player::new(animation, Instant::now())),
             size: loaded.display_size(),
-            format: loaded.format,
+            format: Some(loaded.format),
             depth: loaded.image.depth,
             colour: describe_colour(loaded.profile.as_ref(), &transform),
             metadata: loaded.metadata.clone(),
@@ -469,6 +495,11 @@ impl App {
             histogram: None,
             counting: false,
         });
+
+        // A file replaces whatever was pasted, and the pasted pixels go with
+        // it: keeping them would leave a copy of a picture nobody is looking
+        // at, and `Ctrl+C` would copy the wrong one.
+        self.pasted = None;
 
         // If the panel is already open — the user stepped to this image with
         // the histogram up — the new picture has to be counted for itself.
@@ -537,13 +568,18 @@ impl App {
             return;
         };
 
-        let name = self
-            .folder
-            .as_ref()
-            .map(Folder::current)
-            .and_then(Path::file_name)
-            .and_then(|name| name.to_str())
-            .unwrap_or("nitid");
+        let name = match self.shown.as_ref().is_some_and(|shown| shown.pasted) {
+            // A pasted picture has no name, and the title has to say what is
+            // on screen rather than the name of the file that was open before.
+            true => "clipboard",
+            false => self
+                .folder
+                .as_ref()
+                .map(Folder::current)
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                .unwrap_or("nitid"),
+        };
 
         let mut title = name.to_string();
         if let Some(folder) = &self.folder
@@ -826,9 +862,19 @@ impl App {
             return;
         }
         let path = shown.path.clone();
-        let Request::Ready(image) = self.loader.request(&path) else {
-            // The full decode is still on its way. `upload` calls back here
-            // when it lands, so the count is not lost — only deferred.
+        // A pasted picture is not in the loader's cache — it was never a file
+        // — so its pixels come from the one copy the application holds.
+        let pixels = if shown.pasted {
+            self.pasted.clone()
+        } else {
+            match self.loader.request(&path) {
+                Request::Ready(image) => Some(image.image.clone()),
+                // The full decode is still on its way. `upload` calls back
+                // here when it lands, so the count is not lost — only deferred.
+                Request::Pending => None,
+            }
+        };
+        let Some(pixels) = pixels else {
             return;
         };
 
@@ -838,7 +884,7 @@ impl App {
 
         let proxy = self.proxy.clone();
         std::thread::spawn(move || {
-            let histogram = Histogram::of(&image.image);
+            let histogram = Histogram::of(&pixels);
             // The window may be gone by the time this finishes; there is
             // nobody left to tell, and that is fine.
             let _ = proxy.send_event(Event::Counted(path, Box::new(histogram)));
@@ -869,11 +915,166 @@ impl App {
             return None;
         }
         let shown = self.shown.as_ref()?;
+        if shown.pasted {
+            // A clipboard bitmap carries no profile, so it is passed through
+            // like an untagged file — and the passport says exactly that.
+            return Some(crate::color::Passport::new(None, &self.display_profile, &ColorTransform::identity()));
+        }
         let Request::Ready(image) = self.loader.request(&shown.path) else {
             return None;
         };
         let transform = ColorTransform::for_image(image.profile.as_ref(), &self.display_profile);
         Some(crate::color::Passport::new(image.profile.as_ref(), &self.display_profile, &transform))
+    }
+
+    /// Answer a key pressed with Ctrl held.
+    ///
+    /// Kept apart from `handle_key` because the two answer different keys:
+    /// `C` toggles the clipping zebra and `Ctrl+C` copies the picture, and a
+    /// handler that could not tell them apart would do the wrong one.
+    fn handle_chord(&mut self, key: &Key) {
+        match chord_for(key) {
+            Some(Chord::CopyPath) => self.copy_path(),
+            Some(Chord::CopyPicture) => self.copy_picture(),
+            Some(Chord::Paste) => self.paste_picture(),
+            None => {}
+        }
+    }
+
+    /// Put the picture on the clipboard.
+    ///
+    /// The file's own pixels, unconverted — see the clipboard module and
+    /// ADR 0019. What is copied is the whole picture as the file holds it, not
+    /// what is framed on screen: a zoomed-in view is a way of looking at the
+    /// picture rather than a crop of it, and cropping by accident is worse
+    /// than copying more than was wanted.
+    fn copy_picture(&mut self) {
+        let Some(shown) = self.shown.as_ref() else {
+            return;
+        };
+
+        let image = if shown.pasted {
+            // A pasted picture has no file to go back to, so the pixels on
+            // screen are the only copy there is.
+            self.pasted.clone()
+        } else {
+            match self.loader.request(&shown.path) {
+                Request::Ready(image) => Some(image.image.clone()),
+                Request::Pending => None,
+            }
+        };
+
+        let Some(image) = image else {
+            self.interface.toast("still opening", Instant::now());
+            self.request_redraw();
+            return;
+        };
+
+        match crate::clipboard::set_dib(&crate::clipboard::to_dib(&image)) {
+            Ok(()) => self.interface.toast("picture copied", Instant::now()),
+            Err(error) => {
+                eprintln!("nitid: {error:#}");
+                self.interface.toast("could not reach the clipboard", Instant::now());
+            }
+        }
+        self.request_redraw();
+    }
+
+    /// Put the file's path on the clipboard, quoted for a terminal.
+    fn copy_path(&mut self) {
+        let Some(shown) = self.shown.as_ref() else {
+            return;
+        };
+        if shown.pasted {
+            // Nothing to copy: a pasted picture is not anywhere.
+            self.interface.toast("this picture has no file", Instant::now());
+            self.request_redraw();
+            return;
+        }
+
+        let quoted = crate::clipboard::quote_for_shell(&shown.path.display().to_string());
+        self.interface.context().copy_text(quoted);
+        self.interface.toast("path copied", Instant::now());
+        self.request_redraw();
+    }
+
+    /// Show whatever picture is on the clipboard.
+    ///
+    /// Nothing is written to disk: the picture is shown as itself, with no
+    /// file behind it (owner's decision). A viewer that quietly saved a
+    /// temporary file on every paste would be writing to disk without being
+    /// asked and leaving the results behind.
+    fn paste_picture(&mut self) {
+        let bytes = match crate::clipboard::get_dib() {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => {
+                self.interface.toast("no picture on the clipboard", Instant::now());
+                self.request_redraw();
+                return;
+            }
+            Err(error) => {
+                eprintln!("nitid: {error:#}");
+                self.interface.toast("could not reach the clipboard", Instant::now());
+                self.request_redraw();
+                return;
+            }
+        };
+
+        let Some(image) = crate::clipboard::from_dib(&bytes) else {
+            self.interface.toast("the clipboard holds a bitmap nitid cannot read", Instant::now());
+            self.request_redraw();
+            return;
+        };
+
+        self.show_pasted(image);
+    }
+
+    /// Put a picture with no file behind it on screen.
+    fn show_pasted(&mut self, image: crate::image_source::DecodedImage) {
+        let scale_factor = self.scale_factor();
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        // A clipboard bitmap says nothing about its colours, so it is passed
+        // through untouched — the same rule an untagged file gets (ADR 0005).
+        let transform = ColorTransform::identity();
+        renderer.set_image(&image, &transform);
+
+        let size = (image.width, image.height);
+        let view = View::new(size, renderer.size(), scale_factor);
+
+        // The folder goes with the file: there is nothing beside a pasted
+        // picture to step to, and leaving the old folder in place would let
+        // an arrow key silently replace the paste with a neighbour of the
+        // file that used to be open.
+        self.folder = None;
+        self.shown = Some(Shown {
+            turn: Orientation::Normal,
+            path: PathBuf::new(),
+            orientation: Orientation::Normal,
+            view,
+            fidelity: Fidelity::Full,
+            pasted: true,
+            vector: None,
+            rasterised_at: size,
+            player: None,
+            size,
+            format: None,
+            depth: image.depth,
+            colour: "from the clipboard".to_string(),
+            metadata: crate::metadata::Metadata::default(),
+            file_size: None,
+            histogram: None,
+            counting: false,
+        });
+        self.pasted = Some(image);
+
+        // The tools that read pixels look them up by path, which a pasted
+        // picture has not got: whatever they were showing belongs to the file
+        // that was open before.
+        self.reading = None;
+        self.count_if_wanted();
+        self.refresh();
     }
 
     /// Show or hide the eyedropper.
@@ -923,12 +1124,25 @@ impl App {
         // the same composition the renderer draws with, so the pixel named is
         // the pixel shown.
         let orientation = shown.orientation.then(shown.turn);
-        let Request::Ready(image) = self.loader.request(&path) else {
-            self.reading = None;
-            return;
+        let pasted = shown.pasted;
+
+        // A pasted picture has no file behind it, so its pixels come from the
+        // application's own copy and pass through untagged.
+        let (pixels, transform) = if pasted {
+            let Some(pixels) = self.pasted.clone() else {
+                self.reading = None;
+                return;
+            };
+            (pixels, ColorTransform::identity())
+        } else {
+            let Request::Ready(image) = self.loader.request(&path) else {
+                self.reading = None;
+                return;
+            };
+            let transform = ColorTransform::for_image(image.profile.as_ref(), &self.display_profile);
+            (image.image.clone(), transform)
         };
-        let transform = ColorTransform::for_image(image.profile.as_ref(), &self.display_profile);
-        self.reading = crate::eyedropper::read(&image.image, orientation, &transform, at);
+        self.reading = crate::eyedropper::read(&pixels, orientation, &transform, at);
     }
 
     /// Put the colour under the cursor on the clipboard.
@@ -1106,14 +1320,17 @@ impl App {
 
     /// What the status line should say about what is on screen.
     fn status(&self) -> Status {
-        let name = self
-            .folder
-            .as_ref()
-            .map(Folder::current)
-            .and_then(Path::file_name)
-            .and_then(|name| name.to_str())
-            .unwrap_or_default()
-            .to_string();
+        let name = match self.shown.as_ref().is_some_and(|shown| shown.pasted) {
+            true => "clipboard".to_string(),
+            false => self
+                .folder
+                .as_ref()
+                .map(Folder::current)
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_string(),
+        };
 
         let position = self
             .folder
@@ -1125,7 +1342,7 @@ impl App {
             name,
             position,
             size: self.shown.as_ref().map(|shown| shown.size),
-            format: self.shown.as_ref().map(|shown| shown.format),
+            format: self.shown.as_ref().and_then(|shown| shown.format),
             depth: self.shown.as_ref().map(|shown| shown.depth),
             colour: self.shown.as_ref().map(|shown| shown.colour.clone()),
             scale: self.shown.as_ref().map_or(1.0, |shown| shown.view.scale()),
@@ -1323,6 +1540,33 @@ fn handled(key: &Key) -> bool {
             "+" | "=" | "-" | "_" | "0" | "1" | "?" | "l" | "L" | "r" | "R" | "b" | "B" | "i" | "I" | "z" | "Z" | "h" | "H" | "c" | "C" | "p" | "P" | "k" | "K"
         ),
         _ => false,
+    }
+}
+
+/// What a key pressed with Ctrl asks for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Chord {
+    CopyPicture,
+    CopyPath,
+    Paste,
+}
+
+/// Which chord a key is, with Ctrl already known to be down.
+///
+/// Its own function so the one thing that is easy to get wrong here can be
+/// tested: `Ctrl+C` and `C` are different keys to a person, and a viewer that
+/// confused them would toggle the clipping zebra when asked to copy.
+fn chord_for(key: &Key) -> Option<Chord> {
+    let Key::Character(character) = key else {
+        return None;
+    };
+    match character.as_str() {
+        // Ctrl+Shift+C arrives as the capital letter, the same way the
+        // anticlockwise turn does.
+        "C" => Some(Chord::CopyPath),
+        "c" => Some(Chord::CopyPicture),
+        "v" | "V" => Some(Chord::Paste),
+        _ => None,
     }
 }
 
@@ -1706,8 +1950,17 @@ impl ApplicationHandler<Event> for App {
                 self.refresh();
             }
 
+            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
+
             WindowEvent::KeyboardInput { event, .. } if event.state.is_pressed() && !claimed => {
-                self.handle_key(&event.logical_key, event_loop);
+                // A chord is answered here rather than in `handle_key`, which
+                // knows nothing about modifiers: `Ctrl+C` and `C` are
+                // different keys to a person and must be to the viewer.
+                if self.modifiers.control_key() {
+                    self.handle_chord(&event.logical_key);
+                } else {
+                    self.handle_key(&event.logical_key, event_loop);
+                }
             }
 
             // The loupe is the one key that does something on the way up: it
@@ -2121,6 +2374,74 @@ mod tests {
         // `handled` that always says yes.
         assert!(!handled(&Key::Character("q".into())), "an unclaimed key was reported as answered");
         assert!(!handled(&Key::Named(NamedKey::Tab)));
+    }
+
+    /// The thing this stage could most easily get wrong: `Ctrl+C` and `C` are
+    /// different keys to a person, and a viewer that confused them would
+    /// toggle the clipping zebra when asked to copy the picture.
+    #[test]
+    fn a_chord_is_not_the_bare_key() {
+        assert_eq!(chord_for(&Key::Character("c".into())), Some(Chord::CopyPicture));
+        // The same key without Ctrl is the zebra, which `handled` answers and
+        // `chord_for` is never asked about — the two paths are separate, and
+        // this is what says so.
+        assert!(handled(&Key::Character("c".into())), "the bare key lost its own meaning");
+
+        assert_eq!(chord_for(&Key::Character("v".into())), Some(Chord::Paste));
+        // Shift arrives as the capital letter.
+        assert_eq!(chord_for(&Key::Character("C".into())), Some(Chord::CopyPath));
+    }
+
+    /// A chord nobody claims does nothing, rather than falling through to the
+    /// key handler and doing something unrelated.
+    #[test]
+    fn an_unclaimed_chord_does_nothing() {
+        for key in [
+            Key::Character("z".into()),
+            Key::Character("h".into()),
+            Key::Character("1".into()),
+            Key::Named(NamedKey::ArrowRight),
+        ] {
+            assert_eq!(chord_for(&key), None, "{key:?} was taken for a chord");
+        }
+    }
+
+    /// Copying the picture and copying the path are different things, and the
+    /// only difference in the key is Shift. Getting them the wrong way round
+    /// would put a path where a picture was wanted.
+    #[test]
+    fn shift_is_what_separates_the_two_copies() {
+        assert_eq!(chord_for(&Key::Character("c".into())), Some(Chord::CopyPicture));
+        assert_eq!(chord_for(&Key::Character("C".into())), Some(Chord::CopyPath));
+        assert_ne!(
+            chord_for(&Key::Character("c".into())),
+            chord_for(&Key::Character("C".into())),
+            "Shift made no difference",
+        );
+    }
+
+    /// The key sheet advertises the chords, so they have to be ones the viewer
+    /// answers — the same rule the plain keys are held to, which is what stops
+    /// the sheet promising something that does nothing.
+    #[test]
+    fn every_chord_the_sheet_advertises_is_answered() {
+        let advertised: Vec<&str> = crate::interface::KEYS
+            .iter()
+            .map(|(key, _)| *key)
+            .filter(|key| key.starts_with("Ctrl+"))
+            .collect();
+        assert_eq!(advertised.len(), 3, "the sheet lists {advertised:?}, which is not the three chords");
+
+        for key in advertised {
+            // The letter at the end of the chord, and whether Shift is in it.
+            let letter = key.rsplit('+').next().expect("a chord names a key");
+            let shifted = key.contains("Shift");
+            let character = if shifted { letter.to_uppercase() } else { letter.to_lowercase() };
+            assert!(
+                chord_for(&Key::Character(character.as_str().into())).is_some(),
+                "the key sheet lists {key}, which the viewer ignores",
+            );
+        }
     }
 
     /// The loupe is the one key answered on the way up as well as on the way

@@ -13,6 +13,7 @@
 mod animation;
 mod app;
 mod avif;
+mod clipboard;
 mod color;
 mod config;
 mod console;
