@@ -265,6 +265,27 @@ what is being done between them. Colour management is invisible when it works
 and inexplicable when it does not — a photograph that looks wrong here and
 right elsewhere is a question nobody can answer by looking harder at it.
 
+## The clipboard
+
+`Ctrl+C` puts the picture on the clipboard, `Ctrl+V` shows whatever picture is
+on it, and `Ctrl+Shift+C` copies the file's path — quoted, so a path with a
+space in it survives being pasted into a terminal.
+
+What is copied is **the file's own pixels**, unconverted, which is the same
+decision the histogram and the eyedropper follow: the numbers on the clipboard
+are the numbers those tools report. A `CF_DIB` has nowhere to say what its
+numbers mean, so a wide-gamut picture will look flatter in an application that
+assumes sRGB. That is a true thing about the Windows clipboard rather than
+something a viewer should paper over by quietly rewriting the pixels on the way
+out. Transparency is composited onto white, because `CF_DIB` carries no
+dependable alpha and a cut-out is nearly always going onto a white page.
+
+A pasted picture is **shown, not saved**. It has no file behind it: the title
+says `clipboard`, the arrow keys have nowhere to go, and nothing is written to
+disk. A viewer that quietly saved a temporary file on every paste would be
+writing without being asked and leaving the results behind. See
+[ADR 0020](docs/adr/0020-a-pasted-picture-is-shown-not-saved.md).
+
 ## Large images
 
 A GPU texture has a maximum side — 16384 on current integrated hardware, and
@@ -371,7 +392,7 @@ has no size limit to hide behind.
 
 ## Status
 
-Early development — v0.21.0 is out. Startup, colour and format coverage hold:
+Early development — v0.22.0 is out. Startup, colour and format coverage hold:
 every modern still format opens, a phone's photographs included, every one of
 them reaches the screen without a wait, and the ones that animate play. The
 process that decodes the heavy formats runs with no network in either
@@ -391,7 +412,9 @@ histogram of the file's own values, and holding `Z` puts 100% under the cursor
 for as long as the key is down. **And the colour can be interrogated now**: `C`
 marks what the file clipped, `P` reads the pixel under the pointer in the
 file's terms and the display's, and `K` spells out the path between the two.
-Development runs in small
+**And it talks to the clipboard**: the picture out with `Ctrl+C`, whatever is
+on the clipboard in with `Ctrl+V`, and the path — quoted for a terminal — with
+`Ctrl+Shift+C`. Development runs in small
 versions, each one theme; the road to 1.0 is fixed:
 
 | Version | What lands |
@@ -420,7 +443,8 @@ versions, each one theme; the road to 1.0 is fixed:
 | ✅ v0.20.0 | Reading the picture: a live histogram of the file's own values, and a loupe held at 100% |
 | ✅ v0.20.1 | `nitid install` puts itself on the `PATH`, so the command works from a terminal |
 | ✅ v0.21.0 | Colour tools: the clipping zebra, the eyedropper, and the colour passport |
-| v0.22.0 – v0.35.0 | The everyday viewer: clipboard, file operations, culling, comparison, settings |
+| ✅ v0.22.0 | The clipboard: the picture out, a picture in, the path quoted for a terminal |
+| v0.23.0 – v0.35.0 | The everyday viewer: drag and drop, file operations, culling, comparison, settings |
 | v0.36.0 – v0.39.0 | Windows integration: context menu, installer, auto-update, thumbnails |
 | v0.40.0 – v0.41.0 | Documentation site, stabilisation |
 | v1.0.0 | Public release — the default viewer, nothing missing |
@@ -503,6 +527,9 @@ Opening a file opens its folder: the arrow keys walk the images beside it.
 | `C` | mark what the file clipped |
 | `P` | read the colour under the pointer; click to copy |
 | `K` | what is happening to this image's colour |
+| `Ctrl+C` | copy the picture |
+| `Ctrl+V` | show the picture on the clipboard |
+| `Ctrl+Shift+C` | copy the path, quoted for a terminal |
 | `F11` | fullscreen |
 | `?` | every key there is |
 | `Esc` | quit |
