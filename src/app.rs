@@ -214,6 +214,18 @@ struct App {
     /// changes no status: the toolbar drew and did nothing, which is how it
     /// shipped in v0.17.0 and what a hands-on run found.
     wants_frame: bool,
+    /// Whether the eyedropper is up.
+    ///
+    /// A mode rather than a held key, because its whole purpose is to be
+    /// pointed about the picture and clicked: holding a key down and clicking
+    /// at the same time is a two-handed gesture for a one-handed job.
+    picking: bool,
+    /// What the eyedropper reads under the cursor, while it is up.
+    ///
+    /// Recomputed on every pointer move rather than stored per pixel: reading
+    /// one pixel out of memory the loader is already holding costs nothing
+    /// worth caching.
+    reading: Option<crate::eyedropper::Reading>,
     /// Whether the framing carries from one image to the next.
     ///
     /// Off by default: a folder of unrelated pictures wants each one framed
@@ -261,6 +273,8 @@ impl App {
             toast_deadline: None,
             wants_frame: false,
             zoom_locked: false,
+            picking: false,
+            reading: None,
             shown_once: false,
         }
     }
@@ -459,6 +473,11 @@ impl App {
         // If the panel is already open — the user stepped to this image with
         // the histogram up — the new picture has to be counted for itself.
         self.count_if_wanted();
+        // The same for the eyedropper: a reading belongs to the picture it
+        // was taken from, and carrying it across a step would report a colour
+        // from the image the user just left.
+        self.reading = None;
+        self.take_reading();
     }
 
     /// Draw a vector image again for the size it now occupies on screen.
@@ -743,6 +762,28 @@ impl App {
                 // A look at the pixels, held rather than toggled. The release
                 // is answered in the event loop, not here.
                 "z" | "Z" => self.hold_loupe(),
+                // The colour under the cursor. A mode, so it can be pointed
+                // about the picture and clicked with one hand.
+                "p" | "P" => self.toggle_picking(),
+                // The colour path, spelled out. Reachable from the keyboard
+                // as well as by clicking the status line's colour chip: the
+                // toolbar and the status line carry nothing the keys do not.
+                "k" | "K" => {
+                    self.interface.toggle_passport();
+                    self.request_redraw();
+                }
+                // Which pixels the file itself clipped. A viewing aid, so
+                // it belongs to the renderer rather than to the picture: it
+                // costs one uniform write and survives a step to the next
+                // image, which is what makes it usable for checking a series.
+                "c" | "C" => {
+                    if let Some(renderer) = self.renderer.as_mut() {
+                        let next = !renderer.zebra();
+                        renderer.set_zebra(next);
+                        self.interface.toast(if next { "clipping shown" } else { "clipping hidden" }, Instant::now());
+                        self.request_redraw();
+                    }
+                }
                 // What tones the picture is made of. The count is started
                 // here rather than at load: a file nobody asked to measure
                 // stays unmeasured, which is what keeps this off the path to
@@ -816,6 +857,91 @@ impl App {
         }
         shown.histogram = Some(histogram);
         shown.counting = false;
+        self.request_redraw();
+    }
+
+    /// What is happening to the colour of the picture on screen.
+    ///
+    /// Built on demand rather than kept: it is asked for only while the panel
+    /// is open, and it costs a couple of profile lookups.
+    fn passport(&self) -> Option<crate::color::Passport> {
+        if !self.interface.passport_shown() {
+            return None;
+        }
+        let shown = self.shown.as_ref()?;
+        let Request::Ready(image) = self.loader.request(&shown.path) else {
+            return None;
+        };
+        let transform = ColorTransform::for_image(image.profile.as_ref(), &self.display_profile);
+        Some(crate::color::Passport::new(image.profile.as_ref(), &self.display_profile, &transform))
+    }
+
+    /// Show or hide the eyedropper.
+    fn toggle_picking(&mut self) {
+        self.picking = !self.picking;
+        if self.picking {
+            self.take_reading();
+        } else {
+            self.reading = None;
+        }
+        self.request_redraw();
+    }
+
+    /// Read the pixel under the cursor, if the eyedropper is up.
+    ///
+    /// The pixels come from the loader's cache — the same ones the histogram
+    /// counts — so pointing about a picture costs a lookup rather than a
+    /// read-back from the GPU, which would stall the pipeline on every mouse
+    /// move.
+    fn take_reading(&mut self) {
+        if !self.picking {
+            return;
+        }
+        let cursor = self.cursor_position();
+        let Some(shown) = self.shown.as_ref() else {
+            self.reading = None;
+            return;
+        };
+        // A thumbnail stands in for the picture at a fraction of its size, so
+        // its pixels are not the file's: the eyedropper waits for the real
+        // image rather than reporting a colour off an approximation.
+        if shown.fidelity != Fidelity::Full {
+            self.reading = None;
+            return;
+        }
+
+        let Some(at) = shown.view.pixel_under(cursor) else {
+            // Off the picture: no reading rather than a stale one, or the
+            // panel would keep reporting the last pixel that was under the
+            // cursor as though it still were.
+            self.reading = None;
+            return;
+        };
+
+        let path = shown.path.clone();
+        // What the file asks for, then what the user asked for on top of it —
+        // the same composition the renderer draws with, so the pixel named is
+        // the pixel shown.
+        let orientation = shown.orientation.then(shown.turn);
+        let Request::Ready(image) = self.loader.request(&path) else {
+            self.reading = None;
+            return;
+        };
+        let transform = ColorTransform::for_image(image.profile.as_ref(), &self.display_profile);
+        self.reading = crate::eyedropper::read(&image.image, orientation, &transform, at);
+    }
+
+    /// Put the colour under the cursor on the clipboard.
+    ///
+    /// The file's value, not the display's, for the reason the module states:
+    /// it is a fact about the picture rather than about this monitor.
+    fn copy_reading(&mut self) {
+        let Some(reading) = self.reading else {
+            return;
+        };
+        let hex = reading.hex();
+        self.interface.context().copy_text(hex.clone());
+        self.interface.toast(format!("{hex} copied"), Instant::now());
         self.request_redraw();
     }
 
@@ -1015,6 +1141,10 @@ impl App {
             path: self.shown.as_ref().map(|shown| shown.path.clone()),
             file_size: self.shown.as_ref().and_then(|shown| shown.file_size),
             histogram: self.shown.as_ref().and_then(|shown| shown.histogram.clone()),
+            clipping: self.renderer.as_ref().is_some_and(Renderer::zebra),
+            picking: self.picking,
+            reading: self.reading,
+            passport: self.passport(),
         }
     }
 
@@ -1190,7 +1320,7 @@ fn handled(key: &Key) -> bool {
         ) => true,
         Key::Character(character) => matches!(
             character.as_str(),
-            "+" | "=" | "-" | "_" | "0" | "1" | "?" | "l" | "L" | "r" | "R" | "b" | "B" | "i" | "I" | "z" | "Z" | "h" | "H"
+            "+" | "=" | "-" | "_" | "0" | "1" | "?" | "l" | "L" | "r" | "R" | "b" | "B" | "i" | "I" | "z" | "Z" | "h" | "H" | "c" | "C" | "p" | "P" | "k" | "K"
         ),
         _ => false,
     }
@@ -1223,6 +1353,9 @@ fn key_for(action: Action) -> Key {
         Action::Backdrop => Key::Character("b".into()),
         Action::Info => Key::Character("i".into()),
         Action::Histogram => Key::Character("h".into()),
+        Action::Clipping => Key::Character("c".into()),
+        Action::Pick => Key::Character("p".into()),
+        Action::Passport => Key::Character("k".into()),
         Action::Lock => Key::Character("l".into()),
         Action::FullScreen => Key::Named(NamedKey::F11),
         Action::Keys => Key::Character("?".into()),
@@ -1601,7 +1734,17 @@ impl ApplicationHandler<Event> for App {
             }
 
             WindowEvent::MouseInput { state, button, .. } => match (button, state) {
-                (MouseButton::Left, ElementState::Pressed) => self.dragging = true,
+                (MouseButton::Left, ElementState::Pressed) => {
+                    if self.picking {
+                        // The eyedropper owns the left button while it is up:
+                        // a click is what takes the colour, and panning the
+                        // picture out from under the pointer mid-read would
+                        // make the reading name a pixel nobody aimed at.
+                        self.copy_reading();
+                    } else {
+                        self.dragging = true;
+                    }
+                }
                 (MouseButton::Left, ElementState::Released) => self.dragging = false,
                 (MouseButton::Middle, ElementState::Pressed) => self.reframe(Reframe::Toggle),
                 _ => {}
@@ -1616,6 +1759,10 @@ impl ApplicationHandler<Event> for App {
                 // would name a different strip of the window than the one the
                 // toolbar occupies.
                 if self.follow_pointer(Some(position)) {
+                    self.request_redraw();
+                }
+                if self.picking {
+                    self.take_reading();
                     self.request_redraw();
                 }
                 if self.dragging
@@ -1851,7 +1998,7 @@ mod tests {
     /// trusted: a hand-kept list is one an added action is forgotten from, and
     /// the two tests over it would then pass while saying nothing about the
     /// new button. Adding a variant now fails to compile until it is listed.
-    const EVERY_ACTION: [Action; 14] = [
+    const EVERY_ACTION: [Action; 17] = [
         Action::Previous,
         Action::Next,
         Action::ZoomOut,
@@ -1864,6 +2011,9 @@ mod tests {
         Action::Lock,
         Action::Info,
         Action::Histogram,
+        Action::Clipping,
+        Action::Pick,
+        Action::Passport,
         Action::FullScreen,
         Action::Keys,
     ];
@@ -1888,8 +2038,11 @@ mod tests {
                 Action::Lock => 9,
                 Action::Info => 10,
                 Action::Histogram => 11,
-                Action::FullScreen => 12,
-                Action::Keys => 13,
+                Action::Clipping => 12,
+                Action::Pick => 13,
+                Action::Passport => 14,
+                Action::FullScreen => 15,
+                Action::Keys => 16,
             };
         }
 
@@ -1957,6 +2110,9 @@ mod tests {
             Key::Character("i".into()),
             Key::Character("z".into()),
             Key::Character("h".into()),
+            Key::Character("c".into()),
+            Key::Character("p".into()),
+            Key::Character("k".into()),
         ] {
             assert!(handled(&key), "the key sheet lists {key:?}, which the viewer ignores");
         }

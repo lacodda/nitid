@@ -41,6 +41,16 @@ struct Colour {
     // What shows through a transparent pixel: 0 the viewer's own dark scene,
     // 1 a checkerboard, 2 black, 3 white. See `Backdrop` in `gpu.rs`.
     backdrop: u32,
+    // Whether to mark the pixels the file itself clipped.
+    zebra: u32,
+    // Whether the texture hands this shader linear light rather than the
+    // file's stored values. True for the `*Srgb` texture an untouched 8-bit
+    // image is uploaded into, where the hardware linearises on sampling — the
+    // zebra has to undo that to see what the file actually stored.
+    sampled_is_linear: u32,
+    // Padding to a 16-byte boundary, since WGSL aligns the struct's size and
+    // Rust's `repr(C)` does not. Matched by `_padding` in `ColourUniform`.
+    _padding: vec2<u32>,
 }
 
 @group(0) @binding(0) var image_texture: texture_2d<f32>;
@@ -131,6 +141,48 @@ fn encode_srgb_channel(value: f32) -> f32 {
     return 1.055 * pow(clamped, 1.0 / 2.4) - 0.055;
 }
 
+// How wide one stripe of the zebra is, in physical pixels.
+//
+// Measured on screen like the checkerboard, and for the same reason: a hatch
+// that scaled with the picture would read as part of it.
+const ZEBRA_SIZE: f32 = 7.0;
+
+// The sRGB transfer function the other way: linear light back to the stored
+// value.
+//
+// Needed only by the zebra, and only for an image uploaded into an `*Srgb`
+// texture, where the hardware linearised on sampling and the value the file
+// actually holds is no longer in hand.
+fn decode_srgb_channel(value: f32) -> f32 {
+    if value <= 0.04045 / 12.92 {
+        return value * 12.92;
+    }
+    return 1.055 * pow(value, 1.0 / 2.4) - 0.055;
+}
+
+// Whether this pixel is one the *file* clipped, and which way.
+//
+// Judged on the file's own stored values, before any conversion — the same
+// decision the histogram is built on (ADR 0019). A highlight this display
+// cannot reproduce is not a highlight the camera blew, and marking it would
+// tell the photographer to fix something that is not wrong with the picture.
+//
+// Returns 1 for a blown highlight, -1 for a blocked shadow, 0 otherwise.
+fn clipping_of(stored: vec3<f32>) -> f32 {
+    // A whisker below the ends rather than exactly at them: an 8-bit 255
+    // arrives as 1.0, but a 16-bit sample a step below full scale is 0.99998,
+    // and a JPEG's 254 is a highlight already gone for practical purposes.
+    let high = any(stored >= vec3<f32>(0.996));
+    let low = all(stored <= vec3<f32>(0.004));
+    if high {
+        return 1.0;
+    }
+    if low {
+        return -1.0;
+    }
+    return 0.0;
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let sampled = textureSample(image_texture, image_sampler, in.uv);
@@ -152,6 +204,49 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // extended-range surface it survives, because that surface can carry
         // it.
         rgb = colour.matrix * linear;
+    }
+
+    // The zebra, over the converted colour but before any encoding: it is
+    // stated as light, like everything else here, so it means the same thing
+    // on every surface.
+    //
+    // Marked on the file's own stored values rather than on what came out of
+    // the transform, which is the decision ADR 0019 records for the
+    // histogram: a highlight this display cannot reach is not one the camera
+    // blew. On an `*Srgb` texture the hardware already linearised, so the
+    // stored value is reconstructed to ask the question of the right numbers.
+    if colour.zebra != 0u && sampled.a > 0.0 {
+        var stored = sampled.rgb;
+        if colour.sampled_is_linear != 0u {
+            stored = vec3<f32>(
+                decode_srgb_channel(stored.r),
+                decode_srgb_channel(stored.g),
+                decode_srgb_channel(stored.b),
+            );
+        }
+
+        let clipping = clipping_of(stored);
+        if clipping != 0.0 {
+            // Diagonal stripes, so the hatch cannot be mistaken for anything
+            // in the picture: nothing photographic is a 45-degree comb.
+            let diagonal = in.clip_position.x + in.clip_position.y;
+            if (diagonal - ZEBRA_SIZE * floor(diagonal / ZEBRA_SIZE)) < ZEBRA_SIZE * 0.5 {
+                // Blown highlights are marked in red and blocked shadows in
+                // blue: the two failures are opposite and must not look alike.
+                // Stated as linear light at a strength that reads over both a
+                // white highlight and a black shadow.
+                // Written as a branch rather than `select`: measured, the
+                // two colours came out swapped — a blown highlight marked
+                // blue and a blocked shadow red — because the argument order
+                // is easy to state backwards and nothing but a rendered
+                // frame shows it. A branch says which is which.
+                if clipping > 0.0 {
+                    rgb = vec3<f32>(0.7, 0.0, 0.0);
+                } else {
+                    rgb = vec3<f32>(0.0, 0.05, 0.6);
+                }
+            }
+        }
     }
 
     // Alpha is composited against the chosen backdrop so a transparent PNG

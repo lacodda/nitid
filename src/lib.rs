@@ -16,6 +16,7 @@ mod avif;
 mod color;
 mod config;
 mod console;
+mod eyedropper;
 mod folder;
 mod format;
 mod gpu;

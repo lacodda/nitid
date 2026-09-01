@@ -10,7 +10,7 @@
 //! decoded pixels stay as the file stored them, so a later change of display
 //! profile costs a redraw rather than a re-decode.
 
-use moxcms::{ColorProfile, ToneReprCurve};
+use moxcms::{ColorProfile, ProfileText, ToneReprCurve};
 
 use crate::format::Format;
 
@@ -19,6 +19,104 @@ use crate::format::Format;
 /// 1024 is past the point where banding is visible in an 8-bit image, and the
 /// three curves together come to 12 KB — small enough not to think about.
 pub const CURVE_SAMPLES: usize = 1024;
+
+/// What is happening to this image's colour, in the words a person would use.
+///
+/// The status line has room for three words and says "converted"; this is what
+/// those three words are short for. It exists because colour management is the
+/// one thing a viewer does that is invisible when it works and inexplicable
+/// when it does not: a photograph that looks wrong here and right elsewhere is
+/// a question nobody can answer by looking harder at the picture.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Passport {
+    /// What the file says its numbers mean, named as the profile names itself.
+    ///
+    /// `None` for an untagged file, which says nothing — see ADR 0005 for why
+    /// that is passed through rather than assumed to be sRGB.
+    pub source: Option<String>,
+    /// What the display says it can show.
+    pub display: Option<String>,
+    /// Whether a conversion is actually happening.
+    pub converting: bool,
+    /// How far apart the two spaces are, as the largest single change the
+    /// matrix makes to a primary.
+    ///
+    /// Zero for the identity. It is not a colorimetric error figure and is not
+    /// presented as one: it answers "is this a big change or a small one",
+    /// which is what someone reading a passport wants to know.
+    pub distance: f32,
+}
+
+impl Passport {
+    /// Describe the path this image's colour takes to the screen.
+    pub fn new(source: Option<&ColorProfile>, display: &ColorProfile, transform: &ColorTransform) -> Self {
+        Self {
+            source: source.and_then(profile_name),
+            display: profile_name(display),
+            converting: !transform.is_identity,
+            distance: matrix_distance(&transform.matrix),
+        }
+    }
+
+    /// One line saying what is happening, for a panel that has room for a
+    /// sentence rather than a word.
+    pub fn summary(&self) -> String {
+        match (&self.source, self.converting) {
+            // An untagged file states nothing about its numbers, so nothing is
+            // assumed and nothing is converted.
+            (None, _) => "This file does not say what its colours mean, so they are shown untouched.".into(),
+            (Some(source), false) => format!("{source} matches the display, so nothing is converted."),
+            (Some(source), true) => {
+                let display = self.display.as_deref().unwrap_or("the display");
+                format!("{source} converted to {display}.")
+            }
+        }
+    }
+}
+
+/// What a profile calls itself.
+///
+/// A profile carries its description in one of three encodings depending on
+/// its age, and a viewer that read only the modern one would leave most
+/// display profiles nameless — the ones Windows ships are old.
+fn profile_name(profile: &ColorProfile) -> Option<String> {
+    let text = profile.description.as_ref()?;
+    let name = match text {
+        ProfileText::PlainString(value) => value.clone(),
+        // The localised form: any entry will do, because a viewer that picked
+        // by language would still have to fall back to whatever is there.
+        ProfileText::Localizable(entries) => entries.first()?.value.clone(),
+        // The old form carries both, and the ASCII one is the one that is
+        // always filled in.
+        ProfileText::Description(description) => {
+            if description.ascii_string.trim().is_empty() {
+                description.unicode_string.clone()
+            } else {
+                description.ascii_string.clone()
+            }
+        }
+    };
+
+    let trimmed = name.trim().trim_end_matches('\0').trim();
+    if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+}
+
+/// How far the matrix moves a colour, as the largest change to any one
+/// primary.
+///
+/// The identity leaves every primary alone and measures zero; a conversion
+/// between distant spaces moves them further. Deliberately a single number
+/// with no unit attached: it is a sense of scale, not a measurement.
+fn matrix_distance(matrix: &[[f32; 3]; 3]) -> f32 {
+    let identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    let mut worst: f32 = 0.0;
+    for (row, expected) in matrix.iter().zip(&identity) {
+        for (value, expected) in row.iter().zip(expected) {
+            worst = worst.max((value - expected).abs());
+        }
+    }
+    worst
+}
 
 /// A profile reduced to what the shader needs.
 ///
@@ -56,6 +154,27 @@ impl ColorTransform {
             Some(profile) => Self::new(profile, display),
             None => Self::identity(),
         }
+    }
+
+    /// One channel through its tone curve, from a stored value to linear
+    /// light.
+    ///
+    /// The same lookup the shader does — the curves are sampled into rows and
+    /// read with linear interpolation — done on the CPU for the one pixel the
+    /// eyedropper is asked about. Reading that pixel back off the GPU instead
+    /// would stall the whole pipeline, and it is asked for on every mouse move
+    /// while the eyedropper is up.
+    pub fn decode_channel(&self, value: f32, channel: usize) -> f32 {
+        let row = channel.min(2) * CURVE_SAMPLES;
+        let Some(curve) = self.decode.get(row..row + CURVE_SAMPLES) else {
+            return value;
+        };
+
+        let position = value.clamp(0.0, 1.0) * (CURVE_SAMPLES - 1) as f32;
+        let below = position.floor() as usize;
+        let above = (below + 1).min(CURVE_SAMPLES - 1);
+        let fraction = position - below as f32;
+        curve[below] + (curve[above] - curve[below]) * fraction
     }
 
     /// The transform that changes nothing.
@@ -430,6 +549,141 @@ fn is_near_identity(matrix: &[[f32; 3]; 3]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The case the passport exists for: a file in one space shown on a
+    /// display in another. It names both ends and says a conversion is under
+    /// way.
+    #[test]
+    fn a_converted_image_names_both_ends_of_the_path() {
+        let source = ColorProfile::new_display_p3();
+        let display = ColorProfile::new_srgb();
+        let transform = ColorTransform::new(&source, &display);
+        let passport = Passport::new(Some(&source), &display, &transform);
+
+        assert!(passport.converting, "a P3 image on an sRGB display is a conversion");
+        assert!(passport.source.is_some(), "the file's profile went unnamed");
+        assert!(passport.display.is_some(), "the display's profile went unnamed");
+        assert!(passport.distance > 0.0, "a real conversion measured no distance at all");
+    }
+
+    /// An image that matches the display is converted by nothing, and the
+    /// passport has to say so rather than describing an identity as work.
+    #[test]
+    fn a_matching_image_reports_no_conversion() {
+        let profile = ColorProfile::new_srgb();
+        let transform = ColorTransform::new(&profile, &profile);
+        let passport = Passport::new(Some(&profile), &profile, &transform);
+
+        assert!(!passport.converting);
+        assert!(passport.distance < 0.001, "an identity moved a primary by {}", passport.distance);
+        assert!(passport.summary().contains("matches the display"), "{}", passport.summary());
+    }
+
+    /// An untagged file states nothing, and the passport says that rather than
+    /// naming a profile it does not have — the decision ADR 0005 records.
+    #[test]
+    fn an_untagged_file_says_it_states_nothing() {
+        let display = ColorProfile::new_srgb();
+        let passport = Passport::new(None, &display, &ColorTransform::identity());
+
+        assert_eq!(passport.source, None);
+        assert!(!passport.converting);
+        assert!(
+            passport.summary().contains("does not say"),
+            "an untagged file was described as though it had a profile: {}",
+            passport.summary(),
+        );
+    }
+
+    /// The distance is a sense of scale, so spaces further apart have to
+    /// measure further apart — a figure that did not order them would be
+    /// decoration.
+    #[test]
+    fn spaces_further_apart_measure_further_apart() {
+        let display = ColorProfile::new_srgb();
+
+        let near = Passport::new(
+            Some(&ColorProfile::new_display_p3()),
+            &display,
+            &ColorTransform::new(&ColorProfile::new_display_p3(), &display),
+        );
+        let far = Passport::new(
+            Some(&ColorProfile::new_bt2020()),
+            &display,
+            &ColorTransform::new(&ColorProfile::new_bt2020(), &display),
+        );
+
+        assert!(
+            far.distance > near.distance,
+            "BT.2020 ({}) did not measure further from sRGB than P3 ({})",
+            far.distance,
+            near.distance,
+        );
+    }
+
+    /// The summary is what a person reads, so it has to name the file's own
+    /// space rather than describing the conversion in the abstract.
+    #[test]
+    fn the_summary_names_the_space_the_file_is_in() {
+        let source = ColorProfile::new_display_p3();
+        let display = ColorProfile::new_srgb();
+        let transform = ColorTransform::new(&source, &display);
+        let passport = Passport::new(Some(&source), &display, &transform);
+
+        let summary = passport.summary();
+        let named = passport.source.expect("the source was named");
+        assert!(summary.contains(&named), "the summary does not name the file's space: {summary}");
+        assert!(summary.contains("converted"), "the summary does not say a conversion is happening: {summary}");
+    }
+
+    /// A profile with no description of its own leaves the name empty rather
+    /// than reporting whitespace or a stray terminator as a profile name.
+    #[test]
+    fn a_nameless_profile_is_reported_as_nameless() {
+        let mut profile = ColorProfile::new_srgb();
+        profile.description = Some(ProfileText::PlainString("   \0  ".to_string()));
+        assert_eq!(profile_name(&profile), None, "padding was reported as a profile name");
+
+        profile.description = None;
+        assert_eq!(profile_name(&profile), None);
+    }
+
+    /// The three encodings a profile can carry its name in are all read: a
+    /// viewer that handled only the modern one would leave most display
+    /// profiles nameless, because the ones Windows ships are old.
+    #[test]
+    fn a_profile_name_is_read_in_every_encoding_it_can_carry() {
+        let mut profile = ColorProfile::new_srgb();
+
+        profile.description = Some(ProfileText::PlainString("Plain".into()));
+        assert_eq!(profile_name(&profile).as_deref(), Some("Plain"));
+
+        profile.description = Some(ProfileText::Localizable(vec![moxcms::LocalizableString {
+            language: "en".into(),
+            country: "US".into(),
+            value: "Localised".into(),
+        }]));
+        assert_eq!(profile_name(&profile).as_deref(), Some("Localised"));
+
+        profile.description = Some(ProfileText::Description(moxcms::DescriptionString {
+            ascii_string: "Ascii".into(),
+            unicode_language_code: 0,
+            unicode_string: "Unicode".into(),
+            script_code_code: 0,
+            mac_string: String::new(),
+        }));
+        assert_eq!(profile_name(&profile).as_deref(), Some("Ascii"), "the old form's ASCII name was not read");
+
+        // And the unicode half is the fallback when the ASCII one is empty.
+        profile.description = Some(ProfileText::Description(moxcms::DescriptionString {
+            ascii_string: String::new(),
+            unicode_language_code: 0,
+            unicode_string: "Unicode".into(),
+            script_code_code: 0,
+            mac_string: String::new(),
+        }));
+        assert_eq!(profile_name(&profile).as_deref(), Some("Unicode"));
+    }
 
     #[test]
     fn an_untagged_file_has_no_profile() {

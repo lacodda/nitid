@@ -296,6 +296,36 @@ impl View {
         self.clamp_offset();
     }
 
+    /// Which pixel of the displayed image sits under a window position.
+    ///
+    /// `cursor` is in physical pixels from the window's top-left; the answer
+    /// is in pixels of the image *as shown*, so it follows the zoom, the pan
+    /// and — because `image` is the oriented size — a turned picture. `None`
+    /// when the position is not over the image at all, which is what stops the
+    /// eyedropper reporting a colour for the scene beside a fitted photograph.
+    ///
+    /// Plain geometry, kept here with the rest of it: the renderer knows where
+    /// the picture is drawn but has no business answering questions about it,
+    /// and this way the mapping is tested without a device.
+    pub fn pixel_under(&self, cursor: (f32, f32)) -> Option<(u32, u32)> {
+        let (width, height) = self.scaled_size();
+        if width <= 0.0 || height <= 0.0 || self.scale <= 0.0 {
+            return None;
+        }
+        let top_left = (
+            self.window.0 / 2.0 + self.offset.0 - width / 2.0,
+            self.window.1 / 2.0 + self.offset.1 - height / 2.0,
+        );
+        let point = ((cursor.0 - top_left.0) / self.scale, (cursor.1 - top_left.1) / self.scale);
+
+        // Outside the picture is not a pixel of it. Checked before the cast,
+        // because a negative float becomes a very large `u32`.
+        if point.0 < 0.0 || point.1 < 0.0 || point.0 >= self.image.0 || point.1 >= self.image.1 {
+            return None;
+        }
+        Some((point.0 as u32, point.1 as u32))
+    }
+
     /// Whether the loupe is up.
     pub fn loupe_held(&self) -> bool {
         self.held.is_some()
@@ -621,6 +651,99 @@ mod tests {
         let next = first.carry_onto((4000, 3000), (2000, 1600), 2.0);
         assert!(about(next.scale(), 2.0), "the zoom read {} on the scaled display", next.scale());
         assert!(about(next.physical_scale(), 4.0), "the physical scale did not follow the display");
+    }
+
+    /// What the eyedropper is built on: a window position names a pixel of
+    /// the picture, and the answer follows the framing.
+    #[test]
+    fn a_window_position_names_the_pixel_under_it() {
+        // A 100x100 image centred in a 300x300 window at 100%: it occupies
+        // 100..200 on both axes.
+        let mut view = view((100, 100), (300, 300));
+        view.set_actual();
+
+        assert_eq!(view.pixel_under((150.0, 150.0)), Some((50, 50)), "the middle of the picture");
+        assert_eq!(view.pixel_under((100.0, 100.0)), Some((0, 0)), "the top-left pixel");
+        // The last pixel, not one past it: 199.x still lands on pixel 99.
+        assert_eq!(view.pixel_under((199.9, 199.9)), Some((99, 99)), "the bottom-right pixel");
+    }
+
+    /// The scene beside a fitted photograph is not part of it, and reporting a
+    /// colour there would be reporting the viewer's own background as if it
+    /// were the picture's.
+    #[test]
+    fn a_position_off_the_picture_names_no_pixel() {
+        let mut view = view((100, 100), (300, 300));
+        view.set_actual();
+
+        assert_eq!(view.pixel_under((50.0, 150.0)), None, "left of the picture");
+        assert_eq!(view.pixel_under((250.0, 150.0)), None, "right of the picture");
+        assert_eq!(view.pixel_under((150.0, 50.0)), None, "above the picture");
+        assert_eq!(view.pixel_under((150.0, 250.0)), None, "below the picture");
+        // And exactly one past the last pixel is already outside.
+        assert_eq!(view.pixel_under((200.0, 150.0)), None, "one past the right edge");
+    }
+
+    /// Zooming and panning move the picture under the cursor, so the same
+    /// window position names a different pixel — which is the whole point.
+    #[test]
+    fn the_pixel_named_follows_the_zoom_and_the_pan() {
+        let mut view = view((400, 400), (200, 200));
+        view.set_actual();
+        // Centred: the middle of the window is the middle of the image.
+        assert_eq!(view.pixel_under((100.0, 100.0)), Some((200, 200)));
+
+        // Panned to the top-left corner of the picture.
+        view.pan((10_000.0, 10_000.0));
+        assert_eq!(view.pixel_under((0.0, 0.0)), Some((0, 0)), "the corner did not follow the pan");
+
+        // At 2x every image pixel covers two window pixels. A fresh view,
+        // built before the shadowing binding above is in scope.
+        let mut zoomed = View::new((400, 400), (200, 200), 1.0);
+        zoomed.zoom_to_at(2.0, (100.0, 100.0));
+        let first = zoomed.pixel_under((100.0, 100.0)).expect("over the picture");
+        let second = zoomed.pixel_under((102.0, 100.0)).expect("over the picture");
+        assert_eq!(second.0 - first.0, 1, "two window pixels should be one image pixel at 2x");
+    }
+
+    /// A fitted picture is shown smaller than it is, so one window pixel
+    /// covers several of the image's — the answer has to be in the image's own
+    /// pixels, not the screen's.
+    #[test]
+    fn the_pixel_named_is_the_images_own_even_when_shrunk() {
+        // 1000x1000 fitted into a 250x250 window: a quarter scale.
+        let view = view((1000, 1000), (250, 250));
+        assert!(view.scale() < 0.3, "the fixture is not actually shrunk");
+
+        let middle = view.pixel_under((125.0, 125.0)).expect("over the picture");
+        assert!(
+            (490..=510).contains(&middle.0) && (490..=510).contains(&middle.1),
+            "the middle of a shrunk picture named {middle:?} rather than its centre pixel",
+        );
+    }
+
+    /// A scaled display multiplies the physical pixels without changing which
+    /// pixel of the file is under the cursor.
+    #[test]
+    fn a_scaled_display_names_the_same_pixel() {
+        // The same picture and logical framing on a 200% display.
+        let mut plain = View::new((400, 400), (800, 800), 1.0);
+        plain.set_actual();
+        let mut scaled = View::new((400, 400), (1600, 1600), 2.0);
+        scaled.set_actual();
+
+        // The centre of the window, in each one's physical pixels.
+        assert_eq!(plain.pixel_under((400.0, 400.0)), scaled.pixel_under((800.0, 800.0)));
+    }
+
+    #[test]
+    fn a_degenerate_view_names_no_pixel_rather_than_panicking() {
+        let view = view((0, 0), (0, 0));
+        // Whatever it answers, it must not panic or invent a pixel outside a
+        // picture that has none.
+        if let Some((x, y)) = view.pixel_under((0.0, 0.0)) {
+            assert!(x < 1 && y < 1, "a degenerate view named pixel ({x}, {y})");
+        }
     }
 
     /// What the loupe is for: a fitted photograph is shown too small to judge

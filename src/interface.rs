@@ -17,6 +17,8 @@ use std::time::{Duration, Instant};
 
 use std::path::PathBuf;
 
+use crate::color::Passport;
+use crate::eyedropper::Reading;
 use crate::format::Format;
 use crate::histogram::{BUCKETS, Histogram};
 use crate::image_source::Depth;
@@ -84,6 +86,16 @@ pub struct Status {
     /// `None` while the count is still running, which is what the panel shows
     /// as "counting" rather than as an empty pair of axes.
     pub histogram: Option<Histogram>,
+    /// Whether the clipping zebra is showing.
+    pub clipping: bool,
+    /// Whether the eyedropper is up.
+    pub picking: bool,
+    /// What the eyedropper reads under the cursor. `None` when it is off, or
+    /// when the pointer is not over the picture.
+    pub reading: Option<Reading>,
+    /// What is happening to this image's colour. `Some` only while the
+    /// passport is showing.
+    pub passport: Option<Passport>,
 }
 
 /// What a toolbar button asks the viewer to do.
@@ -105,6 +117,9 @@ pub enum Action {
     Lock,
     Info,
     Histogram,
+    Clipping,
+    Pick,
+    Passport,
     FullScreen,
     Keys,
 }
@@ -143,6 +158,8 @@ pub struct Interface {
     info_shown: bool,
     /// Whether the histogram is showing.
     histogram_shown: bool,
+    /// Whether the colour passport is showing.
+    passport_shown: bool,
     /// Whether the toolbar is showing, decided by where the pointer is.
     ///
     /// Kept here rather than asked of egui each frame because it is also what
@@ -177,6 +194,7 @@ impl Interface {
             keys_shown: false,
             info_shown: false,
             histogram_shown: false,
+            passport_shown: false,
             toolbar_shown: false,
             toasts: Vec::new(),
             last: None,
@@ -200,6 +218,19 @@ impl Interface {
     /// Show or hide the histogram.
     pub fn toggle_histogram(&mut self) {
         self.histogram_shown = !self.histogram_shown;
+    }
+
+    /// Show or hide the colour passport.
+    pub fn toggle_passport(&mut self) {
+        self.passport_shown = !self.passport_shown;
+    }
+
+    /// Whether the colour passport is showing.
+    ///
+    /// Asked by the application before it builds one: the profiles are only
+    /// looked up while something is there to read them.
+    pub fn passport_shown(&self) -> bool {
+        self.passport_shown
     }
 
     /// Whether the histogram is showing.
@@ -275,12 +306,18 @@ impl Interface {
             if toolbar_shown {
                 action = toolbar(ui, status, info_shown, histogram_shown);
             }
-            status_line(ui, status);
+            action = action.or(status_line(ui, status));
             if info_shown {
                 info_panel(ui, status);
             }
             if histogram_shown {
                 histogram_panel(ui, status);
+            }
+            if status.picking {
+                eyedropper_panel(ui, status);
+            }
+            if let Some(passport) = &status.passport {
+                passport_panel(ui, passport);
             }
             if keys_shown {
                 key_sheet(ui);
@@ -312,8 +349,12 @@ impl Interface {
             self.toolbar_shown,
             self.toasts.len(),
         ) + &format!(
-            "|{}|{:?}",
+            "|{}|{}|{}|{}|{:?}|{:?}",
             self.histogram_shown,
+            self.passport_shown,
+            status.clipping,
+            status.picking,
+            status.reading.map(|reading| (reading.at, reading.file)),
             // The counted total stands in for the whole shape: a histogram
             // that arrives, or one replaced by the next picture's, changes it.
             // Without this the panel would open empty and stay empty, because
@@ -392,6 +433,22 @@ fn toolbar(ui: &mut egui::Ui, status: &Status, info_shown: bool, histogram_shown
                                 histogram_shown,
                                 Action::Histogram,
                             ))
+                            .or(toggle(
+                                ui,
+                                "Clip",
+                                "Mark what the file clipped  (C)",
+                                showing,
+                                status.clipping,
+                                Action::Clipping,
+                            ))
+                            .or(toggle(
+                                ui,
+                                "Pick",
+                                "Read the colour under the pointer  (P)",
+                                showing,
+                                status.picking,
+                                Action::Pick,
+                            ))
                             .or_else(|| {
                                 separator(ui);
                                 None
@@ -431,7 +488,8 @@ fn toggle(ui: &mut egui::Ui, label: &str, hint: &str, enabled: bool, on: bool, w
 }
 
 /// The bar along the bottom: what this picture is.
-fn status_line(ui: &mut egui::Ui, status: &Status) {
+fn status_line(ui: &mut egui::Ui, status: &Status) -> Option<Action> {
+    let mut action = None;
     egui::Panel::bottom("status")
         .frame(
             egui::Frame::new()
@@ -467,7 +525,16 @@ fn status_line(ui: &mut egui::Ui, status: &Status) {
 
                 if let Some(colour) = &status.colour {
                     separator(ui);
-                    ui.label(colour);
+                    // The one thing in the status line that answers a click:
+                    // colour management is invisible when it works and
+                    // inexplicable when it does not, so the word describing it
+                    // is the handle for the explanation.
+                    let chip = ui
+                        .add(egui::Label::new(colour).sense(egui::Sense::click()))
+                        .on_hover_text("What is happening to this image's colour  (click)");
+                    if chip.clicked() {
+                        action = Some(Action::Passport);
+                    }
                 }
 
                 if status.hdr {
@@ -512,6 +579,8 @@ fn status_line(ui: &mut egui::Ui, status: &Status) {
                 });
             });
         });
+
+    action
 }
 
 /// What the file says about itself, down the right-hand edge.
@@ -827,6 +896,114 @@ fn band_colour(lit: [bool; 3]) -> egui::Color32 {
     egui::Color32::from_rgb(if lit[0] { ON } else { OFF }, if lit[1] { ON } else { OFF }, if lit[2] { ON } else { OFF })
 }
 
+/// What the eyedropper reads, beside the pointer's own end of the window.
+///
+/// Anchored to the top-left rather than following the pointer: a panel that
+/// chased the cursor would cover the pixel being read, which is the one thing
+/// the person is looking at. It sits under the toolbar's band so the two never
+/// argue over the same strip.
+fn eyedropper_panel(ui: &mut egui::Ui, status: &Status) {
+    egui::Area::new("eyedropper".into())
+        .fixed_pos(egui::pos2(ui.max_rect().left() + 12.0, ui.max_rect().top() + TOOLBAR_HEIGHT + 12.0))
+        .interactable(false)
+        .show(ui.ctx(), |ui| {
+            egui::Frame::new()
+                .fill(egui::Color32::from_rgba_unmultiplied(14, 16, 20, 235))
+                .inner_margin(egui::Margin::symmetric(12, 10))
+                .corner_radius(6)
+                .show(ui, |ui| {
+                    ui.set_width(200.0);
+                    let Some(reading) = status.reading else {
+                        // Off the picture: said rather than shown as a blank
+                        // swatch, which would read as "black".
+                        ui.label(egui::RichText::new("Colour").strong());
+                        ui.label(egui::RichText::new("point at the picture").weak());
+                        return;
+                    };
+
+                    ui.horizontal(|ui| {
+                        // The colour itself, as the display shows it — a
+                        // swatch drawn in the file's numbers would be a
+                        // different colour from the pixel beside it.
+                        let (rect, _) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::hover());
+                        ui.painter()
+                            .rect_filled(rect, 3.0, egui::Color32::from_rgb(reading.display[0], reading.display[1], reading.display[2]));
+                        ui.label(egui::RichText::new(reading.hex()).strong().monospace());
+                    });
+
+                    ui.add_space(4.0);
+                    row(ui, "File", &format!("{} {} {}", reading.file[0], reading.file[1], reading.file[2]), true);
+                    // Only when it says something the line above did not: on
+                    // an untagged image the two are the same number twice.
+                    if reading.converted() {
+                        row(
+                            ui,
+                            "Display",
+                            &format!("{} {} {}", reading.display[0], reading.display[1], reading.display[2]),
+                            false,
+                        );
+                    }
+                    if reading.alpha != 255 {
+                        row(ui, "Alpha", &reading.alpha.to_string(), true);
+                    }
+                    row(ui, "At", &format!("{}, {}", reading.at.0, reading.at.1), false);
+
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("click to copy").weak().small());
+                });
+        });
+}
+
+/// The colour path, spelled out.
+///
+/// Centred like the key sheet rather than tucked in a corner: this is read
+/// once, deliberately, to answer a question — not watched while working, the
+/// way the histogram and the eyedropper are.
+fn passport_panel(ui: &mut egui::Ui, passport: &Passport) {
+    egui::Window::new("Colour")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(ui.ctx(), |ui| {
+            ui.set_max_width(420.0);
+            ui.label(passport.summary());
+            ui.add_space(8.0);
+
+            egui::Grid::new("passport").num_columns(2).spacing([18.0, 4.0]).show(ui, |ui| {
+                // The two ends of the path, named as the profiles name
+                // themselves rather than as the viewer's guess at what they
+                // are.
+                ui.label("This file");
+                ui.label(match &passport.source {
+                    Some(name) => name.clone(),
+                    // Not "sRGB": an untagged file is passed through rather
+                    // than assumed, which is the whole point of ADR 0005.
+                    None => "says nothing".to_string(),
+                });
+                ui.end_row();
+
+                ui.label("This display");
+                ui.label(passport.display.clone().unwrap_or_else(|| "unnamed".to_string()));
+                ui.end_row();
+
+                ui.label("Between them");
+                ui.label(if passport.converting {
+                    format!("converted, moving a primary by up to {:.0}%", passport.distance * 100.0)
+                } else {
+                    "nothing to convert".to_string()
+                });
+                ui.end_row();
+            });
+
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new("The conversion happens on the GPU, per frame, from the pixels as the file stored them.")
+                    .weak()
+                    .small(),
+            );
+        });
+}
+
 /// Every key there is, because the chrome does not advertise them.
 fn key_sheet(ui: &mut egui::Ui) {
     egui::Window::new("Keys")
@@ -865,6 +1042,9 @@ pub const KEYS: &[(&str, &str)] = &[
     ("B", "what shows through transparency"),
     ("I", "what the file says about itself"),
     ("H", "what tones the picture is made of"),
+    ("C", "mark what the file clipped"),
+    ("P", "read the colour under the pointer; click to copy"),
+    ("K", "what is happening to this image's colour"),
     ("+ -", "zoom in / out"),
     ("F11", "full screen"),
     ("?", "this list"),
@@ -929,6 +1109,10 @@ mod tests {
             path: None,
             file_size: None,
             histogram: None,
+            clipping: false,
+            picking: false,
+            reading: None,
+            passport: None,
         }
     }
 

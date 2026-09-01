@@ -232,6 +232,18 @@ struct ColourUniform {
     extended_range: u32,
     /// What shows through a transparent pixel; `Backdrop::code`.
     backdrop: u32,
+    /// Non-zero while the clipping zebra is showing.
+    zebra: u32,
+    /// Non-zero when the texture hands the shader linear light rather than
+    /// the file's stored values — an `*Srgb` texture, which the hardware
+    /// linearises on sampling. The zebra undoes that to judge the values the
+    /// file actually holds.
+    sampled_is_linear: u32,
+    /// WGSL rounds a struct's size up to its alignment — 16 bytes here,
+    /// because of the `mat3x3` — and `#[repr(C)]` does not, so the padding is
+    /// declared rather than left to differ between the two languages. Six
+    /// `u32` after the 48-byte matrix come to 72; two more reach 80.
+    _padding: [u32; 2],
 }
 
 impl ColourUniform {
@@ -240,7 +252,7 @@ impl ColourUniform {
     /// and the shader's curves must, even when the transform itself would
     /// change nothing. The identity transform carries the sRGB curve for
     /// exactly this.
-    fn new(transform: &ColorTransform, output: Output, depth: Depth, backdrop: Backdrop) -> Self {
+    fn new(transform: &ColorTransform, output: Output, depth: Depth, backdrop: Backdrop, zebra: bool) -> Self {
         let mut matrix = [[0.0; 4]; 3];
         for (row, values) in transform.matrix.iter().enumerate() {
             matrix[row][..3].copy_from_slice(values);
@@ -255,6 +267,13 @@ impl ColourUniform {
             encode_srgb: u32::from(!output.encodes_srgb() && !output.is_hdr()),
             extended_range: u32::from(output.is_hdr()),
             backdrop: backdrop.code(),
+            zebra: u32::from(zebra),
+            // The one case the image is uploaded into an `*Srgb` texture:
+            // eight bits with nothing to convert, where `set_image` picks
+            // `Rgba8UnormSrgb` and the hardware linearises on sampling. The
+            // same condition, written once here and once there.
+            sampled_is_linear: u32::from(depth == Depth::Eight && transform.is_identity),
+            _padding: [0; 2],
         }
     }
 }
@@ -319,6 +338,12 @@ pub struct Renderer {
     /// as the transform: it outlives any one image and has to be restated
     /// whenever the uniform is rewritten.
     backdrop: Backdrop,
+    /// Whether the clipping zebra is showing.
+    ///
+    /// Lives beside the backdrop and for the same reason: it is a viewing
+    /// choice that outlives any one image, so it is restated every time the
+    /// colour uniform is rewritten.
+    zebra: bool,
     /// Whether the device can hold sixteen-bit normalised textures.
     ///
     /// `Rgba16Unorm` is an optional wgpu feature. DX12 — the backend nitid
@@ -485,7 +510,13 @@ impl Renderer {
 
         let colour = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("nitid colour"),
-            contents: bytemuck::bytes_of(&ColourUniform::new(&ColorTransform::identity(), output, Depth::Eight, Backdrop::default())),
+            contents: bytemuck::bytes_of(&ColourUniform::new(
+                &ColorTransform::identity(),
+                output,
+                Depth::Eight,
+                Backdrop::default(),
+                false,
+            )),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -507,6 +538,7 @@ impl Renderer {
             colour,
             transform: ColorTransform::identity(),
             backdrop: Backdrop::default(),
+            zebra: false,
             wide_textures,
             tile_limit,
             upload: None,
@@ -536,6 +568,25 @@ impl Renderer {
         self.write_colour();
     }
 
+    /// Whether the clipping zebra is showing.
+    pub fn zebra(&self) -> bool {
+        self.zebra
+    }
+
+    /// Show or hide the clipping zebra.
+    ///
+    /// Costs the same as the backdrop does — one uniform write — because the
+    /// marking happens in the shader that was going to run anyway. Nothing is
+    /// re-decoded and no pixels are touched, which is what lets it be turned
+    /// on to check a highlight and off again without a pause.
+    pub fn set_zebra(&mut self, zebra: bool) {
+        if self.zebra == zebra {
+            return;
+        }
+        self.zebra = zebra;
+        self.write_colour();
+    }
+
     /// Restate the colour uniform from what the renderer currently holds.
     ///
     /// The one place that builds it for the live state, so a caller cannot
@@ -553,7 +604,7 @@ impl Renderer {
     /// release checklist rather than of `cargo test`.
     fn write_colour(&mut self) {
         let depth = self.upload.as_ref().map_or(Depth::Eight, |upload| upload.depth);
-        let uniform = ColourUniform::new(&self.transform, self.output, depth, self.backdrop);
+        let uniform = ColourUniform::new(&self.transform, self.output, depth, self.backdrop, self.zebra);
         self.queue.write_buffer(&self.colour, 0, bytemuck::bytes_of(&uniform));
     }
 
@@ -777,7 +828,7 @@ impl Renderer {
         self.queue.write_buffer(
             &self.colour,
             0,
-            bytemuck::bytes_of(&ColourUniform::new(transform, self.output, depth, self.backdrop)),
+            bytemuck::bytes_of(&ColourUniform::new(transform, self.output, depth, self.backdrop, self.zebra)),
         );
 
         self.upload = Some(Upload { tiles: uploads, size, depth });
@@ -1230,8 +1281,10 @@ mod tests {
 
     #[test]
     fn the_colour_uniform_matches_the_shader_layout() {
-        // mat3x3 with 16-byte aligned columns, then two u32 and padding.
-        assert_eq!(std::mem::size_of::<ColourUniform>(), 64);
+        // mat3x3 with 16-byte aligned columns (48 bytes), then six u32 and
+        // one of padding, rounded up to the struct's own 16-byte alignment.
+        assert_eq!(std::mem::size_of::<ColourUniform>(), 80);
+        assert_eq!(std::mem::size_of::<ColourUniform>() % 16, 0, "WGSL rounds the struct up; the two must agree");
     }
 
     /// The surface an SDR display gets: the hardware encodes on write.
@@ -1259,13 +1312,201 @@ mod tests {
         }
     }
 
+    /// The red and blue of a pixel read back from a test surface.
+    ///
+    /// The surfaces here are `Bgra8*`, so the bytes arrive blue first. Reading
+    /// them as RGB is exactly the mistake that made the zebra tests report a
+    /// red mark as blue and sent this stage chasing a shader bug that did not
+    /// exist — the existing colour tests never caught it because every colour
+    /// they check is grey, where the order does not show.
+    fn red_of(pixel: [f32; 4]) -> f32 {
+        pixel[2]
+    }
+
+    fn blue_of(pixel: [f32; 4]) -> f32 {
+        pixel[0]
+    }
+
     fn wide_gamut_transform() -> ColorTransform {
         ColorTransform::new(&moxcms::ColorProfile::new_display_p3(), &moxcms::ColorProfile::new_srgb())
     }
 
+    /// The zebra marks a blown highlight, and marking is visible: some pixels
+    /// of the row carry the mark and some do not, which is what a hatch is.
+    ///
+    /// Read back from a real frame, because the marking happens in the shader
+    /// and nothing on the Rust side can be asked whether it worked — the same
+    /// reason the colour tests draw rather than compute.
+    #[test]
+    fn the_zebra_marks_a_blown_highlight() {
+        let white = [255u8, 255, 255, 255];
+        let Some(row) = draw_row_with_zebra(srgb_surface(), &ColorTransform::identity(), &white, Depth::Eight, 64) else {
+            eprintln!("skipping: no graphics adapter here");
+            return;
+        };
+
+        // The mark is red, so a striped row has pixels where red leads and
+        // pixels where the white picture stands.
+        let marked = row.iter().filter(|pixel| red_of(**pixel) > blue_of(**pixel) + 0.2).count();
+        let plain = row.iter().filter(|pixel| blue_of(**pixel) > 0.8).count();
+
+        assert!(marked > 0, "a blown highlight was not marked at all");
+        assert!(plain > 0, "the mark covered the whole picture rather than striping it");
+    }
+
+    /// A picture with nothing clipped is left alone. Without this the test
+    /// above would pass on a shader that painted every pixel red.
+    #[test]
+    fn the_zebra_leaves_an_unclipped_picture_alone() {
+        let mid = [128u8, 128, 128, 255];
+        let Some(with) = draw_row_with_zebra(srgb_surface(), &ColorTransform::identity(), &mid, Depth::Eight, 64) else {
+            eprintln!("skipping: no graphics adapter here");
+            return;
+        };
+        let without = draw_row_offscreen(srgb_surface(), &ColorTransform::identity(), &mid, Depth::Eight, Backdrop::default(), 64)
+            .expect("the adapter answered a moment ago");
+
+        for (index, (a, b)) in with.iter().zip(&without).enumerate() {
+            for channel in 0..3 {
+                assert!(
+                    (a[channel] - b[channel]).abs() < 0.01,
+                    "pixel {index} channel {channel} changed with the zebra on: {a:?} vs {b:?}",
+                );
+            }
+        }
+    }
+
+    /// A blocked shadow is marked too, and in the other colour: the two
+    /// failures are opposite and must not look alike.
+    #[test]
+    fn a_blocked_shadow_is_marked_differently_from_a_blown_highlight() {
+        let black = [0u8, 0, 0, 255];
+        let white = [255u8, 255, 255, 255];
+        let Some(shadows) = draw_row_with_zebra(srgb_surface(), &ColorTransform::identity(), &black, Depth::Eight, 64) else {
+            eprintln!("skipping: no graphics adapter here");
+            return;
+        };
+        let highlights = draw_row_with_zebra(srgb_surface(), &ColorTransform::identity(), &white, Depth::Eight, 64).expect("the adapter answered a moment ago");
+
+        // The mark itself in each row: the pixel furthest from neutral in the
+        // direction its mark is coloured. Picking the *brightest* pixel finds
+        // the unmarked picture instead — white is brighter than the red mark
+        // laid over it, which is what this assertion first reported.
+        let shadow_mark = shadows
+            .iter()
+            .copied()
+            .max_by(|a, b| (blue_of(*a) - red_of(*a)).total_cmp(&(blue_of(*b) - red_of(*b))))
+            .expect("the row is not empty");
+        let highlight_mark = highlights
+            .iter()
+            .copied()
+            .max_by(|a, b| (red_of(*a) - blue_of(*a)).total_cmp(&(red_of(*b) - blue_of(*b))))
+            .expect("the row is not empty");
+
+        assert!(
+            blue_of(shadow_mark) > red_of(shadow_mark) + 0.1,
+            "a blocked shadow was not marked in blue: {shadow_mark:?}",
+        );
+        assert!(
+            red_of(highlight_mark) > blue_of(highlight_mark) + 0.1,
+            "a blown highlight was not marked in red: {highlight_mark:?}",
+        );
+    }
+
+    /// The decision ADR 0019 records, applied to the zebra: it marks what the
+    /// *file* clipped, not what this display cannot reproduce.
+    ///
+    /// A mid-grey in a wide-gamut space converts to something well inside an
+    /// sRGB display's range and clips nothing; a value at full scale in the
+    /// file is clipped whatever the display does with it. The transform must
+    /// not change the answer.
+    #[test]
+    fn the_zebra_judges_the_file_rather_than_the_display() {
+        let mid = [128u8, 128, 128, 255];
+        let Some(row) = draw_row_with_zebra(srgb_surface(), &wide_gamut_transform(), &mid, Depth::Eight, 64) else {
+            eprintln!("skipping: no graphics adapter here");
+            return;
+        };
+
+        // Nothing marked: the file's own value is nowhere near either end,
+        // however the conversion moves it.
+        let marked = row.iter().filter(|pixel| red_of(**pixel) > blue_of(**pixel) + 0.2).count();
+        assert_eq!(marked, 0, "a pixel the file did not clip was marked because of the display");
+
+        // And a value the file did clip is still marked through the same
+        // transform, or the test above would pass on a zebra that never fires.
+        let white = [255u8, 255, 255, 255];
+        let clipped = draw_row_with_zebra(srgb_surface(), &wide_gamut_transform(), &white, Depth::Eight, 64).expect("the adapter answered a moment ago");
+        assert!(
+            clipped.iter().any(|pixel| red_of(*pixel) > blue_of(*pixel) + 0.2),
+            "a highlight the file clipped went unmarked once a transform was involved",
+        );
+    }
+
+    /// A sixteen-bit file reaches the shader as raw samples rather than
+    /// linearised ones, so the zebra has to read the right numbers on both
+    /// paths. Full scale is clipped at either depth.
+    #[test]
+    fn the_zebra_reads_a_sixteen_bit_file_too() {
+        let full = 0xffffu16.to_ne_bytes();
+        let pixel: Vec<u8> = [full, full, full, full].concat();
+        let Some(row) = draw_row_with_zebra(srgb_surface(), &ColorTransform::identity(), &pixel, Depth::Sixteen, 64) else {
+            eprintln!("skipping: no graphics adapter here");
+            return;
+        };
+        assert!(
+            row.iter().any(|pixel| red_of(*pixel) > blue_of(*pixel) + 0.2),
+            "a sixteen-bit highlight at full scale went unmarked",
+        );
+
+        // And a mid-grey at the same depth is left alone.
+        let half = 0x8000u16.to_ne_bytes();
+        let opaque = 0xffffu16.to_ne_bytes();
+        let mid: Vec<u8> = [half, half, half, opaque].concat();
+        let quiet = draw_row_with_zebra(srgb_surface(), &ColorTransform::identity(), &mid, Depth::Sixteen, 64).expect("the adapter answered a moment ago");
+        assert!(
+            !quiet.iter().any(|pixel| red_of(*pixel) > blue_of(*pixel) + 0.2),
+            "a sixteen-bit mid grey was marked as clipped",
+        );
+    }
+
+    /// The zebra rides in the colour uniform, so it must not disturb the
+    /// answers the surface already depends on.
+    #[test]
+    fn turning_the_zebra_on_changes_nothing_else_in_the_uniform() {
+        let transform = wide_gamut_transform();
+        let off = ColourUniform::new(&transform, srgb_surface(), Depth::Eight, Backdrop::default(), false);
+        let on = ColourUniform::new(&transform, srgb_surface(), Depth::Eight, Backdrop::default(), true);
+
+        assert_eq!((off.zebra, on.zebra), (0, 1), "the flag does not reach the shader");
+        assert_eq!(off.convert, on.convert);
+        assert_eq!(off.encode_srgb, on.encode_srgb);
+        assert_eq!(off.extended_range, on.extended_range);
+        assert_eq!(off.backdrop, on.backdrop);
+        assert_eq!(off.matrix, on.matrix);
+    }
+
+    /// The shader is told whether the texture handed it linear light, and it
+    /// is true for exactly one case: eight bits with nothing to convert, which
+    /// is the `*Srgb` texture `set_image` picks. Getting this wrong reads the
+    /// wrong numbers and marks the wrong pixels.
+    #[test]
+    fn the_shader_is_told_when_the_hardware_linearised() {
+        let srgb_texture = ColourUniform::new(&ColorTransform::identity(), srgb_surface(), Depth::Eight, Backdrop::default(), true);
+        assert_eq!(srgb_texture.sampled_is_linear, 1, "the one hardware-linearised case was not declared");
+
+        // A conversion means a plain `Rgba8Unorm` texture: raw values.
+        let converted = ColourUniform::new(&wide_gamut_transform(), srgb_surface(), Depth::Eight, Backdrop::default(), true);
+        assert_eq!(converted.sampled_is_linear, 0, "a plain texture was reported as linearised");
+
+        // Sixteen bits has no `*Srgb` variant at all.
+        let wide = ColourUniform::new(&ColorTransform::identity(), srgb_surface(), Depth::Sixteen, Backdrop::default(), true);
+        assert_eq!(wide.sampled_is_linear, 0, "a sixteen-bit texture was reported as linearised");
+    }
+
     #[test]
     fn an_identity_transform_asks_the_shader_to_do_nothing() {
-        let uniform = ColourUniform::new(&ColorTransform::identity(), srgb_surface(), Depth::Eight, Backdrop::default());
+        let uniform = ColourUniform::new(&ColorTransform::identity(), srgb_surface(), Depth::Eight, Backdrop::default(), false);
         assert_eq!(uniform.convert, 0);
         assert_eq!(uniform.encode_srgb, 0);
         assert_eq!(uniform.extended_range, 0);
@@ -1273,7 +1514,7 @@ mod tests {
 
     #[test]
     fn a_conversion_onto_an_srgb_surface_leaves_encoding_to_the_hardware() {
-        let uniform = ColourUniform::new(&wide_gamut_transform(), srgb_surface(), Depth::Eight, Backdrop::default());
+        let uniform = ColourUniform::new(&wide_gamut_transform(), srgb_surface(), Depth::Eight, Backdrop::default(), false);
 
         assert_eq!(uniform.convert, 1);
         // An sRGB surface encodes on write; doing it in the shader too would
@@ -1289,11 +1530,11 @@ mod tests {
         // surface expecting sRGB — dark, and only on hardware nitid had not
         // met.
         assert_eq!(
-            ColourUniform::new(&wide_gamut_transform(), plain_surface(), Depth::Eight, Backdrop::default()).encode_srgb,
+            ColourUniform::new(&wide_gamut_transform(), plain_surface(), Depth::Eight, Backdrop::default(), false).encode_srgb,
             1
         );
         assert_eq!(
-            ColourUniform::new(&ColorTransform::identity(), plain_surface(), Depth::Eight, Backdrop::default()).encode_srgb,
+            ColourUniform::new(&ColorTransform::identity(), plain_surface(), Depth::Eight, Backdrop::default(), false).encode_srgb,
             1
         );
     }
@@ -1301,7 +1542,7 @@ mod tests {
     #[test]
     fn an_extended_range_surface_is_given_light_rather_than_an_encoding() {
         for transform in [ColorTransform::identity(), wide_gamut_transform()] {
-            let uniform = ColourUniform::new(&transform, hdr_surface(), Depth::Eight, Backdrop::default());
+            let uniform = ColourUniform::new(&transform, hdr_surface(), Depth::Eight, Backdrop::default(), false);
 
             assert_eq!(uniform.extended_range, 1);
             // Encoding here would apply a transfer function the surface does
@@ -1400,12 +1641,34 @@ mod tests {
         draw_row_offscreen(output, transform, pixel, depth, backdrop, 1).map(|row| row[0])
     }
 
+    /// The same, with the clipping zebra on.
+    ///
+    /// A row rather than a pixel, because the zebra is a function of screen
+    /// position: a one-pixel target lands on one stripe and says nothing
+    /// about whether the hatch exists.
+    fn draw_row_with_zebra(output: Output, transform: &ColorTransform, pixel: &[u8], depth: Depth, width: u32) -> Option<Vec<[f32; 4]>> {
+        draw_row_offscreen_with(output, transform, pixel, depth, Backdrop::default(), width, true)
+    }
+
     /// The same, drawn into a target `width` pixels wide, returning the row.
     ///
     /// A wider target is what makes the checkerboard visible at all: it is a
     /// function of the screen position, so a one-pixel target can only ever
     /// show one square of it.
     fn draw_row_offscreen(output: Output, transform: &ColorTransform, pixel: &[u8], depth: Depth, backdrop: Backdrop, width: u32) -> Option<Vec<[f32; 4]>> {
+        draw_row_offscreen_with(output, transform, pixel, depth, backdrop, width, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_row_offscreen_with(
+        output: Output,
+        transform: &ColorTransform,
+        pixel: &[u8],
+        depth: Depth,
+        backdrop: Backdrop,
+        width: u32,
+        zebra: bool,
+    ) -> Option<Vec<[f32; 4]>> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
         let wide = adapter.features().contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM);
@@ -1510,7 +1773,7 @@ mod tests {
         });
         let colour = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
-            contents: bytemuck::bytes_of(&ColourUniform::new(transform, output, depth, backdrop)),
+            contents: bytemuck::bytes_of(&ColourUniform::new(transform, output, depth, backdrop, zebra)),
             usage: wgpu::BufferUsages::UNIFORM,
         });
 
@@ -1820,7 +2083,7 @@ mod tests {
         let curve_sampler = device.create_sampler(&wgpu::SamplerDescriptor::default());
         let colour = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
-            contents: bytemuck::bytes_of(&ColourUniform::new(&transform, output, Depth::Eight, Backdrop::default())),
+            contents: bytemuck::bytes_of(&ColourUniform::new(&transform, output, Depth::Eight, Backdrop::default(), false)),
             usage: wgpu::BufferUsages::UNIFORM,
         });
 
