@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.21.0] - 2026-09-01
+
+### Documentation
+- Describe the colour tools, and what ADR 0019 settled for them
+
+### Features
+- A clipping zebra, an eyedropper, and a colour passport
 ## [0.20.1] - 2026-08-31
 
 ### Bug Fixes
