@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.23.1] - 2026-09-03
+
+### Bug Fixes
+- The mark the window shows, and the level each size carries
+
+### Documentation
+- Hold the README to the code, and say what install leaves behind
 ## [0.23.0] - 2026-09-03
 
 ### Bug Fixes
