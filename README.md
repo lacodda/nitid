@@ -413,7 +413,7 @@ has no size limit to hide behind.
 
 ## Status
 
-Early development — v0.22.0 is out. Startup, colour and format coverage hold:
+Early development — v0.23.0 is out. Startup, colour and format coverage hold:
 every modern still format opens, a phone's photographs included, every one of
 them reaches the screen without a wait, and the ones that animate play. The
 process that decodes the heavy formats runs with no network in either

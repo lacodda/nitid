@@ -2,7 +2,17 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.23.0] - 2026-09-03
+
+### Documentation
+- Describe drag and drop, and what a drag carries
+
+### Features
+- Files in by dropping, the picture out by dragging
 ## [0.22.0] - 2026-09-01
+
+### Bug Fixes
+- Compile where there is no Windows clipboard
 
 ### Documentation
 - Describe the clipboard, and why a paste is not saved
