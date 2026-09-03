@@ -17,6 +17,7 @@ mod clipboard;
 mod color;
 mod config;
 mod console;
+mod drag;
 mod eyedropper;
 mod folder;
 mod format;

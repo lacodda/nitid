@@ -96,6 +96,11 @@ pub struct Status {
     /// What is happening to this image's colour. `Some` only while the
     /// passport is showing.
     pub passport: Option<Passport>,
+    /// Whether files are being held over the window, waiting to be let go.
+    ///
+    /// A drag that gets no answer looks like a window that will not take it,
+    /// so the viewer says it will before the button comes up.
+    pub hovering: bool,
 }
 
 /// What a toolbar button asks the viewer to do.
@@ -322,6 +327,9 @@ impl Interface {
             if keys_shown {
                 key_sheet(ui);
             }
+            if status.hovering {
+                drop_invitation(ui);
+            }
             toast_stack(ui, &toasts);
         });
         (output, action)
@@ -360,7 +368,7 @@ impl Interface {
             // Without this the panel would open empty and stay empty, because
             // nothing else in the digest moves when a count lands.
             status.histogram.as_ref().map(|histogram| histogram.counted),
-        )
+        ) + &format!("|{}", status.hovering)
     }
 
     /// Whether the interface would draw something different from last time.
@@ -1045,6 +1053,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("C", "mark what the file clipped"),
     ("P", "read the colour under the pointer; click to copy"),
     ("K", "what is happening to this image's colour"),
+    ("Ctrl+Drag", "drag the picture into another window"),
     ("Ctrl+C", "copy the picture"),
     ("Ctrl+V", "show the picture on the clipboard"),
     ("Ctrl+Shift+C", "copy the path, quoted for a terminal"),
@@ -1078,6 +1087,24 @@ fn toast_stack(ui: &mut egui::Ui, toasts: &[(String, f32)]) {
                     });
             }
         });
+}
+
+/// What the window shows while files are held over it.
+///
+/// A border rather than a wash over the picture: the answer to "will you take
+/// this?" belongs at the edge of the window, which is what the pointer is
+/// aiming at, and the photograph underneath stays visible while it is given.
+fn drop_invitation(ui: &mut egui::Ui) {
+    let screen = ui.ctx().viewport_rect();
+    egui::Area::new("drop".into()).fixed_pos(screen.min).interactable(false).show(ui.ctx(), |ui| {
+        let painter = ui.painter();
+        painter.rect_stroke(
+            screen.shrink(3.0),
+            8.0,
+            egui::Stroke::new(3.0, egui::Color32::from_rgb(120, 170, 255)),
+            egui::StrokeKind::Inside,
+        );
+    });
 }
 
 fn separator(ui: &mut egui::Ui) {
@@ -1116,6 +1143,7 @@ mod tests {
             picking: false,
             reading: None,
             passport: None,
+            hovering: false,
         }
     }
 

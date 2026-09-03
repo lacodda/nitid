@@ -1714,6 +1714,7 @@ dependencies = [
  "thiserror 2.0.20",
  "wgpu",
  "windows",
+ "windows-core",
  "windows-registry",
  "winit",
  "winresource",

@@ -193,6 +193,19 @@ struct App {
     display_profile: ColorProfile,
     cursor: PhysicalPosition<f64>,
     dragging: bool,
+    /// Files dropped on the window, collected until the batch is complete.
+    dropped: Dropped,
+    /// Whether files are being held over the window right now.
+    ///
+    /// A drag with no answer from the window looks like a window that will not
+    /// take it, so the viewer says so before the button comes up.
+    hovering: bool,
+    /// Where the left button went down, while it is down.
+    ///
+    /// The press alone cannot say whether this is a pan, a drag out of the
+    /// window, or a click: that is decided by how far the pointer then travels
+    /// (`drag::far_enough`). `None` when the button is up.
+    pressed_at: Option<PhysicalPosition<f64>>,
     /// Which modifier keys are down.
     ///
     /// winit reports these as their own event rather than on each key, so the
@@ -287,6 +300,9 @@ impl App {
             display_profile: color::display_profile(),
             cursor: PhysicalPosition::new(0.0, 0.0),
             dragging: false,
+            dropped: Dropped::default(),
+            hovering: false,
+            pressed_at: None,
             modifiers: winit::keyboard::ModifiersState::empty(),
             display_checked_at: None,
             failure: None,
@@ -980,6 +996,80 @@ impl App {
         self.request_redraw();
     }
 
+    /// Hand the picture to another window.
+    ///
+    /// The gesture is Ctrl and a left drag (decision of the owner): the bare
+    /// left drag is panning, and a viewer whose main gesture changed meaning
+    /// with the zoom would be one nobody could pan with confidence.
+    ///
+    /// What travels is the file, and where there is no file, the picture —
+    /// see `drag`. The pixels are the file's own, unconverted, which is the
+    /// same promise `Ctrl+C` makes and the same one ADR 0019 records.
+    ///
+    /// This blocks until the drop: `DoDragDrop` runs its own message loop.
+    /// The viewer is unresponsive for that stretch by the shell's design —
+    /// every application that can be dragged from behaves this way.
+    fn drag_out(&mut self) {
+        let Some(shown) = self.shown.as_ref() else {
+            return;
+        };
+
+        let (image, hdrop) = if shown.pasted {
+            // Nothing on disk to hand over, so only the pixels travel. A
+            // temporary file would be writing to disk unasked, which ADR 0020
+            // says the viewer does not do.
+            (self.pasted.clone(), None)
+        } else {
+            let image = match self.loader.request(&shown.path) {
+                Request::Ready(image) => Some(image.image.clone()),
+                Request::Pending => None,
+            };
+            (image, Some(crate::drag::to_hdrop(&[shown.path.as_path()])))
+        };
+
+        let Some(image) = image else {
+            self.interface.toast("still opening", Instant::now());
+            self.request_redraw();
+            return;
+        };
+
+        let payload = crate::drag::Payload {
+            hdrop,
+            dib: crate::clipboard::to_dib(&image),
+        };
+
+        // The pointer is somewhere else by the time this returns and the
+        // button is up, so whatever the press started is over.
+        self.dragging = false;
+        self.pressed_at = None;
+
+        match crate::drag::start(payload) {
+            Ok(true) => self.interface.toast("picture handed over", Instant::now()),
+            // A drag that ended nowhere is not a failure worth reporting: the
+            // user let go over the desktop, which is the ordinary way to
+            // change your mind.
+            Ok(false) => {}
+            Err(error) => {
+                eprintln!("nitid: {error:#}");
+                self.interface.toast("could not hand the picture over", Instant::now());
+            }
+        }
+        self.request_redraw();
+    }
+
+    /// Open the files of a completed drop, as one batch.
+    ///
+    /// Called once the event loop has delivered the whole drop: winit reports
+    /// one event per file, and opening each as it arrived would rescan the
+    /// folder once per file and land on the last one alone.
+    fn open_dropped(&mut self) {
+        let dropped = self.dropped.finish();
+        if dropped.is_empty() {
+            return;
+        }
+        self.open(&dropped);
+    }
+
     /// Put the file's path on the clipboard, quoted for a terminal.
     fn copy_path(&mut self) {
         let Some(shown) = self.shown.as_ref() else {
@@ -1362,6 +1452,7 @@ impl App {
             picking: self.picking,
             reading: self.reading,
             passport: self.passport(),
+            hovering: self.hovering,
         }
     }
 
@@ -1570,6 +1661,44 @@ fn chord_for(key: &Key) -> Option<Chord> {
     }
 }
 
+/// One drop of files, gathered while it arrives.
+///
+/// winit reports a drop of five files as five events, one per file, delivered
+/// back to back before the loop goes idle. Opening each as it arrives would
+/// rescan the folder five times and leave the window on the last file alone —
+/// the opposite of what selecting five files and dropping them means. So they
+/// are gathered here and answered once, when the loop is about to wait.
+///
+/// Its own type rather than a bare `Vec` so the gathering can be tested at
+/// all: opening needs a window, and the thing worth holding — that a drop of
+/// five files stays five — is decided before any window is touched.
+#[derive(Default)]
+struct Dropped(Vec<PathBuf>);
+
+impl Dropped {
+    /// Take in one file of a drop.
+    fn take(&mut self, path: PathBuf) {
+        self.0.push(path);
+    }
+
+    /// The whole batch, leaving nothing behind for the next drop.
+    fn finish(&mut self) -> Vec<PathBuf> {
+        std::mem::take(&mut self.0)
+    }
+}
+
+/// Whether a left press begins a pan rather than a drag out of the window.
+///
+/// Its own function because the two gestures start on the same button and
+/// must never both begin: panning while the shell drags the picture away
+/// would move the view out from under the pointer that is aiming the drop.
+/// Inline in the press handler this could not be tested — the press needs a
+/// window — and a viewer that panned on Ctrl would be a viewer that scrolled
+/// the photograph every time somebody reached for another application.
+fn pans(modifiers: winit::keyboard::ModifiersState) -> bool {
+    !modifiers.control_key()
+}
+
 /// Whether this is the loupe's key.
 ///
 /// Its own function because the loupe is answered twice — on the press and on
@@ -1769,6 +1898,10 @@ impl ApplicationHandler<Event> for App {
     /// the event-driven redraw promise at the top of this file stands. Only a
     /// playing animation asks to be woken, and only for its next frame.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // A drop is answered here rather than as it arrives: by now the whole
+        // batch has been delivered, so five dropped files are five, not the
+        // last of five.
+        self.open_dropped();
         self.watch_the_display();
 
         let advanced = match self.shown.as_mut().and_then(|shown| shown.player.as_mut()) {
@@ -1995,10 +2128,19 @@ impl ApplicationHandler<Event> for App {
                         // make the reading name a pixel nobody aimed at.
                         self.copy_reading();
                     } else {
-                        self.dragging = true;
+                        // Which gesture this is depends on the modifier and on
+                        // how far the pointer then goes, so the press only
+                        // records where it happened. Panning still begins on
+                        // the press itself: a pan that waited for a threshold
+                        // would jump when it finally started.
+                        self.pressed_at = Some(self.cursor);
+                        self.dragging = pans(self.modifiers);
                     }
                 }
-                (MouseButton::Left, ElementState::Released) => self.dragging = false,
+                (MouseButton::Left, ElementState::Released) => {
+                    self.dragging = false;
+                    self.pressed_at = None;
+                }
                 (MouseButton::Middle, ElementState::Pressed) => self.reframe(Reframe::Toggle),
                 _ => {}
             },
@@ -2024,10 +2166,24 @@ impl ApplicationHandler<Event> for App {
                     shown.view.pan(delta);
                     self.request_redraw();
                 }
+
+                // Ctrl and a left drag hands the picture to another window.
+                // Checked after panning so the two can never both happen: the
+                // press decided which this is, and `dragging` is false for a
+                // drag out.
+                if !self.dragging
+                    && let Some(from) = self.pressed_at
+                    && self.modifiers.control_key()
+                    && crate::drag::far_enough((from.x, from.y), (position.x, position.y))
+                {
+                    self.pressed_at = None;
+                    self.drag_out();
+                }
             }
 
             WindowEvent::CursorLeft { .. } => {
                 self.dragging = false;
+                self.pressed_at = None;
                 // A pointer that has left the window is not reaching for
                 // anything, so the chrome goes away with it.
                 if self.follow_pointer(None) {
@@ -2035,7 +2191,26 @@ impl ApplicationHandler<Event> for App {
                 }
             }
 
-            WindowEvent::DroppedFile(path) => self.open(&[path]),
+            // Collected rather than opened: the batch arrives as one event per
+            // file and is answered once, in `about_to_wait`.
+            WindowEvent::DroppedFile(path) => {
+                self.hovering = false;
+                self.dropped.take(path);
+            }
+
+            WindowEvent::HoveredFile(_) => {
+                if !self.hovering {
+                    self.hovering = true;
+                    self.request_redraw();
+                }
+            }
+
+            WindowEvent::HoveredFileCancelled => {
+                if self.hovering {
+                    self.hovering = false;
+                    self.request_redraw();
+                }
+            }
 
             WindowEvent::RedrawRequested => self.redraw(event_loop),
 
@@ -2423,12 +2598,17 @@ mod tests {
     /// The key sheet advertises the chords, so they have to be ones the viewer
     /// answers — the same rule the plain keys are held to, which is what stops
     /// the sheet promising something that does nothing.
+    ///
+    /// `Ctrl+Drag` is deliberately excluded: it is a gesture of the mouse, not
+    /// a chord of the keyboard, and there is no key for `chord_for` to answer.
+    /// The sheet lists it because a function nobody can see is a function
+    /// nobody finds, which is the rule the whole sheet exists for.
     #[test]
     fn every_chord_the_sheet_advertises_is_answered() {
         let advertised: Vec<&str> = crate::interface::KEYS
             .iter()
             .map(|(key, _)| *key)
-            .filter(|key| key.starts_with("Ctrl+"))
+            .filter(|key| key.starts_with("Ctrl+") && !key.contains("Drag"))
             .collect();
         assert_eq!(advertised.len(), 3, "the sheet lists {advertised:?}, which is not the three chords");
 
@@ -2442,6 +2622,63 @@ mod tests {
                 "the key sheet lists {key}, which the viewer ignores",
             );
         }
+    }
+
+    /// A drop of several files is several files.
+    ///
+    /// This is the whole reason the batch exists. winit delivers one event per
+    /// dropped file, so a handler that opened each as it arrived would rescan
+    /// the folder once per file and end up showing the last one alone — which
+    /// is what selecting five files and dropping them is meant not to do.
+    #[test]
+    fn a_drop_of_several_files_is_answered_as_one() {
+        let mut dropped = Dropped::default();
+        for name in ["a.jpg", "b.png", "c.webp"] {
+            dropped.take(PathBuf::from(name));
+        }
+
+        let batch = dropped.finish();
+        assert_eq!(batch.len(), 3, "the drop came apart into {} openings", batch.len());
+        assert_eq!(batch[0], PathBuf::from("a.jpg"), "the batch is not in the order the files arrived");
+    }
+
+    /// The batch is emptied by being answered, so the next drop is its own.
+    ///
+    /// Without this a second drop would open the first drop's files again
+    /// alongside its own, and the folder would grow with every drop.
+    #[test]
+    fn a_finished_drop_leaves_nothing_for_the_next_one() {
+        let mut dropped = Dropped::default();
+        dropped.take(PathBuf::from("a.jpg"));
+        assert_eq!(dropped.finish().len(), 1);
+
+        assert!(dropped.finish().is_empty(), "the files of one drop were left waiting for the next");
+
+        dropped.take(PathBuf::from("b.png"));
+        assert_eq!(dropped.finish(), vec![PathBuf::from("b.png")], "a later drop carried the earlier one's files");
+    }
+
+    /// The sheet's mouse gestures are the ones the viewer actually answers.
+    ///
+    /// The chord test above cannot cover these — there is no key to feed
+    /// `chord_for` — so the promise is held here instead: the sheet says a
+    /// bare drag pans and Ctrl and a drag hands the picture over, and the
+    /// press handler has to agree about which is which. Without this the
+    /// sheet could advertise a gesture nothing implements, which is exactly
+    /// what it exists to prevent.
+    #[test]
+    fn the_sheets_mouse_gestures_are_the_ones_the_viewer_answers() {
+        let gestures: Vec<&str> = crate::interface::KEYS.iter().map(|(key, _)| *key).filter(|key| key.contains("Drag")).collect();
+        assert_eq!(gestures, ["Drag", "Ctrl+Drag"], "the sheet's drag gestures changed");
+
+        // Which one a press begins is decided by the modifier, and the two are
+        // exclusive: panning and handing the picture over at once would drag
+        // the picture out from under the pointer that is aiming it.
+        assert!(pans(winit::keyboard::ModifiersState::empty()), "a bare drag does not pan");
+        assert!(
+            !pans(winit::keyboard::ModifiersState::CONTROL),
+            "Ctrl and a drag panned as well as handing the picture over"
+        );
     }
 
     /// The loupe is the one key answered on the way up as well as on the way
