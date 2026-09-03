@@ -286,6 +286,27 @@ disk. A viewer that quietly saved a temporary file on every paste would be
 writing without being asked and leaving the results behind. See
 [ADR 0020](docs/adr/0020-a-pasted-picture-is-shown-not-saved.md).
 
+## Drag and drop
+
+Files dropped on the window open. A selection of several arrives as the several
+it was, and the arrow keys then walk those files rather than the hundreds
+sitting beside them in the folder — the same thing multi-select does from the
+shell. While files are held over the window it says so, because a drag with no
+answer looks like a window that will not take it.
+
+**`Ctrl` and a drag hands the picture the other way**, into a chat, a mail, an
+editor. What travels is the file where there is one and the picture where there
+is not, offered together so the receiving application takes whichever it
+understands: a mail client gets the original file, with its format and its
+metadata intact, and an editor that paints gets the pixels. Only a copy is ever
+offered — a drag that could move the file would delete the photograph you are
+looking at. See
+[ADR 0021](docs/adr/0021-a-drag-offers-the-file-and-the-picture.md).
+
+The bare drag stays panning. A picture pasted from the clipboard has no file to
+hand over, so it travels as pixels only; nothing is written to disk to make it
+look otherwise.
+
 ## Large images
 
 A GPU texture has a maximum side — 16384 on current integrated hardware, and
@@ -414,7 +435,10 @@ marks what the file clipped, `P` reads the pixel under the pointer in the
 file's terms and the display's, and `K` spells out the path between the two.
 **And it talks to the clipboard**: the picture out with `Ctrl+C`, whatever is
 on the clipboard in with `Ctrl+V`, and the path — quoted for a terminal — with
-`Ctrl+Shift+C`. Development runs in small
+`Ctrl+Shift+C`. **And pictures come and go by hand now**: files dropped on the
+window open — a selection of several as the several it was — and `Ctrl` with a
+drag hands what is on screen to another window, as the file where there is one
+and as the picture where there is not. Development runs in small
 versions, each one theme; the road to 1.0 is fixed:
 
 | Version | What lands |
@@ -444,7 +468,8 @@ versions, each one theme; the road to 1.0 is fixed:
 | ✅ v0.20.1 | `nitid install` puts itself on the `PATH`, so the command works from a terminal |
 | ✅ v0.21.0 | Colour tools: the clipping zebra, the eyedropper, and the colour passport |
 | ✅ v0.22.0 | The clipboard: the picture out, a picture in, the path quoted for a terminal |
-| v0.23.0 – v0.35.0 | The everyday viewer: drag and drop, file operations, culling, comparison, settings |
+| ✅ v0.23.0 | Drag and drop: files dropped on the window open, `Ctrl` and a drag hands the picture out |
+| v0.24.0 – v0.35.0 | The everyday viewer: file operations, culling, comparison, settings |
 | v0.36.0 – v0.39.0 | Windows integration: context menu, installer, auto-update, thumbnails |
 | v0.40.0 – v0.41.0 | Documentation site, stabilisation |
 | v1.0.0 | Public release — the default viewer, nothing missing |
@@ -527,6 +552,7 @@ Opening a file opens its folder: the arrow keys walk the images beside it.
 | `C` | mark what the file clipped |
 | `P` | read the colour under the pointer; click to copy |
 | `K` | what is happening to this image's colour |
+| `Ctrl+Drag` | drag the picture into another window |
 | `Ctrl+C` | copy the picture |
 | `Ctrl+V` | show the picture on the clipboard |
 | `Ctrl+Shift+C` | copy the path, quoted for a terminal |
