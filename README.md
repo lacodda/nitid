@@ -413,7 +413,7 @@ has no size limit to hide behind.
 
 ## Status
 
-Early development — v0.23.0 is out. Startup, colour and format coverage hold:
+Early development — v0.23.1 is out. Startup, colour and format coverage hold:
 every modern still format opens, a phone's photographs included, every one of
 them reaches the screen without a wait, and the ones that animate play. The
 process that decodes the heavy formats runs with no network in either
@@ -504,10 +504,11 @@ nitid install
 ```
 
 This copies nitid to `%LOCALAPPDATA%\Programs\nitid`, registers the file types
-it can open, and puts that directory on your `PATH` so `nitid` works as a
-command — no administrator, nothing outside your own user account. Re-running
-it upgrades an existing install, even while the viewer is open, and does not
-add the directory to the `PATH` a second time.
+it can open, puts that directory on your `PATH` so `nitid` works as a command,
+and leaves a shortcut on your desktop — no administrator, nothing outside your
+own user account. Re-running it upgrades an existing install, even while the
+viewer is open, and does not add the directory to the `PATH` a second time or
+put a second shortcut beside the first.
 
 A terminal that was already open keeps the environment it started with, so
 `nitid` becomes available there once it is restarted.
@@ -523,7 +524,8 @@ with** — right-click an image, choose *Open with* → *Choose another app*, pi
 nitid and tick *Always use this app*. It also shows up in *Settings → Apps →
 Default apps*.
 
-`nitid uninstall` removes the files, the registration, and the `PATH` entry.
+`nitid uninstall` removes the files, the registration, the `PATH` entry, and
+the desktop shortcut.
 
 ## Using it
 
