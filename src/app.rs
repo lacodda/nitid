@@ -1949,7 +1949,19 @@ impl ApplicationHandler<Event> for App {
             .with_title("nitid")
             // The window stays hidden until the first frame is ready: showing
             // it earlier is the white flash every other viewer opens with.
-            .with_visible(false);
+            .with_visible(false)
+            // The mark is in the executable's resources, which is what
+            // Explorer reads — but a window is not given it. Without this the
+            // titlebar and the taskbar draw the system's grey placeholder.
+            .with_window_icon(crate::icon::small());
+
+        // The taskbar button asks for a bigger image than the titlebar, and
+        // Windows is the only platform that keeps them apart.
+        #[cfg(windows)]
+        {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            attributes = attributes.with_taskbar_icon(crate::icon::large());
+        }
 
         // Reopen where the viewer was last closed. Without an explicit
         // position Windows cascades each new window a little further down and

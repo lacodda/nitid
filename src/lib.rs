@@ -24,6 +24,7 @@ mod format;
 mod gpu;
 mod hdr;
 mod histogram;
+mod icon;
 mod image_source;
 #[cfg(windows)]
 mod install;
@@ -54,6 +55,18 @@ pub mod testing {
     pub use crate::image_source::{Depth, decode_here};
     pub use crate::metadata::read as read_metadata;
     pub use crate::sandbox::decode as decode_sandboxed;
+
+    /// Every key the key sheet advertises, for the test that holds the README
+    /// to it. The two lists are written for different readers and drifted
+    /// apart silently until v0.23.1 tied them together.
+    pub fn keys() -> &'static [(&'static str, &'static str)] {
+        crate::interface::KEYS
+    }
+
+    /// Every extension the viewer opens and the installer registers.
+    pub fn extensions() -> Vec<&'static str> {
+        crate::image_source::supported_extensions()
+    }
 
     /// Whether a viewer is listening on the channel `id` names.
     ///

@@ -100,6 +100,14 @@ pub fn install() -> Result<PathBuf> {
         Err(error) => eprintln!("nitid: could not add {} to your PATH: {error:#}", target_dir.display()),
     }
 
+    // Likewise: a desktop without a shortcut is an inconvenience, not a
+    // failed install.
+    match create_desktop_shortcut(&target_dir.join(WINDOWED_EXE)) {
+        Ok(Some(path)) => println!("Put a shortcut on your desktop: {}", path.display()),
+        Ok(None) => {}
+        Err(error) => eprintln!("nitid: could not create the desktop shortcut: {error:#}"),
+    }
+
     println!();
     println!("nitid is now offered in \"Open with\". Windows reserves the choice");
     println!("of default application for you: right-click an image, choose");
@@ -119,6 +127,12 @@ pub fn uninstall() -> Result<()> {
         Ok(true) => println!("Removed {} from your PATH", dir.display()),
         Ok(false) => {}
         Err(error) => eprintln!("nitid: could not remove {} from your PATH: {error:#}", dir.display()),
+    }
+
+    match remove_desktop_shortcut() {
+        Ok(true) => println!("Removed the desktop shortcut"),
+        Ok(false) => {}
+        Err(error) => eprintln!("nitid: could not remove the desktop shortcut: {error:#}"),
     }
 
     // The decoder's AppContainer profile is machine state nitid registered on
@@ -462,6 +476,88 @@ fn unregister() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The name the shortcut carries on the desktop.
+///
+/// A constant because two functions must agree on it: one writes the file and
+/// the other deletes it, and a rename in one place would leave the other
+/// removing nothing while reporting success.
+const SHORTCUT_NAME: &str = "nitid.lnk";
+
+/// Where the shortcut goes.
+///
+/// The desktop is asked for rather than assembled from the profile directory:
+/// it is a known folder and can be moved (OneDrive redirects it, and this
+/// machine's is redirected), so `%USERPROFILE%\Desktop` is a guess that is
+/// wrong exactly on the machines where it matters.
+fn desktop_dir() -> Result<PathBuf> {
+    use windows::Win32::UI::Shell::{FOLDERID_Desktop, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
+
+    let wide = unsafe { SHGetKnownFolderPath(&FOLDERID_Desktop, KF_FLAG_DEFAULT, None) }.context("asking Windows where the desktop is")?;
+    let path = unsafe { wide.to_string() }.context("reading the desktop path")?;
+    // The shell allocated this; the caller frees it.
+    unsafe { windows::Win32::System::Com::CoTaskMemFree(Some(wide.0 as *const _)) };
+    Ok(PathBuf::from(path))
+}
+
+/// Put a shortcut to the viewer on the desktop.
+///
+/// `Ok(None)` when one is already there: an install that runs twice should not
+/// leave "nitid (2)", and overwriting a shortcut the user may have renamed or
+/// moved would undo a choice they made.
+///
+/// The windowed executable is the target, not the console one — a shortcut
+/// that flashes a console window on every launch is a shortcut people delete
+/// (ADR 0004).
+fn create_desktop_shortcut(target: &Path) -> Result<Option<PathBuf>> {
+    use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize, IPersistFile};
+    use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
+    use windows::core::{HSTRING, Interface};
+
+    let link_path = desktop_dir()?.join(SHORTCUT_NAME);
+    if link_path.exists() {
+        return Ok(None);
+    }
+
+    // This runs in a short-lived command, so the apartment is entered and left
+    // here rather than at startup. A failure means COM is already initialised
+    // in a different mode, which the work below survives.
+    let initialised = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok();
+    let result = (|| -> Result<()> {
+        let link: IShellLinkW = unsafe { CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER) }.context("creating the shortcut object")?;
+
+        unsafe { link.SetPath(&HSTRING::from(target.as_os_str())) }.context("setting the shortcut's target")?;
+        if let Some(dir) = target.parent() {
+            unsafe { link.SetWorkingDirectory(&HSTRING::from(dir.as_os_str())) }.context("setting the shortcut's working directory")?;
+        }
+        unsafe { link.SetDescription(&HSTRING::from("A fast image viewer with honest colour and HDR")) }.context("describing the shortcut")?;
+        // Index 0 of the executable's own resources, which is the mark the
+        // rest of the shell already shows for it.
+        unsafe { link.SetIconLocation(&HSTRING::from(target.as_os_str()), 0) }.context("setting the shortcut's icon")?;
+
+        let file: IPersistFile = link.cast().context("the shortcut cannot be saved")?;
+        unsafe { file.Save(&HSTRING::from(link_path.as_os_str()), true) }.context("writing the shortcut")?;
+        Ok(())
+    })();
+
+    if initialised {
+        unsafe { CoUninitialize() };
+    }
+    result.map(|()| Some(link_path))
+}
+
+/// Take the shortcut away again.
+///
+/// Only the one this installed: a file of that name is removed, and a shortcut
+/// the user made themselves somewhere else is theirs to keep.
+fn remove_desktop_shortcut() -> Result<bool> {
+    let link_path = desktop_dir()?.join(SHORTCUT_NAME);
+    if !link_path.exists() {
+        return Ok(false);
+    }
+    fs::remove_file(&link_path).with_context(|| format!("removing {}", link_path.display()))?;
+    Ok(true)
 }
 
 #[cfg(test)]
