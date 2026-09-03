@@ -4,6 +4,9 @@ All notable changes to this project are documented in this file.
 
 ## [0.23.0] - 2026-09-03
 
+### Bug Fixes
+- Read the payload where there is no shell to drag into
+
 ### Documentation
 - Describe drag and drop, and what a drag carries
 
