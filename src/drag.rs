@@ -97,9 +97,17 @@ pub use windows_drag::start;
 /// The same surface where there is no shell to drag into.
 ///
 /// As with the clipboard: the callers stay free of `cfg` attributes, and the
-/// non-Windows build is what CI's MSRV job compiles.
+/// non-Windows build is what CI's Linux job compiles.
+///
+/// The payload is taken apart rather than ignored. A stub that bound it to `_`
+/// left both fields of `Payload` written and never read, which `dead_code`
+/// reports — and did so only on Linux, where the Windows half that reads them
+/// does not exist. Reading them here says the true thing: there is nothing to
+/// hand the picture to, not that the picture was never assembled.
 #[cfg(not(windows))]
-pub fn start(_payload: Payload) -> anyhow::Result<bool> {
+pub fn start(payload: Payload) -> anyhow::Result<bool> {
+    let Payload { hdrop, dib } = payload;
+    let _ = (hdrop, dib);
     Ok(false)
 }
 
