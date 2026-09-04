@@ -28,6 +28,11 @@ const ICO: &[u8] = include_bytes!("../assets/icon.ico");
 const SMALL: u32 = 32;
 
 /// What the taskbar button and the task switcher draw.
+///
+/// Windows-only: it is the only platform that asks for a second, larger icon
+/// (`ICON_BIG`) alongside the titlebar's. Elsewhere `with_window_icon` is the
+/// whole story, and a constant nothing reads is dead code.
+#[cfg(windows)]
 const LARGE: u32 = 256;
 
 /// One image inside an `.ico`, as the directory describes it.
@@ -102,6 +107,9 @@ pub fn small() -> Option<winit::window::Icon> {
 }
 
 /// The icon for the taskbar button.
+///
+/// Windows-only, like the attribute that takes it: see `LARGE`.
+#[cfg(windows)]
 pub fn large() -> Option<winit::window::Icon> {
     icon_at(LARGE)
 }
@@ -128,7 +136,10 @@ mod tests {
     #[test]
     fn the_window_gets_two_different_sizes() {
         let small = image_near(ICO, SMALL).expect("no small image");
-        let large = image_near(ICO, LARGE).expect("no large image");
+        // 256 spelled out rather than `LARGE`, which only exists on Windows:
+        // the two images being different is a fact about the container and
+        // holds wherever the container is read.
+        let large = image_near(ICO, 256).expect("no large image");
         assert_ne!(small, large, "the titlebar and the taskbar were handed the same image");
         assert!(large.len() > small.len(), "the large icon is not the larger image");
     }
