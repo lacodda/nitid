@@ -2,12 +2,20 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.24.0] - 2026-09-05
+
+### Documentation
+- The settings in the README, and a roadmap that matches the plan
+
+### Features
+- A place for the choices, and the first fifteen in it
 ## [0.23.1] - 2026-09-04
 
 ### Bug Fixes
 - The mark the window shows, and the level each size carries
 - The taskbar icon is a Windows-only thing, and says so
 - Ask about the target OS, not the machine doing the build
+- Keep the cfg that makes the script compile off Windows
 
 ### Documentation
 - Hold the README to the code, and say what install leaves behind
