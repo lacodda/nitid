@@ -13,7 +13,13 @@
 //! and it does not change when the window moves to another monitor.
 
 use crate::color::ColorTransform;
+use crate::config::{Copies, Units};
 use crate::image_source::{DecodedImage, Depth, Orientation};
+
+/// One eight-bit channel as a percentage of full scale.
+fn percent(value: u8) -> f32 {
+    f32::from(value) / 255.0 * 100.0
+}
 
 /// One pixel, in both the terms that matter.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -46,6 +52,29 @@ impl Reading {
     /// The file's colour as a hex string, which is what goes to the clipboard.
     pub fn hex(&self) -> String {
         format!("#{:02X}{:02X}{:02X}", self.file[0], self.file[1], self.file[2])
+    }
+
+    /// The three channels written in the units the settings ask for.
+    ///
+    /// The values are the file's own, whichever units they are shown in: what
+    /// the camera recorded is the question the eyedropper answers, and the
+    /// display's version is the row below when the two differ.
+    pub fn channels(&self, units: Units) -> String {
+        match units {
+            Units::Bytes => format!("{} {} {}", self.file[0], self.file[1], self.file[2]),
+            // One decimal: a photographer reads "39.2%", and a percentage
+            // written to four places is a number nobody uses.
+            Units::Percent => format!("{:.1}% {:.1}% {:.1}%", percent(self.file[0]), percent(self.file[1]), percent(self.file[2])),
+            Units::Hex => self.hex(),
+        }
+    }
+
+    /// What a click puts on the clipboard.
+    pub fn copied(&self, units: Units, copies: Copies) -> String {
+        match copies {
+            Copies::Hex => self.hex(),
+            Copies::Channels => self.channels(units),
+        }
     }
 
     /// Whether the display shows this pixel as something other than what the
@@ -409,6 +438,34 @@ mod tests {
         let image = image(1, 1, vec![0xAB, 0xCD, 0xEF, 255]);
         let reading = read(&image, Orientation::Normal, &ColorTransform::identity(), (0, 0)).expect("inside the image");
         assert_eq!(reading.hex(), "#ABCDEF");
+    }
+
+    /// Each unit setting writes the same pixel a different way, and all three
+    /// describe the file's own values.
+    #[test]
+    fn the_units_setting_decides_how_a_reading_is_written() {
+        let image = image(1, 1, vec![0xFF, 0x80, 0x00, 255]);
+        let reading = read(&image, Orientation::Normal, &ColorTransform::identity(), (0, 0)).expect("inside the image");
+
+        assert_eq!(reading.channels(Units::Bytes), "255 128 0");
+        assert_eq!(reading.channels(Units::Hex), "#FF8000");
+        // 128/255 is 50.2%, not 50%: the value is the file's, not a round
+        // number invented to look tidy.
+        assert_eq!(reading.channels(Units::Percent), "100.0% 50.2% 0.0%");
+    }
+
+    /// What a click copies is its own setting: someone pasting into CSS wants
+    /// the hex, someone typing into a raw converter wants the numbers.
+    #[test]
+    fn the_copy_setting_decides_what_reaches_the_clipboard() {
+        let image = image(1, 1, vec![0xFF, 0x80, 0x00, 255]);
+        let reading = read(&image, Orientation::Normal, &ColorTransform::identity(), (0, 0)).expect("inside the image");
+
+        assert_eq!(reading.copied(Units::Bytes, Copies::Hex), "#FF8000");
+        assert_eq!(reading.copied(Units::Bytes, Copies::Channels), "255 128 0");
+        // Copying channels follows the units the panel is showing, so what is
+        // pasted is what was read.
+        assert_eq!(reading.copied(Units::Percent, Copies::Channels), "100.0% 50.2% 0.0%");
     }
 
     /// An untagged image needs no conversion, so the two readings agree and

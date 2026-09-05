@@ -271,7 +271,16 @@ impl View {
     /// rather than resizing a picture: without it every zoom is followed by a
     /// corrective pan.
     pub fn zoom_at(&mut self, notches: f32, cursor: (f32, f32)) {
-        let target = (self.scale * WHEEL_STEP.powf(notches)).clamp(MIN_SCALE, MAX_SCALE);
+        self.zoom_at_step(notches, cursor, WHEEL_STEP);
+    }
+
+    /// The same, with the per-notch factor the settings ask for.
+    ///
+    /// Kept multiplicative whatever the step: zooming stays geometric, so
+    /// every notch covers the same visual distance whether the image is tiny
+    /// or huge, and only how far one notch goes is a matter of taste.
+    pub fn zoom_at_step(&mut self, notches: f32, cursor: (f32, f32), step: f32) {
+        let target = (self.scale * step.powf(notches)).clamp(MIN_SCALE, MAX_SCALE);
         self.zoom_to_at(target, cursor);
     }
 
@@ -517,6 +526,33 @@ mod tests {
         let (offset_x, offset_y) = view.offset();
         let top_left = (view.window.0 / 2.0 + offset_x - width / 2.0, view.window.1 / 2.0 + offset_y - height / 2.0);
         ((cursor.0 - top_left.0) / view.physical_scale(), (cursor.1 - top_left.1) / view.physical_scale())
+    }
+
+    /// A bigger step per notch moves further in one notch, and the zoom
+    /// stays geometric either way: two notches are one notch squared.
+    #[test]
+    fn the_zoom_step_setting_decides_how_far_one_notch_goes() {
+        let centre = (500.0, 400.0);
+
+        let mut gentle = View::new((4000, 3000), (1000, 800), 1.0);
+        gentle.zoom_at_step(1.0, centre, 1.1);
+
+        let mut brisk = View::new((4000, 3000), (1000, 800), 1.0);
+        brisk.zoom_at_step(1.0, centre, 1.5);
+
+        assert!(brisk.scale() > gentle.scale(), "the larger step did not zoom further");
+
+        let mut twice = View::new((4000, 3000), (1000, 800), 1.0);
+        twice.zoom_at_step(2.0, centre, 1.5);
+        let once = brisk.scale();
+        let fitted = View::new((4000, 3000), (1000, 800), 1.0).scale();
+        // Two notches from the same start is the one-notch factor squared.
+        let expected = fitted * 1.5 * 1.5;
+        assert!(
+            (twice.scale() - expected).abs() < 0.001,
+            "two notches came out at {} rather than {expected} (one notch reached {once})",
+            twice.scale()
+        );
     }
 
     #[test]

@@ -41,17 +41,50 @@ pub fn exit_after_interface() -> bool {
     matches!(exit_when(), Some(ExitWhen::Interface))
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+/// How long the viewer should sit with a picture up before closing itself,
+/// when it was asked to.
+///
+/// `NITID_EXIT_AFTER_FIRST_FRAME=idle:2000` shows the picture, does nothing
+/// for two seconds and quits. It is a measuring tool, not a gate: counting
+/// the `interface laid out` lines over that window is how the promise that a
+/// still picture costs no wakeups gets checked by hand.
+///
+/// No automatic gate is built on it, and that was tried. The layouts a
+/// deliberately looping build produced over the same window measured 740,
+/// 184, 178, 16 and 3 across runs — the loop turns out to depend on
+/// something outside the process, so a ceiling either passes a broken build
+/// or fails a sound one. The measurement is still worth having; the
+/// threshold is not.
+pub fn idle_for() -> Option<std::time::Duration> {
+    match exit_when() {
+        Some(ExitWhen::Idle(millis)) => Some(std::time::Duration::from_millis(millis)),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq, Debug)]
 enum ExitWhen {
     FirstFrame,
     Interface,
+    /// Stay up this many milliseconds, then quit.
+    Idle(u64),
 }
 
 fn exit_when() -> Option<ExitWhen> {
-    let value = std::env::var_os(EXIT_VAR)?;
-    match value.to_str() {
-        Some("0") => None,
-        Some("interface") => Some(ExitWhen::Interface),
+    exit_when_from(std::env::var_os(EXIT_VAR)?.to_str()?)
+}
+
+/// The parsing on its own, so it can be tested without the environment:
+/// setting a variable inside a test races every other test in the process.
+fn exit_when_from(text: &str) -> Option<ExitWhen> {
+    match text {
+        "0" => None,
+        "interface" => Some(ExitWhen::Interface),
+        text if text.starts_with("idle:") => {
+            // A malformed window still gives one: a run that quit at once
+            // would measure nothing.
+            Some(ExitWhen::Idle(text.trim_start_matches("idle:").parse().unwrap_or(2000)))
+        }
         _ => Some(ExitWhen::FirstFrame),
     }
 }
@@ -146,6 +179,22 @@ pub fn elapsed() -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The idle mode's duration is read from the value, and a malformed one
+    /// still gives a window rather than quitting at once — a gate that exited
+    /// immediately would measure nothing and pass.
+    #[test]
+    fn the_idle_mode_carries_how_long_to_wait() {
+        assert_eq!(
+            exit_when_from("idle:500"),
+            Some(ExitWhen::Idle(500)),
+            "the idle window was not read from the value"
+        );
+        assert_eq!(exit_when_from("idle:nonsense"), Some(ExitWhen::Idle(2000)));
+        assert_eq!(exit_when_from("interface"), Some(ExitWhen::Interface));
+        assert_eq!(exit_when_from("1"), Some(ExitWhen::FirstFrame));
+        assert_eq!(exit_when_from("0"), None);
+    }
 
     #[test]
     fn recording_without_a_started_clock_is_harmless() {
