@@ -179,9 +179,13 @@ impl Folder {
     }
 }
 
-/// List the decodable images of a folder, ordered the way the shell orders
-/// them: case-insensitive by name, so `IMG_2.jpg` precedes `IMG_10.jpg` only
-/// when the names say so — natural numeric ordering is a v0.7.0 setting.
+/// List the decodable images of a folder, in the order the settings ask for.
+///
+/// By name is the default and the shell's own order: case-insensitive, so
+/// `IMG_2.jpg` precedes `IMG_10.jpg` only when the names say so. Natural
+/// numeric ordering, where `IMG_10` follows `IMG_9`, is not offered yet — it
+/// is a third way to read a name rather than a fourth thing to sort on, and
+/// it belongs beside the name option when it arrives.
 fn scan(folder: &Path, order: Order) -> Result<Vec<PathBuf>> {
     let read = folder.read_dir().with_context(|| format!("listing {}", folder.display()))?;
 

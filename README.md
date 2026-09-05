@@ -413,7 +413,7 @@ has no size limit to hide behind.
 
 ## Status
 
-Early development — v0.23.1 is out. Startup, colour and format coverage hold:
+Early development — v0.24.0 is out. Startup, colour and format coverage hold:
 every modern still format opens, a phone's photographs included, every one of
 them reaches the screen without a wait, and the ones that animate play. The
 process that decodes the heavy formats runs with no network in either
@@ -438,8 +438,11 @@ on the clipboard in with `Ctrl+V`, and the path — quoted for a terminal — wi
 `Ctrl+Shift+C`. **And pictures come and go by hand now**: files dropped on the
 window open — a selection of several as the several it was — and `Ctrl` with a
 drag hands what is on screen to another window, as the file where there is one
-and as the picture where there is not. Development runs in small
-versions, each one theme; the road to 1.0 is fixed:
+and as the picture where there is not. **And the choices are yours now**: `,`
+opens the settings — what the wheel does, when the chrome is on screen, how a
+picture is framed when it arrives, where the zebra draws its lines and what
+the eyedropper reads in — each taking effect as it is made. Development runs
+in small versions, each one theme; the road to 1.0 is fixed:
 
 | Version | What lands |
 | --- | --- |
@@ -469,9 +472,11 @@ versions, each one theme; the road to 1.0 is fixed:
 | ✅ v0.21.0 | Colour tools: the clipping zebra, the eyedropper, and the colour passport |
 | ✅ v0.22.0 | The clipboard: the picture out, a picture in, the path quoted for a terminal |
 | ✅ v0.23.0 | Drag and drop: files dropped on the window open, `Ctrl` and a drag hands the picture out |
-| v0.24.0 – v0.35.0 | The everyday viewer: file operations, culling, comparison, settings |
-| v0.36.0 – v0.39.0 | Windows integration: context menu, installer, auto-update, thumbnails |
-| v0.40.0 – v0.41.0 | Documentation site, stabilisation |
+| ✅ v0.23.1 | The window's own icon, and a shortcut on the desktop |
+| ✅ v0.24.0 | Settings: gestures, chrome, how a picture opens, the colour tools |
+| v0.25.0 – v0.37.0 | The everyday viewer: file operations, culling, comparison, slideshow |
+| v0.39.0 – v0.42.0 | Windows integration: context menu, installer, auto-update, thumbnails |
+| v0.43.0 – v0.44.0 | Documentation site, stabilisation |
 | v1.0.0 | Public release — the default viewer, nothing missing |
 
 Beyond 1.0: **2.x** makes a separate screenshot tool unnecessary — capture a
