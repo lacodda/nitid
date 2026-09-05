@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use std::path::PathBuf;
 
 use crate::color::Passport;
+use crate::config::{Appearance, Behaviour, Chrome, Config, Copies, Gestures, MAX_ZOOM_STEP, MIN_ZOOM_STEP, Opening, Order, Tools, Units, Wheel};
 use crate::eyedropper::Reading;
 use crate::format::Format;
 use crate::histogram::{BUCKETS, Histogram};
@@ -127,6 +128,7 @@ pub enum Action {
     Passport,
     FullScreen,
     Keys,
+    Settings,
 }
 
 /// A short-lived message: "path copied", "moved to the recycle bin".
@@ -171,9 +173,49 @@ pub struct Interface {
     /// decides whether a frame is laid out at all: the digest has to be able
     /// to see it change.
     toolbar_shown: bool,
+    /// Whether the settings dialog is up, and which of its sections is open.
+    settings_shown: bool,
+    section: Section,
+    /// When each strip of chrome is on screen, as the settings say.
+    chrome: Appearance,
+    /// The units the eyedropper last read in.
+    ///
+    /// Kept so the digest can see them change: the reading is the same pixel
+    /// whichever units it is written in, so nothing else in the digest moves
+    /// when the setting does.
+    units: Units,
     toasts: Vec<Toast>,
     /// The last thing laid out, kept so an unchanged frame can be skipped.
     last: Option<String>,
+}
+
+/// A page of the settings dialog.
+///
+/// Sections by meaning rather than one long sheet: a person looking for what
+/// the wheel does should not have to read past the zebra's thresholds to
+/// find it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Section {
+    #[default]
+    Gestures,
+    Appearance,
+    Opening,
+    Tools,
+}
+
+impl Section {
+    /// The sections down the left of the dialog, in the order they are shown.
+    const ALL: [Self; 4] = [Self::Gestures, Self::Appearance, Self::Opening, Self::Tools];
+
+    /// What the section is called in its list.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Gestures => "Gestures",
+            Self::Appearance => "View",
+            Self::Opening => "Opening",
+            Self::Tools => "Colour",
+        }
+    }
 }
 
 impl Default for Interface {
@@ -201,6 +243,10 @@ impl Interface {
             histogram_shown: false,
             passport_shown: false,
             toolbar_shown: false,
+            settings_shown: false,
+            section: Section::default(),
+            chrome: Appearance::default(),
+            units: Units::default(),
             toasts: Vec::new(),
             last: None,
         }
@@ -230,6 +276,41 @@ impl Interface {
         self.passport_shown = !self.passport_shown;
     }
 
+    /// Take the chrome rules from the settings.
+    ///
+    /// The toolbar's visibility is recomputed at once rather than waiting for
+    /// the next pointer move: a person who has just pinned it open is looking
+    /// straight at the place it should have appeared.
+    pub fn set_chrome(&mut self, chrome: Appearance) {
+        self.chrome = chrome;
+        self.toolbar_shown = match chrome.toolbar {
+            Chrome::Always => true,
+            Chrome::Never => false,
+            // Left as it is: the pointer has not moved, and the next move
+            // will answer for it.
+            Chrome::Hover => self.toolbar_shown,
+        };
+    }
+
+    /// Show or hide the settings dialog.
+    pub fn toggle_settings(&mut self) {
+        self.settings_shown = !self.settings_shown;
+    }
+
+    /// Whether the settings dialog is up.
+    ///
+    /// Asked by the application before Esc quits: with the dialog open, Esc
+    /// closes it instead. A key that both closes a dialog and ends the
+    /// program is a key nobody presses with confidence.
+    pub fn settings_shown(&self) -> bool {
+        self.settings_shown
+    }
+
+    /// Put the settings dialog away.
+    pub fn close_settings(&mut self) {
+        self.settings_shown = false;
+    }
+
     /// Whether the colour passport is showing.
     ///
     /// Asked by the application before it builds one: the profiles are only
@@ -257,10 +338,14 @@ impl Interface {
     /// resting exactly on the boundary does not flicker the toolbar on and off
     /// with every pixel of movement.
     pub fn follow_pointer(&mut self, pointer: Option<(f32, f32)>) -> bool {
-        let shown = match pointer {
-            Some((_, y)) if self.toolbar_shown => y <= TOOLBAR_REVEAL.max(TOOLBAR_HEIGHT),
-            Some((_, y)) => y <= TOOLBAR_REVEAL,
-            None => false,
+        let shown = match self.chrome.toolbar {
+            Chrome::Always => true,
+            Chrome::Never => false,
+            Chrome::Hover => match pointer {
+                Some((_, y)) if self.toolbar_shown => y <= TOOLBAR_REVEAL.max(TOOLBAR_HEIGHT),
+                Some((_, y)) => y <= TOOLBAR_REVEAL,
+                None => false,
+            },
         };
         let changed = shown != self.toolbar_shown;
         self.toolbar_shown = shown;
@@ -293,11 +378,16 @@ impl Interface {
     /// `raw` comes from `egui-winit` and carries the pointer, the keys and the
     /// screen rectangle. The `Action` is whatever button was pressed this
     /// frame, and it is the interface's whole say in what the viewer does.
-    pub fn layout(&mut self, raw: egui::RawInput, status: &Status, now: Instant) -> (egui::FullOutput, Option<Action>) {
+    pub fn layout(&mut self, raw: egui::RawInput, status: &Status, config: &mut Config, now: Instant) -> (egui::FullOutput, Option<Action>, bool) {
         let keys_shown = self.keys_shown;
         let info_shown = self.info_shown;
         let histogram_shown = self.histogram_shown;
         let toolbar_shown = self.toolbar_shown;
+        let settings_shown = self.settings_shown;
+        let mut section = self.section;
+        let status_shown = self.chrome.status_line != Chrome::Never;
+        let units = config.tools.units;
+        self.units = units;
         let toasts: Vec<(String, f32)> = self
             .toasts
             .iter()
@@ -305,13 +395,19 @@ impl Interface {
             .collect();
 
         let mut action = None;
+        // Whether the settings dialog changed anything this frame. The caller
+        // acts on it: a setting that only took effect on the next restart
+        // would be a setting the user cannot judge while choosing it.
+        let mut edited = false;
         // `run_ui` hands over the root `Ui` rather than the context: in egui
         // 0.36 panels are shown inside a `Ui`, and this is the one they sit in.
         let output = self.context.clone().run_ui(raw, |ui| {
             if toolbar_shown {
                 action = toolbar(ui, status, info_shown, histogram_shown);
             }
-            action = action.or(status_line(ui, status));
+            if status_shown {
+                action = action.or(status_line(ui, status));
+            }
             if info_shown {
                 info_panel(ui, status);
             }
@@ -319,7 +415,7 @@ impl Interface {
                 histogram_panel(ui, status);
             }
             if status.picking {
-                eyedropper_panel(ui, status);
+                eyedropper_panel(ui, status, units);
             }
             if let Some(passport) = &status.passport {
                 passport_panel(ui, passport);
@@ -327,12 +423,16 @@ impl Interface {
             if keys_shown {
                 key_sheet(ui);
             }
+            if settings_shown {
+                edited = settings_dialog(ui, config, &mut section);
+            }
             if status.hovering {
                 drop_invitation(ui);
             }
             toast_stack(ui, &toasts);
         });
-        (output, action)
+        self.section = section;
+        (output, action, edited)
     }
 
     /// A one-line summary of what is being shown, used to tell whether the
@@ -368,7 +468,10 @@ impl Interface {
             // Without this the panel would open empty and stay empty, because
             // nothing else in the digest moves when a count lands.
             status.histogram.as_ref().map(|histogram| histogram.counted),
-        ) + &format!("|{}", status.hovering)
+        ) + &format!(
+            "|{}|{}|{:?}|{:?}|{:?}",
+            status.hovering, self.settings_shown, self.section, self.chrome.toolbar, self.chrome.status_line
+        ) + &format!("|{:?}", self.units)
     }
 
     /// Whether the interface would draw something different from last time.
@@ -431,6 +534,7 @@ fn toolbar(ui: &mut egui::Ui, status: &Status, info_shown: bool, histogram_shown
                 let from_the_right = ui
                     .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         button(ui, "?", "Keys  (?)", true, Action::Keys)
+                            .or(button(ui, "⚙", "Settings  (,)", true, Action::Settings))
                             .or(button(ui, "⛶", "Full screen  (F11)", true, Action::FullScreen))
                             .or(toggle(ui, "Info", "What the file says about itself  (I)", showing, info_shown, Action::Info))
                             .or(toggle(
@@ -910,7 +1014,7 @@ fn band_colour(lit: [bool; 3]) -> egui::Color32 {
 /// chased the cursor would cover the pixel being read, which is the one thing
 /// the person is looking at. It sits under the toolbar's band so the two never
 /// argue over the same strip.
-fn eyedropper_panel(ui: &mut egui::Ui, status: &Status) {
+fn eyedropper_panel(ui: &mut egui::Ui, status: &Status, units: Units) {
     egui::Area::new("eyedropper".into())
         .fixed_pos(egui::pos2(ui.max_rect().left() + 12.0, ui.max_rect().top() + TOOLBAR_HEIGHT + 12.0))
         .interactable(false)
@@ -940,7 +1044,7 @@ fn eyedropper_panel(ui: &mut egui::Ui, status: &Status) {
                     });
 
                     ui.add_space(4.0);
-                    row(ui, "File", &format!("{} {} {}", reading.file[0], reading.file[1], reading.file[2]), true);
+                    row(ui, "File", &reading.channels(units), true);
                     // Only when it says something the line above did not: on
                     // an untagged image the two are the same number twice.
                     if reading.converted() {
@@ -1031,6 +1135,226 @@ fn key_sheet(ui: &mut egui::Ui) {
         });
 }
 
+/// The settings, sections down the left and the chosen one on the right.
+///
+/// Returns whether anything was changed. The caller writes the file and puts
+/// the change into effect at once: a setting that waited for a restart would
+/// be a setting nobody can judge while choosing it.
+///
+/// Every control here edits the config in place. There is no OK button and
+/// nothing to apply — the dialog is a view onto the settings, not a copy of
+/// them that has to be reconciled.
+fn settings_dialog(ui: &mut egui::Ui, config: &mut Config, section: &mut Section) -> bool {
+    let mut edited = false;
+
+    egui::Window::new("Settings")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(ui.ctx(), |ui| {
+            ui.horizontal_top(|ui| {
+                ui.vertical(|ui| {
+                    ui.set_min_width(96.0);
+                    for choice in Section::ALL {
+                        ui.selectable_value(section, choice, choice.name());
+                    }
+                });
+
+                separator_vertical(ui);
+
+                ui.vertical(|ui| {
+                    ui.set_min_width(330.0);
+                    edited = match *section {
+                        Section::Gestures => gestures_section(ui, &mut config.gestures),
+                        Section::Appearance => appearance_section(ui, &mut config.appearance),
+                        Section::Opening => opening_section(ui, &mut config.behaviour),
+                        Section::Tools => tools_section(ui, &mut config.tools),
+                    };
+                });
+            });
+
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new(SETTINGS_HINT).weak());
+        });
+
+    edited
+}
+
+/// What the settings dialog says about itself, where a person would read it.
+const SETTINGS_HINT: &str = "Changes take effect at once. Esc closes.";
+
+/// The wheel and the mouse.
+fn gestures_section(ui: &mut egui::Ui, gestures: &mut Gestures) -> bool {
+    let mut edited = false;
+
+    ui.label(egui::RichText::new("Gestures").strong());
+    ui.add_space(6.0);
+
+    edited |= choice(ui, "Wheel", &mut gestures.wheel, &[(Wheel::Zoom, "zoom"), (Wheel::Step, "next image")]);
+    // Said rather than left to be discovered: the setting chooses which
+    // gesture is the bare one, and a person who wants the other needs to know
+    // it did not go away.
+    ui.label(
+        egui::RichText::new(match gestures.wheel {
+            Wheel::Zoom => "Ctrl+wheel steps through the folder.",
+            Wheel::Step => "Ctrl+wheel zooms.",
+        })
+        .weak()
+        .small(),
+    );
+    ui.add_space(6.0);
+
+    edited |= ui.checkbox(&mut gestures.invert_wheel, "Reverse the wheel's direction").changed();
+    edited |= ui.checkbox(&mut gestures.middle_toggles, "Middle click toggles fit and 100%").changed();
+
+    ui.add_space(6.0);
+    ui.label("Zoom per notch");
+    edited |= ui
+        .add(
+            egui::Slider::new(&mut gestures.zoom_step, MIN_ZOOM_STEP..=MAX_ZOOM_STEP)
+                .custom_formatter(|value, _| format!("{:.0}%", (value - 1.0) * 100.0))
+                .custom_parser(|text| text.trim_end_matches('%').parse::<f64>().ok().map(|percent| percent / 100.0 + 1.0)),
+        )
+        .changed();
+
+    edited
+}
+
+/// What is on screen besides the picture.
+fn appearance_section(ui: &mut egui::Ui, appearance: &mut Appearance) -> bool {
+    let mut edited = false;
+
+    ui.label(egui::RichText::new("View").strong());
+    ui.add_space(6.0);
+
+    edited |= chrome_choice(ui, "Toolbar", &mut appearance.toolbar);
+    ui.add_space(6.0);
+    edited |= chrome_choice(ui, "Status line", &mut appearance.status_line);
+
+    ui.add_space(8.0);
+    // The decision, said where someone would go looking for the switch that
+    // is not here. See the reference layout: the scene behind a photograph
+    // stays dark so the photograph is what is lit.
+    ui.label(
+        egui::RichText::new("The viewer is dark by decision: the scene behind a photograph stays dark so the photograph is what is lit.")
+            .weak()
+            .small(),
+    );
+
+    edited
+}
+
+/// How an image arrives, and what the folder does.
+fn opening_section(ui: &mut egui::Ui, behaviour: &mut Behaviour) -> bool {
+    let mut edited = false;
+
+    ui.label(egui::RichText::new("Opening").strong());
+    ui.add_space(6.0);
+
+    edited |= choice(
+        ui,
+        "Show at",
+        &mut behaviour.opening,
+        &[(Opening::Fit, "fit to window"), (Opening::Actual, "100%")],
+    );
+    ui.add_space(6.0);
+
+    edited |= ui.checkbox(&mut behaviour.hold_zoom, "Hold the framing across a step").changed();
+    ui.label(egui::RichText::new("What the L key toggles for one session.").weak().small());
+    ui.add_space(6.0);
+
+    edited |= ui.checkbox(&mut behaviour.wrap, "Step past the last image to the first").changed();
+    ui.add_space(6.0);
+
+    edited |= choice(
+        ui,
+        "Order",
+        &mut behaviour.order,
+        &[(Order::Name, "name"), (Order::Modified, "date"), (Order::Size, "size")],
+    );
+
+    edited
+}
+
+/// The colour tools.
+fn tools_section(ui: &mut egui::Ui, tools: &mut Tools) -> bool {
+    let mut edited = false;
+
+    ui.label(egui::RichText::new("Colour").strong());
+    ui.add_space(6.0);
+
+    ui.label("Clipping marks a highlight at or above");
+    edited |= ui
+        .add(
+            egui::Slider::new(&mut tools.clip_high, 0.5..=1.0)
+                .custom_formatter(percent)
+                .custom_parser(from_percent),
+        )
+        .changed();
+
+    ui.add_space(4.0);
+    ui.label("and a shadow at or below");
+    edited |= ui
+        .add(
+            egui::Slider::new(&mut tools.clip_low, 0.0..=0.5)
+                .custom_formatter(percent)
+                .custom_parser(from_percent),
+        )
+        .changed();
+
+    ui.add_space(8.0);
+    edited |= choice(
+        ui,
+        "Eyedropper reads in",
+        &mut tools.units,
+        &[(Units::Bytes, "0–255"), (Units::Percent, "%"), (Units::Hex, "hex")],
+    );
+    ui.add_space(6.0);
+    edited |= choice(ui, "A click copies", &mut tools.copies, &[(Copies::Hex, "hex"), (Copies::Channels, "channels")]);
+
+    edited
+}
+
+/// A threshold shown as the percentage of full scale a person would say.
+fn percent(value: f64, _: std::ops::RangeInclusive<usize>) -> String {
+    format!("{:.1}%", value * 100.0)
+}
+
+fn from_percent(text: &str) -> Option<f64> {
+    text.trim_end_matches('%').parse::<f64>().ok().map(|percent| percent / 100.0)
+}
+
+/// One row of mutually exclusive choices, labelled.
+///
+/// Generic over the value so that every such row in the dialog is the same
+/// row: a settings page whose controls each look slightly different reads as
+/// several pages that happen to be next to each other.
+fn choice<T: PartialEq + Copy>(ui: &mut egui::Ui, label: &str, value: &mut T, options: &[(T, &str)]) -> bool {
+    let mut edited = false;
+    ui.label(label);
+    ui.horizontal(|ui| {
+        for (option, name) in options {
+            edited |= ui.selectable_value(value, *option, *name).changed();
+        }
+    });
+    edited
+}
+
+/// When a strip of chrome is shown.
+fn chrome_choice(ui: &mut egui::Ui, label: &str, value: &mut Chrome) -> bool {
+    choice(
+        ui,
+        label,
+        value,
+        &[(Chrome::Hover, "on hover"), (Chrome::Always, "always"), (Chrome::Never, "never")],
+    )
+}
+
+/// The rule between the section list and the section.
+fn separator_vertical(ui: &mut egui::Ui) {
+    ui.add(egui::Separator::default().vertical().spacing(16.0));
+}
+
 /// The keys, in the order a person meets them.
 ///
 /// Kept beside the handler it describes rather than in the documentation,
@@ -1040,7 +1364,8 @@ pub const KEYS: &[(&str, &str)] = &[
     ("← →", "previous / next image"),
     ("Home End", "first / last image"),
     ("Space", "pause an animation, or the next image"),
-    ("Wheel", "zoom around the cursor"),
+    ("Wheel", "zoom around the cursor, or step through the folder"),
+    ("Ctrl+Wheel", "whichever of the two the bare wheel is not"),
     ("Drag", "pan"),
     ("Middle click", "toggle fit and 100%"),
     ("0 1", "fit to window / actual size"),
@@ -1059,6 +1384,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Ctrl+Shift+C", "copy the path, quoted for a terminal"),
     ("+ -", "zoom in / out"),
     ("F11", "full screen"),
+    (",", "settings"),
     ("?", "this list"),
     ("Esc", "quit"),
 ];
@@ -1205,7 +1531,7 @@ mod tests {
                 screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, height))),
                 ..Default::default()
             };
-            let (mut output, _) = interface.layout(raw, status, Instant::now());
+            let (mut output, _, _) = interface.layout(raw, status, &mut Config::default(), Instant::now());
             output.textures_delta.clear();
         }
         interface.context().memory(|memory| memory.area_rect(id))
@@ -1375,6 +1701,55 @@ mod tests {
         assert!(!interface.toolbar_shown, "the toolbar stayed up with the pointer gone");
     }
 
+    /// Pinned open, the toolbar ignores the pointer entirely — including the
+    /// pointer leaving the window, which is what takes it away by default.
+    #[test]
+    fn a_pinned_toolbar_stays_whatever_the_pointer_does() {
+        let mut interface = Interface::new();
+        interface.set_chrome(Appearance {
+            toolbar: Chrome::Always,
+            status_line: Chrome::Hover,
+        });
+        assert!(interface.toolbar_shown, "pinning it open did not show it");
+
+        interface.follow_pointer(Some((400.0, 600.0)));
+        assert!(interface.toolbar_shown, "a pointer far from the top took the pinned toolbar away");
+        interface.follow_pointer(None);
+        assert!(interface.toolbar_shown, "the pointer leaving took the pinned toolbar away");
+    }
+
+    /// Turned off, it stays off even with the pointer in the band that would
+    /// otherwise reveal it.
+    #[test]
+    fn a_toolbar_turned_off_does_not_come_back() {
+        let mut interface = Interface::new();
+        interface.follow_pointer(Some((400.0, 10.0)));
+        assert!(interface.toolbar_shown);
+
+        interface.set_chrome(Appearance {
+            toolbar: Chrome::Never,
+            status_line: Chrome::Hover,
+        });
+        assert!(!interface.toolbar_shown, "turning it off left it on screen");
+
+        interface.follow_pointer(Some((400.0, 10.0)));
+        assert!(!interface.toolbar_shown, "the pointer brought back a toolbar that was turned off");
+    }
+
+    /// A chrome rule changing has to be drawn, or the setting is chosen and
+    /// nothing happens until something else asks for a frame.
+    #[test]
+    fn a_changed_chrome_rule_is_a_change() {
+        let mut interface = Interface::new();
+        interface.changed(&status());
+
+        interface.set_chrome(Appearance {
+            toolbar: Chrome::Hover,
+            status_line: Chrome::Never,
+        });
+        assert!(interface.changed(&status()), "hiding the status line went unnoticed");
+    }
+
     /// The toolbar is chrome, so its coming and going has to be drawn.
     #[test]
     fn the_toolbar_appearing_is_a_change() {
@@ -1468,7 +1843,7 @@ mod tests {
             events,
             ..Default::default()
         };
-        let (mut output, action) = interface.layout(raw, status, Instant::now());
+        let (mut output, action, _) = interface.layout(raw, status, &mut Config::default(), Instant::now());
         // egui insists its texture deltas are acknowledged rather than
         // dropped, the same as the renderer does with them for real.
         output.textures_delta.clear();
@@ -1555,7 +1930,7 @@ mod tests {
             events,
             ..Default::default()
         };
-        let (mut output, _) = interface.layout(raw, status, Instant::now());
+        let (mut output, _, _) = interface.layout(raw, status, &mut Config::default(), Instant::now());
         output.textures_delta.clear();
         output
             .platform_output
@@ -1648,6 +2023,95 @@ mod tests {
         assert!(interface.changed(&status()), "opening the panel went unnoticed");
         interface.toggle_info();
         assert!(interface.changed(&status()), "closing the panel went unnoticed");
+    }
+
+    /// One frame of the settings dialog, optionally clicking somewhere.
+    ///
+    /// Returns whether the dialog reported an edit, and leaves the config
+    /// carrying whatever the click did to it.
+    fn settings_frame(interface: &mut Interface, config: &mut Config, at: Option<egui::Pos2>) -> bool {
+        let mut events = Vec::new();
+        if let Some(at) = at {
+            events.push(egui::Event::PointerMoved(at));
+            for pressed in [true, false] {
+                events.push(egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+        }
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 600.0))),
+            events,
+            ..Default::default()
+        };
+        let (mut output, _, edited) = interface.layout(raw, &status(), config, Instant::now());
+        output.textures_delta.clear();
+        edited
+    }
+
+    /// The dialog is reachable and its controls change the settings: a
+    /// settings page whose switches are painted but wired to nothing would
+    /// pass every test that only asked whether it rendered.
+    #[test]
+    fn a_control_in_the_settings_actually_changes_a_setting() {
+        let mut interface = Interface::new();
+        interface.toggle_settings();
+        let mut config = Config::default();
+
+        // Two settled frames first: egui places a window on the frame after
+        // it first lays it out, so a click on the very first frame lands
+        // where nothing is yet.
+        settings_frame(&mut interface, &mut config, None);
+        settings_frame(&mut interface, &mut config, None);
+
+        let before = config.clone();
+        let mut edited = false;
+        // The dialog is centred in a 900x600 window; walk its area rather
+        // than assume a pixel, since egui decides the widths.
+        'search: for y in (140..460).step_by(4) {
+            for x in (280..620).step_by(4) {
+                let at = egui::pos2(x as f32, y as f32);
+                settings_frame(&mut interface, &mut config, None);
+                if settings_frame(&mut interface, &mut config, Some(at)) {
+                    edited = true;
+                    break 'search;
+                }
+            }
+        }
+
+        assert!(edited, "nothing in the settings dialog reported a change");
+        assert_ne!(config, before, "the dialog reported an edit that changed no setting");
+    }
+
+    /// With the dialog closed, the same clicks change nothing: the settings
+    /// are only editable while they are on screen.
+    #[test]
+    fn a_closed_settings_dialog_changes_nothing() {
+        let mut interface = Interface::new();
+        let mut config = Config::default();
+        settings_frame(&mut interface, &mut config, None);
+
+        let before = config.clone();
+        for y in (140..460).step_by(8) {
+            for x in (280..620).step_by(8) {
+                settings_frame(&mut interface, &mut config, Some(egui::pos2(x as f32, y as f32)));
+            }
+        }
+        assert_eq!(config, before, "a closed dialog changed the settings");
+    }
+
+    /// The dialog opening and closing is a change worth drawing.
+    #[test]
+    fn opening_the_settings_is_a_change() {
+        let mut interface = Interface::new();
+        interface.changed(&status());
+        interface.toggle_settings();
+        assert!(interface.changed(&status()), "opening the settings went unnoticed");
+        interface.close_settings();
+        assert!(interface.changed(&status()), "closing the settings went unnoticed");
     }
 
     /// A file size is read by a person, not by a machine.

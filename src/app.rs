@@ -21,7 +21,7 @@ use moxcms::ColorProfile;
 
 use crate::animation::Player;
 use crate::color::{self, ColorTransform};
-use crate::config::Config;
+use crate::config::{Config, Opening, Wheel};
 use crate::folder::Folder;
 use crate::format::Format;
 use crate::gpu::Renderer;
@@ -288,6 +288,8 @@ struct PaintedFrame {
 
 impl App {
     fn new(initial: Vec<PathBuf>, loader: Loader, proxy: EventLoopProxy<Event>) -> Self {
+        let config = Config::load();
+        let hold_zoom = config.behaviour.hold_zoom;
         Self {
             initial,
             window: None,
@@ -296,7 +298,7 @@ impl App {
             shown: None,
             loader,
             proxy,
-            config: Config::load(),
+            config,
             display_profile: color::display_profile(),
             cursor: PhysicalPosition::new(0.0, 0.0),
             dragging: false,
@@ -312,7 +314,7 @@ impl App {
             painted: None,
             toast_deadline: None,
             wants_frame: false,
-            zoom_locked: false,
+            zoom_locked: hold_zoom,
             pasted: None,
             picking: false,
             reading: None,
@@ -363,7 +365,7 @@ impl App {
     fn open(&mut self, paths: &[PathBuf]) {
         let (folder, path) = match paths {
             [] => return,
-            [single] => match Folder::open(single) {
+            [single] => match Folder::open(single, self.config.behaviour.order, self.config.behaviour.wrap) {
                 Ok(folder) => {
                     let path = folder.current().to_path_buf();
                     (Some(folder), path)
@@ -373,7 +375,7 @@ impl App {
                     (None, single.clone())
                 }
             },
-            several => match Folder::of_selection(several) {
+            several => match Folder::of_selection(several, self.config.behaviour.wrap) {
                 Some(folder) => {
                     let path = folder.current().to_path_buf();
                     (Some(folder), path)
@@ -479,6 +481,7 @@ impl App {
             renderer.size(),
             scale_factor,
             self.zoom_locked,
+            self.config.behaviour.opening,
         );
 
         self.shown = Some(Shown {
@@ -707,6 +710,27 @@ impl App {
         self.request_redraw();
     }
 
+    /// Put a changed setting into effect, and write it down.
+    ///
+    /// Called on every frame the dialog reported an edit, so a slider being
+    /// dragged is felt while it is dragged rather than on the next start.
+    /// The file is small and the write is not on any hot path: a viewer that
+    /// batched these would be one that loses them on a crash.
+    fn settings_changed(&mut self) {
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.set_thresholds(crate::gpu::Thresholds {
+                high: self.config.tools.clip_high,
+                low: self.config.tools.clip_low,
+            });
+        }
+        // The chrome that is pinned or hidden by setting rather than by the
+        // pointer has to be told: the toolbar's own rule only answers to
+        // where the pointer is.
+        self.interface.set_chrome(self.config.appearance);
+        self.config.save();
+        self.request_redraw();
+    }
+
     fn request_redraw(&self) {
         if let Some(window) = &self.window {
             window.request_redraw();
@@ -750,7 +774,17 @@ impl App {
             "the viewer was handed a key it does not answer: {key:?} — a toolbar button asking for it would do nothing",
         );
         match key {
-            Key::Named(NamedKey::Escape) => event_loop.exit(),
+            // With the settings up, Esc puts them away rather than ending
+            // the program: one key that both closes a dialog and quits is a
+            // key nobody presses with confidence.
+            Key::Named(NamedKey::Escape) => {
+                if self.interface.settings_shown() {
+                    self.interface.close_settings();
+                    self.request_redraw();
+                } else {
+                    event_loop.exit();
+                }
+            }
             // On an animated image the space bar is its pause; everywhere
             // else it steps to the next file, as it always has.
             Key::Named(NamedKey::Space) => match self.shown.as_mut().and_then(|shown| shown.player.as_mut()) {
@@ -817,6 +851,13 @@ impl App {
                 // The colour under the cursor. A mode, so it can be pointed
                 // about the picture and clicked with one hand.
                 "p" | "P" => self.toggle_picking(),
+                // The settings. A dialog rather than a panel: it is a place
+                // you go to and come back from, not something to look at a
+                // picture alongside.
+                "," => {
+                    self.interface.toggle_settings();
+                    self.request_redraw();
+                }
                 // The colour path, spelled out. Reachable from the keyboard
                 // as well as by clicking the status line's colour chip: the
                 // toolbar and the status line carry nothing the keys do not.
@@ -1243,9 +1284,9 @@ impl App {
         let Some(reading) = self.reading else {
             return;
         };
-        let hex = reading.hex();
-        self.interface.context().copy_text(hex.clone());
-        self.interface.toast(format!("{hex} copied"), Instant::now());
+        let copied = reading.copied(self.config.tools.units, self.config.tools.copies);
+        self.interface.context().copy_text(copied.clone());
+        self.interface.toast(format!("{copied} copied"), Instant::now());
         self.request_redraw();
     }
 
@@ -1485,7 +1526,7 @@ impl App {
         let input = self.input.as_mut()?;
 
         let raw = input.take_egui_input(&window);
-        let (output, action) = self.interface.layout(raw, &status, now);
+        let (output, action, edited) = self.interface.layout(raw, &status, &mut self.config, now);
         input.handle_platform_output(&window, output.platform_output);
 
         // Worth a milestone of its own: this is where the interface could
@@ -1497,6 +1538,13 @@ impl App {
             textures: output.textures_delta,
             pixels_per_point: output.pixels_per_point,
         });
+
+        // After the frame is tessellated, because putting a setting into
+        // effect touches the renderer and the interface, and both are
+        // borrowed above.
+        if edited {
+            self.settings_changed();
+        }
         action
     }
 
@@ -1628,7 +1676,31 @@ fn handled(key: &Key) -> bool {
         ) => true,
         Key::Character(character) => matches!(
             character.as_str(),
-            "+" | "=" | "-" | "_" | "0" | "1" | "?" | "l" | "L" | "r" | "R" | "b" | "B" | "i" | "I" | "z" | "Z" | "h" | "H" | "c" | "C" | "p" | "P" | "k" | "K"
+            "+" | "="
+                | "-"
+                | "_"
+                | "0"
+                | "1"
+                | "?"
+                | ","
+                | "l"
+                | "L"
+                | "r"
+                | "R"
+                | "b"
+                | "B"
+                | "i"
+                | "I"
+                | "z"
+                | "Z"
+                | "h"
+                | "H"
+                | "c"
+                | "C"
+                | "p"
+                | "P"
+                | "k"
+                | "K"
         ),
         _ => false,
     }
@@ -1732,6 +1804,7 @@ fn key_for(action: Action) -> Key {
         Action::Lock => Key::Character("l".into()),
         Action::FullScreen => Key::Named(NamedKey::F11),
         Action::Keys => Key::Character("?".into()),
+        Action::Settings => Key::Character(",".into()),
     }
 }
 
@@ -1794,8 +1867,15 @@ struct Previous {
 /// there passed every test and the whole gate — the lock's own unit tests
 /// prove what `carry_onto` computes, not that anything calls it. This is a
 /// decision made of plain values, so it can be asked directly.
-fn frame_arriving(previous: Option<Previous>, image: (u32, u32), window: (u32, u32), scale_factor: f32, locked: bool) -> View {
-    let fresh = || View::new(image, window, scale_factor);
+fn frame_arriving(previous: Option<Previous>, image: (u32, u32), window: (u32, u32), scale_factor: f32, locked: bool, opening: Opening) -> View {
+    // A picture with no framing to inherit opens the way the settings say.
+    let fresh = || {
+        let mut view = View::new(image, window, scale_factor);
+        if opening == Opening::Actual {
+            view.set_actual();
+        }
+        view
+    };
     let Some(previous) = previous else {
         return fresh();
     };
@@ -2120,14 +2200,36 @@ impl ApplicationHandler<Event> for App {
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
-                let notches = match delta {
+                let mut notches = match delta {
                     MouseScrollDelta::LineDelta(_, lines) => lines,
                     MouseScrollDelta::PixelDelta(position) => position.y as f32 / PIXELS_PER_NOTCH,
                 };
-                let cursor = self.cursor_position();
-                if let Some(shown) = self.shown.as_mut() {
-                    shown.view.zoom_at(notches, cursor);
-                    self.refresh();
+                if self.config.gestures.invert_wheel {
+                    notches = -notches;
+                }
+                // Which gesture the wheel is depends on the setting, and Ctrl
+                // always asks for the other one — so both are reachable
+                // whichever way round the setting is.
+                let gesture = match self.modifiers.control_key() {
+                    true => self.config.gestures.wheel.modified(),
+                    false => self.config.gestures.wheel,
+                };
+                match gesture {
+                    Wheel::Zoom => {
+                        let cursor = self.cursor_position();
+                        if let Some(shown) = self.shown.as_mut() {
+                            shown.view.zoom_at_step(notches, cursor, self.config.gestures.zoom_step);
+                            self.refresh();
+                        }
+                    }
+                    // A notch is one image, whichever way the wheel reports
+                    // its distance: a trackpad's fractional scroll should not
+                    // fly through a folder.
+                    Wheel::Step => match notches.partial_cmp(&0.0) {
+                        Some(std::cmp::Ordering::Greater) => self.navigate(Step::Previous),
+                        Some(std::cmp::Ordering::Less) => self.navigate(Step::Next),
+                        _ => {}
+                    },
                 }
             }
 
@@ -2153,7 +2255,9 @@ impl ApplicationHandler<Event> for App {
                     self.dragging = false;
                     self.pressed_at = None;
                 }
-                (MouseButton::Middle, ElementState::Pressed) => self.reframe(Reframe::Toggle),
+                (MouseButton::Middle, ElementState::Pressed) if self.config.gestures.middle_toggles => {
+                    self.reframe(Reframe::Toggle);
+                }
                 _ => {}
             },
 
@@ -2238,7 +2342,7 @@ mod tests {
     /// A picture arriving with nothing before it is framed for itself.
     #[test]
     fn the_first_image_is_framed_for_itself() {
-        let view = frame_arriving(None, (4000, 3000), (1000, 800), 1.0, false);
+        let view = frame_arriving(None, (4000, 3000), (1000, 800), 1.0, false, Opening::Fit);
         assert_eq!(view.mode(), FitMode::Fit);
     }
 
@@ -2262,12 +2366,12 @@ mod tests {
         };
 
         // Locked: the neighbour arrives at the zoom the user set.
-        let locked = frame_arriving(previous(), (4000, 3000), (1000, 800), 1.0, true);
+        let locked = frame_arriving(previous(), (4000, 3000), (1000, 800), 1.0, true, Opening::Fit);
         assert_eq!(locked.mode(), FitMode::Free, "the lock did not carry the framing");
         assert!((locked.scale() - 3.0).abs() < 0.01, "the neighbour came out at {}", locked.scale());
 
         // Unlocked: it is fitted, as a folder of unrelated pictures wants.
-        let unlocked = frame_arriving(previous(), (4000, 3000), (1000, 800), 1.0, false);
+        let unlocked = frame_arriving(previous(), (4000, 3000), (1000, 800), 1.0, false, Opening::Fit);
         assert_eq!(unlocked.mode(), FitMode::Fit, "an unlocked neighbour kept the previous framing");
     }
 
@@ -2290,6 +2394,7 @@ mod tests {
             (1000, 800),
             1.0,
             false,
+            Opening::Fit,
         );
         assert_eq!(same.mode(), FitMode::Free, "the framing was thrown away when the full image arrived");
 
@@ -2303,8 +2408,42 @@ mod tests {
             (1000, 800),
             1.0,
             false,
+            Opening::Fit,
         );
         assert_eq!(other.mode(), FitMode::Fit, "another file's thumbnail inherited this one's framing");
+    }
+
+    /// The opening setting decides how a picture with nothing to inherit is
+    /// framed. Only that case: a framing carried by the lock, or rebased from
+    /// a thumbnail, is a framing someone already chose.
+    #[test]
+    fn the_opening_setting_frames_a_fresh_picture() {
+        let fitted = frame_arriving(None, (4000, 3000), (1000, 800), 1.0, false, Opening::Fit);
+        assert_eq!(fitted.mode(), FitMode::Fit);
+
+        let actual = frame_arriving(None, (4000, 3000), (1000, 800), 1.0, false, Opening::Actual);
+        assert_eq!(actual.mode(), FitMode::Actual, "the setting asked for 100% and did not get it");
+        assert!((actual.scale() - 1.0).abs() < 0.001, "100% came out at {}", actual.scale());
+
+        // The lock still wins: it carries a framing that was chosen, and the
+        // opening setting is only about a picture with none.
+        let carried = frame_arriving(
+            Some(Previous {
+                view: {
+                    let mut view = View::new((400, 300), (1000, 800), 1.0);
+                    view.zoom_to_at(2.0, (500.0, 400.0));
+                    view
+                },
+                fidelity: Fidelity::Full,
+                same_file: false,
+            }),
+            (4000, 3000),
+            (1000, 800),
+            1.0,
+            true,
+            Opening::Actual,
+        );
+        assert_eq!(carried.mode(), FitMode::Free, "the opening setting overrode the zoom lock");
     }
 
     /// Even under the lock, a file's own full image replaces its thumbnail by
@@ -2327,6 +2466,7 @@ mod tests {
             (1000, 800),
             1.0,
             true,
+            Opening::Fit,
         );
         // Rebasing keeps the picture the same size on screen: a thumbnail at
         // 4x becomes the full image at 0.4x, ten times smaller in pixels.
@@ -2438,7 +2578,7 @@ mod tests {
     /// trusted: a hand-kept list is one an added action is forgotten from, and
     /// the two tests over it would then pass while saying nothing about the
     /// new button. Adding a variant now fails to compile until it is listed.
-    const EVERY_ACTION: [Action; 17] = [
+    const EVERY_ACTION: [Action; 18] = [
         Action::Previous,
         Action::Next,
         Action::ZoomOut,
@@ -2456,6 +2596,7 @@ mod tests {
         Action::Passport,
         Action::FullScreen,
         Action::Keys,
+        Action::Settings,
     ];
 
     /// What makes `EVERY_ACTION` exhaustive: this match has no catch-all, so a
@@ -2483,6 +2624,7 @@ mod tests {
                 Action::Passport => 14,
                 Action::FullScreen => 15,
                 Action::Keys => 16,
+                Action::Settings => 17,
             };
         }
 
@@ -2611,16 +2753,17 @@ mod tests {
     /// answers — the same rule the plain keys are held to, which is what stops
     /// the sheet promising something that does nothing.
     ///
-    /// `Ctrl+Drag` is deliberately excluded: it is a gesture of the mouse, not
-    /// a chord of the keyboard, and there is no key for `chord_for` to answer.
-    /// The sheet lists it because a function nobody can see is a function
-    /// nobody finds, which is the rule the whole sheet exists for.
+    /// `Ctrl+Drag` and `Ctrl+Wheel` are deliberately excluded: they are
+    /// gestures of the mouse, not chords of the keyboard, and there is no key
+    /// for `chord_for` to answer. The sheet lists them because a function
+    /// nobody can see is a function nobody finds, which is the rule the whole
+    /// sheet exists for.
     #[test]
     fn every_chord_the_sheet_advertises_is_answered() {
         let advertised: Vec<&str> = crate::interface::KEYS
             .iter()
             .map(|(key, _)| *key)
-            .filter(|key| key.starts_with("Ctrl+") && !key.contains("Drag"))
+            .filter(|key| key.starts_with("Ctrl+") && !key.contains("Drag") && !key.contains("Wheel"))
             .collect();
         assert_eq!(advertised.len(), 3, "the sheet lists {advertised:?}, which is not the three chords");
 

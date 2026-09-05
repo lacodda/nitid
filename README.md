@@ -540,7 +540,8 @@ Opening a file opens its folder: the arrow keys walk the images beside it.
 | `←` `→` | previous / next image in the folder |
 | `Home` `End` | first / last image |
 | `Space` | pause / resume an animation; next image on a still |
-| Wheel | zoom around the cursor |
+| Wheel | zoom around the cursor, or step through the folder |
+| Ctrl+Wheel | whichever of the two the bare wheel is not |
 | Drag | pan |
 | Middle click | toggle fit and 100% |
 | `+` `-` | zoom in / out |
@@ -559,11 +560,34 @@ Opening a file opens its folder: the arrow keys walk the images beside it.
 | `Ctrl+V` | show the picture on the clipboard |
 | `Ctrl+Shift+C` | copy the path, quoted for a terminal |
 | `F11` | fullscreen |
+| `,` | settings |
 | `?` | every key there is |
-| `Esc` | quit |
+| `Esc` | close the settings, or quit |
 
 "100%" means one image pixel per logical pixel, so a photo is the same size
 here as everywhere else on a scaled display.
+
+### Settings
+
+`,` opens the settings, or the gear on the toolbar; `Esc` closes them. There is
+no OK button — a change takes effect as it is made, so a threshold can be
+dragged while watching what it marks. Four sections:
+
+| Section | What it holds |
+| --- | --- |
+| Gestures | what the bare wheel does — zoom or step through the folder — how far one notch zooms, whether the wheel is reversed, whether the middle button toggles fit and 100% |
+| View | when the toolbar and the status line are on screen: on hover, always, or never |
+| Opening | fit or 100% for a picture that arrives, whether the framing is held across a step, whether the folder wraps at its ends, and the order it is walked in — name, date or size |
+| Colour | where the clipping zebra draws its two lines, the units the eyedropper reads in, and what a click copies |
+
+Ctrl+wheel always performs whichever gesture the bare wheel does not, so both
+are reachable whichever way round the setting is.
+
+Settings live in `%APPDATA%\lacodda\nitid\settings.conf`, one `key = value`
+per line, meant to be readable and repairable by hand. A key the running
+version does not recognise is left alone rather than dropped, so a newer
+build's settings survive a run of an older one — see
+[ADR 0022](docs/adr/0022-settings-are-plain-lines-that-survive-both-directions.md).
 
 ### Environment
 

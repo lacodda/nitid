@@ -48,9 +48,11 @@ struct Colour {
     // image is uploaded into, where the hardware linearises on sampling — the
     // zebra has to undo that to see what the file actually stored.
     sampled_is_linear: u32,
-    // Padding to a 16-byte boundary, since WGSL aligns the struct's size and
-    // Rust's `repr(C)` does not. Matched by `_padding` in `ColourUniform`.
-    _padding: vec2<u32>,
+    // Where the zebra draws its two lines, as fractions of full scale. They
+    // fill what used to be padding: WGSL aligns the struct's size to 16 bytes
+    // and Rust's `repr(C)` does not, so these reach the 80 both agree on.
+    clip_high: f32,
+    clip_low: f32,
 }
 
 @group(0) @binding(0) var image_texture: texture_2d<f32>;
@@ -169,11 +171,12 @@ fn decode_srgb_channel(value: f32) -> f32 {
 //
 // Returns 1 for a blown highlight, -1 for a blocked shadow, 0 otherwise.
 fn clipping_of(stored: vec3<f32>) -> f32 {
-    // A whisker below the ends rather than exactly at them: an 8-bit 255
-    // arrives as 1.0, but a 16-bit sample a step below full scale is 0.99998,
-    // and a JPEG's 254 is a highlight already gone for practical purposes.
-    let high = any(stored >= vec3<f32>(0.996));
-    let low = all(stored <= vec3<f32>(0.004));
+    // Where the two lines fall is a setting. They default to a whisker below
+    // the ends rather than exactly at them: an 8-bit 255 arrives as 1.0, but
+    // a 16-bit sample a step below full scale is 0.99998, and a JPEG's 254 is
+    // a highlight already gone for practical purposes.
+    let high = any(stored >= vec3<f32>(colour.clip_high));
+    let low = all(stored <= vec3<f32>(colour.clip_low));
     if high {
         return 1.0;
     }

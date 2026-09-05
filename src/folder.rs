@@ -9,12 +9,19 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+use crate::config::Order;
 use crate::image_source;
 
 /// The images of one folder plus a cursor onto the current file.
 pub struct Folder {
     entries: Vec<PathBuf>,
     current: usize,
+    /// Whether a step past either end comes round to the other.
+    ///
+    /// On by default. Off, the ends of the folder are ends: the arrow key
+    /// stops rather than starting again, which is what someone working
+    /// through a shoot in order expects.
+    wrap: bool,
 }
 
 impl Folder {
@@ -23,10 +30,10 @@ impl Folder {
     /// A file whose folder cannot be read still opens: the listing falls back
     /// to that single entry, because failing to browse is not a reason to
     /// refuse to show the picture that was double-clicked.
-    pub fn open(path: &Path) -> Result<Self> {
+    pub fn open(path: &Path, order: Order, wrap: bool) -> Result<Self> {
         let path = absolute(path)?;
         let entries = match path.parent() {
-            Some(parent) => scan(parent).unwrap_or_else(|_| vec![path.clone()]),
+            Some(parent) => scan(parent, order).unwrap_or_else(|_| vec![path.clone()]),
             None => vec![path.clone()],
         };
 
@@ -34,7 +41,7 @@ impl Folder {
 
         let current = entries.iter().position(|entry| entry == &path).unwrap_or(0);
 
-        Ok(Self { entries, current })
+        Ok(Self { entries, current, wrap })
     }
 
     /// Browse an explicit selection rather than a folder.
@@ -45,14 +52,18 @@ impl Folder {
     ///
     /// `None` when nothing selected is an image this build can open, which
     /// leaves the caller showing whatever it already had.
-    pub fn of_selection(paths: &[PathBuf]) -> Option<Self> {
+    /// The selection keeps the order it was given: the person picked these
+    /// files in this order, and re-sorting them would answer a question they
+    /// did not ask. `wrap` still applies — it is about the ends of a list,
+    /// whichever list it is.
+    pub fn of_selection(paths: &[PathBuf], wrap: bool) -> Option<Self> {
         let entries: Vec<PathBuf> = paths
             .iter()
             .filter(|path| image_source::is_supported(path))
             .filter_map(|path| absolute(path).ok())
             .collect();
 
-        (!entries.is_empty()).then_some(Self { entries, current: 0 })
+        (!entries.is_empty()).then_some(Self { entries, current: 0, wrap })
     }
 
     /// Add files to what is being browsed, and move the cursor to the first
@@ -146,7 +157,16 @@ impl Folder {
         if len < 2 {
             return None;
         }
-        let next = (self.current as isize + delta).rem_euclid(len as isize) as usize;
+        let next = self.current as isize + delta;
+        let next = if self.wrap {
+            next.rem_euclid(len as isize) as usize
+        } else if (0..len as isize).contains(&next) {
+            next as usize
+        } else {
+            // At the end and told not to come round: staying put is the
+            // answer, and `jump` reports "nothing changed" for it.
+            return None;
+        };
         self.jump(next)
     }
 
@@ -162,7 +182,7 @@ impl Folder {
 /// List the decodable images of a folder, ordered the way the shell orders
 /// them: case-insensitive by name, so `IMG_2.jpg` precedes `IMG_10.jpg` only
 /// when the names say so — natural numeric ordering is a v0.7.0 setting.
-fn scan(folder: &Path) -> Result<Vec<PathBuf>> {
+fn scan(folder: &Path, order: Order) -> Result<Vec<PathBuf>> {
     let read = folder.read_dir().with_context(|| format!("listing {}", folder.display()))?;
 
     let mut entries: Vec<PathBuf> = read
@@ -171,12 +191,39 @@ fn scan(folder: &Path) -> Result<Vec<PathBuf>> {
         .filter(|path| path.is_file() && image_source::is_supported(path))
         .collect();
 
-    entries.sort_by_key(|path| sort_key(path));
+    sort(&mut entries, order);
     Ok(entries)
+}
+
+/// Put the listing in the order the settings ask for.
+///
+/// Name is the shell's own order and the default. The other two answer a
+/// different question — what did I shoot last, what is the big one — and both
+/// fall back to the name so that files sharing a date or a size keep a stable
+/// order rather than whatever the filesystem happened to hand over.
+fn sort(entries: &mut [PathBuf], order: Order) {
+    match order {
+        Order::Name => entries.sort_by_key(|path| sort_key(path)),
+        Order::Modified => entries.sort_by(|a, b| modified(b).cmp(&modified(a)).then_with(|| sort_key(a).cmp(&sort_key(b)))),
+        Order::Size => entries.sort_by(|a, b| size(b).cmp(&size(a)).then_with(|| sort_key(a).cmp(&sort_key(b)))),
+    }
 }
 
 fn sort_key(path: &Path) -> String {
     path.file_name().and_then(|name| name.to_str()).unwrap_or_default().to_lowercase()
+}
+
+/// When the file was last written, or the epoch for one that will not say.
+///
+/// A file whose metadata cannot be read sorts as the oldest rather than
+/// dropping out of the listing: it is still a picture, and refusing to show
+/// it because its timestamp is unreadable would be the wrong trade.
+fn modified(path: &Path) -> std::time::SystemTime {
+    path.metadata().and_then(|data| data.modified()).unwrap_or(std::time::UNIX_EPOCH)
+}
+
+fn size(path: &Path) -> u64 {
+    path.metadata().map(|data| data.len()).unwrap_or(0)
 }
 
 /// Resolve a path against the working directory without requiring it to exist
@@ -210,7 +257,7 @@ mod tests {
     #[test]
     fn lists_only_decodable_files_sorted_by_name() {
         let (dir, _) = folder_with(&["b.png", "a.JPG", "notes.txt", "c.gif"]);
-        let folder = Folder::open(&dir.path().join("a.JPG")).unwrap();
+        let folder = Folder::open(&dir.path().join("a.JPG"), Order::Name, true).unwrap();
 
         assert_eq!(folder.len(), 3);
         assert_eq!(folder.position(), 0);
@@ -220,7 +267,7 @@ mod tests {
     #[test]
     fn navigation_wraps_in_both_directions() {
         let (dir, _) = folder_with(&["a.png", "b.png", "c.png"]);
-        let mut folder = Folder::open(&dir.path().join("a.png")).unwrap();
+        let mut folder = Folder::open(&dir.path().join("a.png"), Order::Name, true).unwrap();
 
         assert_eq!(folder.next().unwrap().file_name().unwrap(), "b.png");
         assert_eq!(folder.next().unwrap().file_name().unwrap(), "c.png");
@@ -228,10 +275,69 @@ mod tests {
         assert_eq!(folder.previous().unwrap().file_name().unwrap(), "c.png");
     }
 
+    /// With wrapping off the ends are ends: the arrow key stops rather than
+    /// starting the folder again, which is what someone working through a
+    /// shoot in order expects.
+    #[test]
+    fn navigation_stops_at_the_ends_when_it_is_told_not_to_wrap() {
+        let (dir, _) = folder_with(&["a.png", "b.png", "c.png"]);
+        let mut folder = Folder::open(&dir.path().join("a.png"), Order::Name, false).unwrap();
+
+        // Backwards from the first goes nowhere, and leaves the cursor put.
+        assert!(folder.previous().is_none());
+        assert_eq!(folder.current().file_name().unwrap(), "a.png");
+
+        assert_eq!(folder.next().unwrap().file_name().unwrap(), "b.png");
+        assert_eq!(folder.next().unwrap().file_name().unwrap(), "c.png");
+        assert!(folder.next().is_none(), "the last image stepped past the end");
+        assert_eq!(folder.current().file_name().unwrap(), "c.png");
+    }
+
+    /// Date and size order answer a different question from name order, and
+    /// both put the most recent or the largest first.
+    #[test]
+    fn the_order_setting_decides_the_listing() {
+        let dir = tempfile::tempdir().expect("a temporary folder");
+        // Written biggest-first so that size order is not the order they were
+        // created in: a test that agreed with the filesystem by accident
+        // would pass with the sort deleted.
+        for (name, bytes) in [("a.png", 300), ("b.png", 100), ("c.png", 200)] {
+            std::fs::write(dir.path().join(name), vec![0u8; bytes]).expect("writing a temporary file");
+        }
+
+        let by_name = Folder::open(&dir.path().join("a.png"), Order::Name, true).unwrap();
+        assert_eq!(names(&by_name), ["a.png", "b.png", "c.png"]);
+
+        let by_size = Folder::open(&dir.path().join("a.png"), Order::Size, true).unwrap();
+        assert_eq!(names(&by_size), ["a.png", "c.png", "b.png"], "the largest file did not come first");
+        // The cursor stays on the file that was opened, wherever the order
+        // put it — opening a picture must always show that picture.
+        assert_eq!(by_size.current().file_name().unwrap(), "a.png");
+    }
+
+    /// A hand-picked selection keeps the order it was given: the person
+    /// picked these files in this order.
+    #[test]
+    fn a_selection_is_not_re_sorted() {
+        let (_dir, paths) = folder_with(&["c.png", "a.png", "b.png"]);
+        let folder = Folder::of_selection(&paths, true).unwrap();
+
+        assert_eq!(names(&folder), ["c.png", "a.png", "b.png"]);
+    }
+
+    /// The file names of a listing, in the order it holds them.
+    fn names(folder: &Folder) -> Vec<String> {
+        folder
+            .entries
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect()
+    }
+
     #[test]
     fn first_and_last_jump_across_the_folder() {
         let (dir, _) = folder_with(&["a.png", "b.png", "c.png"]);
-        let mut folder = Folder::open(&dir.path().join("b.png")).unwrap();
+        let mut folder = Folder::open(&dir.path().join("b.png"), Order::Name, true).unwrap();
 
         assert_eq!(folder.last().unwrap().file_name().unwrap(), "c.png");
         assert_eq!(folder.first().unwrap().file_name().unwrap(), "a.png");
@@ -242,7 +348,7 @@ mod tests {
     #[test]
     fn a_lone_image_reports_no_movement() {
         let (dir, _) = folder_with(&["only.png"]);
-        let mut folder = Folder::open(&dir.path().join("only.png")).unwrap();
+        let mut folder = Folder::open(&dir.path().join("only.png"), Order::Name, true).unwrap();
 
         assert_eq!(folder.len(), 1);
         assert!(folder.next().is_none());
@@ -252,7 +358,7 @@ mod tests {
     #[test]
     fn a_file_missing_from_its_folder_still_opens() {
         let (dir, _) = folder_with(&["a.png"]);
-        let folder = Folder::open(&dir.path().join("gone.png")).unwrap();
+        let folder = Folder::open(&dir.path().join("gone.png"), Order::Name, true).unwrap();
 
         // The cursor falls back to the start rather than refusing to open.
         assert_eq!(folder.position(), 0);

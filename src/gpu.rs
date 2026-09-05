@@ -214,6 +214,26 @@ fn orientation_matrix(orientation: Orientation) -> [[f32; 2]; 2] {
     ]
 }
 
+/// Where the clipping zebra draws its two lines, as fractions of full scale.
+///
+/// A setting rather than a constant since v0.24.0: what counts as a blown
+/// highlight depends on the camera and on what the picture is for, and the
+/// photographer is the one who knows.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Thresholds {
+    pub high: f32,
+    pub low: f32,
+}
+
+impl Default for Thresholds {
+    fn default() -> Self {
+        Self {
+            high: crate::config::DEFAULT_CLIP_HIGH,
+            low: crate::config::DEFAULT_CLIP_LOW,
+        }
+    }
+}
+
 /// Colour conversion state, laid out to match `Colour` in `shader.wgsl`.
 ///
 /// WGSL aligns each column of a `mat3x3<f32>` to 16 bytes, so the matrix is
@@ -239,11 +259,16 @@ struct ColourUniform {
     /// linearises on sampling. The zebra undoes that to judge the values the
     /// file actually holds.
     sampled_is_linear: u32,
-    /// WGSL rounds a struct's size up to its alignment — 16 bytes here,
-    /// because of the `mat3x3` — and `#[repr(C)]` does not, so the padding is
-    /// declared rather than left to differ between the two languages. Six
-    /// `u32` after the 48-byte matrix come to 72; two more reach 80.
-    _padding: [u32; 2],
+    /// At or above this fraction of full scale the zebra calls a highlight
+    /// blown, and at or below `clip_low` it calls a shadow blocked. Both are
+    /// judged on the file's own stored values (ADR 0019).
+    ///
+    /// These two occupy what used to be declared padding: WGSL rounds the
+    /// struct's size up to its 16-byte alignment and `#[repr(C)]` does not,
+    /// so the six `u32` after the 48-byte matrix come to 72 and these reach
+    /// the 80 both languages agree on.
+    clip_high: f32,
+    clip_low: f32,
 }
 
 impl ColourUniform {
@@ -252,7 +277,7 @@ impl ColourUniform {
     /// and the shader's curves must, even when the transform itself would
     /// change nothing. The identity transform carries the sRGB curve for
     /// exactly this.
-    fn new(transform: &ColorTransform, output: Output, depth: Depth, backdrop: Backdrop, zebra: bool) -> Self {
+    fn new(transform: &ColorTransform, output: Output, depth: Depth, backdrop: Backdrop, zebra: bool, thresholds: Thresholds) -> Self {
         let mut matrix = [[0.0; 4]; 3];
         for (row, values) in transform.matrix.iter().enumerate() {
             matrix[row][..3].copy_from_slice(values);
@@ -273,7 +298,8 @@ impl ColourUniform {
             // `Rgba8UnormSrgb` and the hardware linearises on sampling. The
             // same condition, written once here and once there.
             sampled_is_linear: u32::from(depth == Depth::Eight && transform.is_identity),
-            _padding: [0; 2],
+            clip_high: thresholds.high,
+            clip_low: thresholds.low,
         }
     }
 }
@@ -344,6 +370,9 @@ pub struct Renderer {
     /// choice that outlives any one image, so it is restated every time the
     /// colour uniform is rewritten.
     zebra: bool,
+    /// Where the zebra draws its lines. Held here for the same reason as the
+    /// backdrop: a viewing choice that outlives any one image.
+    thresholds: Thresholds,
     /// Whether the device can hold sixteen-bit normalised textures.
     ///
     /// `Rgba16Unorm` is an optional wgpu feature. DX12 — the backend nitid
@@ -516,6 +545,7 @@ impl Renderer {
                 Depth::Eight,
                 Backdrop::default(),
                 false,
+                Thresholds::default(),
             )),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -539,6 +569,7 @@ impl Renderer {
             transform: ColorTransform::identity(),
             backdrop: Backdrop::default(),
             zebra: false,
+            thresholds: Thresholds::default(),
             wide_textures,
             tile_limit,
             upload: None,
@@ -573,6 +604,18 @@ impl Renderer {
         self.zebra
     }
 
+    /// Move the lines the zebra judges by.
+    ///
+    /// Costs the same one uniform write the zebra itself does, so a
+    /// photographer can drag the threshold and watch the marking follow.
+    pub fn set_thresholds(&mut self, thresholds: Thresholds) {
+        if self.thresholds == thresholds {
+            return;
+        }
+        self.thresholds = thresholds;
+        self.write_colour();
+    }
+
     /// Show or hide the clipping zebra.
     ///
     /// Costs the same as the backdrop does — one uniform write — because the
@@ -604,7 +647,7 @@ impl Renderer {
     /// release checklist rather than of `cargo test`.
     fn write_colour(&mut self) {
         let depth = self.upload.as_ref().map_or(Depth::Eight, |upload| upload.depth);
-        let uniform = ColourUniform::new(&self.transform, self.output, depth, self.backdrop, self.zebra);
+        let uniform = ColourUniform::new(&self.transform, self.output, depth, self.backdrop, self.zebra, self.thresholds);
         self.queue.write_buffer(&self.colour, 0, bytemuck::bytes_of(&uniform));
     }
 
@@ -828,7 +871,7 @@ impl Renderer {
         self.queue.write_buffer(
             &self.colour,
             0,
-            bytemuck::bytes_of(&ColourUniform::new(transform, self.output, depth, self.backdrop, self.zebra)),
+            bytemuck::bytes_of(&ColourUniform::new(transform, self.output, depth, self.backdrop, self.zebra, self.thresholds)),
         );
 
         self.upload = Some(Upload { tiles: uploads, size, depth });
@@ -1282,9 +1325,42 @@ mod tests {
     #[test]
     fn the_colour_uniform_matches_the_shader_layout() {
         // mat3x3 with 16-byte aligned columns (48 bytes), then six u32 and
-        // one of padding, rounded up to the struct's own 16-byte alignment.
+        // the two zebra thresholds, which come to the struct's own 16-byte
+        // alignment exactly.
         assert_eq!(std::mem::size_of::<ColourUniform>(), 80);
         assert_eq!(std::mem::size_of::<ColourUniform>() % 16, 0, "WGSL rounds the struct up; the two must agree");
+    }
+
+    /// The thresholds the settings choose are the ones the shader is handed.
+    ///
+    /// They travel in what used to be padding, which is exactly the kind of
+    /// change that compiles and silently sends zeroes: a zebra told to mark
+    /// everything at or above 0.0 would paint the whole picture.
+    #[test]
+    fn the_zebra_thresholds_reach_the_shader() {
+        let uniform = ColourUniform::new(
+            &ColorTransform::identity(),
+            srgb_surface(),
+            Depth::Eight,
+            Backdrop::default(),
+            true,
+            Thresholds { high: 0.9, low: 0.1 },
+        );
+        assert_eq!(uniform.clip_high, 0.9);
+        assert_eq!(uniform.clip_low, 0.1);
+
+        // And the default is the pair the zebra judged by before it was a
+        // setting, not zero.
+        let default = ColourUniform::new(
+            &ColorTransform::identity(),
+            srgb_surface(),
+            Depth::Eight,
+            Backdrop::default(),
+            true,
+            Thresholds::default(),
+        );
+        assert_eq!(default.clip_high, crate::config::DEFAULT_CLIP_HIGH);
+        assert_eq!(default.clip_low, crate::config::DEFAULT_CLIP_LOW);
     }
 
     /// The surface an SDR display gets: the hardware encodes on write.
@@ -1475,8 +1551,8 @@ mod tests {
     #[test]
     fn turning_the_zebra_on_changes_nothing_else_in_the_uniform() {
         let transform = wide_gamut_transform();
-        let off = ColourUniform::new(&transform, srgb_surface(), Depth::Eight, Backdrop::default(), false);
-        let on = ColourUniform::new(&transform, srgb_surface(), Depth::Eight, Backdrop::default(), true);
+        let off = ColourUniform::new(&transform, srgb_surface(), Depth::Eight, Backdrop::default(), false, Thresholds::default());
+        let on = ColourUniform::new(&transform, srgb_surface(), Depth::Eight, Backdrop::default(), true, Thresholds::default());
 
         assert_eq!((off.zebra, on.zebra), (0, 1), "the flag does not reach the shader");
         assert_eq!(off.convert, on.convert);
@@ -1492,21 +1568,49 @@ mod tests {
     /// wrong numbers and marks the wrong pixels.
     #[test]
     fn the_shader_is_told_when_the_hardware_linearised() {
-        let srgb_texture = ColourUniform::new(&ColorTransform::identity(), srgb_surface(), Depth::Eight, Backdrop::default(), true);
+        let srgb_texture = ColourUniform::new(
+            &ColorTransform::identity(),
+            srgb_surface(),
+            Depth::Eight,
+            Backdrop::default(),
+            true,
+            Thresholds::default(),
+        );
         assert_eq!(srgb_texture.sampled_is_linear, 1, "the one hardware-linearised case was not declared");
 
         // A conversion means a plain `Rgba8Unorm` texture: raw values.
-        let converted = ColourUniform::new(&wide_gamut_transform(), srgb_surface(), Depth::Eight, Backdrop::default(), true);
+        let converted = ColourUniform::new(
+            &wide_gamut_transform(),
+            srgb_surface(),
+            Depth::Eight,
+            Backdrop::default(),
+            true,
+            Thresholds::default(),
+        );
         assert_eq!(converted.sampled_is_linear, 0, "a plain texture was reported as linearised");
 
         // Sixteen bits has no `*Srgb` variant at all.
-        let wide = ColourUniform::new(&ColorTransform::identity(), srgb_surface(), Depth::Sixteen, Backdrop::default(), true);
+        let wide = ColourUniform::new(
+            &ColorTransform::identity(),
+            srgb_surface(),
+            Depth::Sixteen,
+            Backdrop::default(),
+            true,
+            Thresholds::default(),
+        );
         assert_eq!(wide.sampled_is_linear, 0, "a sixteen-bit texture was reported as linearised");
     }
 
     #[test]
     fn an_identity_transform_asks_the_shader_to_do_nothing() {
-        let uniform = ColourUniform::new(&ColorTransform::identity(), srgb_surface(), Depth::Eight, Backdrop::default(), false);
+        let uniform = ColourUniform::new(
+            &ColorTransform::identity(),
+            srgb_surface(),
+            Depth::Eight,
+            Backdrop::default(),
+            false,
+            Thresholds::default(),
+        );
         assert_eq!(uniform.convert, 0);
         assert_eq!(uniform.encode_srgb, 0);
         assert_eq!(uniform.extended_range, 0);
@@ -1514,7 +1618,14 @@ mod tests {
 
     #[test]
     fn a_conversion_onto_an_srgb_surface_leaves_encoding_to_the_hardware() {
-        let uniform = ColourUniform::new(&wide_gamut_transform(), srgb_surface(), Depth::Eight, Backdrop::default(), false);
+        let uniform = ColourUniform::new(
+            &wide_gamut_transform(),
+            srgb_surface(),
+            Depth::Eight,
+            Backdrop::default(),
+            false,
+            Thresholds::default(),
+        );
 
         assert_eq!(uniform.convert, 1);
         // An sRGB surface encodes on write; doing it in the shader too would
@@ -1530,11 +1641,27 @@ mod tests {
         // surface expecting sRGB — dark, and only on hardware nitid had not
         // met.
         assert_eq!(
-            ColourUniform::new(&wide_gamut_transform(), plain_surface(), Depth::Eight, Backdrop::default(), false).encode_srgb,
+            ColourUniform::new(
+                &wide_gamut_transform(),
+                plain_surface(),
+                Depth::Eight,
+                Backdrop::default(),
+                false,
+                Thresholds::default()
+            )
+            .encode_srgb,
             1
         );
         assert_eq!(
-            ColourUniform::new(&ColorTransform::identity(), plain_surface(), Depth::Eight, Backdrop::default(), false).encode_srgb,
+            ColourUniform::new(
+                &ColorTransform::identity(),
+                plain_surface(),
+                Depth::Eight,
+                Backdrop::default(),
+                false,
+                Thresholds::default()
+            )
+            .encode_srgb,
             1
         );
     }
@@ -1542,7 +1669,7 @@ mod tests {
     #[test]
     fn an_extended_range_surface_is_given_light_rather_than_an_encoding() {
         for transform in [ColorTransform::identity(), wide_gamut_transform()] {
-            let uniform = ColourUniform::new(&transform, hdr_surface(), Depth::Eight, Backdrop::default(), false);
+            let uniform = ColourUniform::new(&transform, hdr_surface(), Depth::Eight, Backdrop::default(), false, Thresholds::default());
 
             assert_eq!(uniform.extended_range, 1);
             // Encoding here would apply a transfer function the surface does
@@ -1773,7 +1900,7 @@ mod tests {
         });
         let colour = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
-            contents: bytemuck::bytes_of(&ColourUniform::new(transform, output, depth, backdrop, zebra)),
+            contents: bytemuck::bytes_of(&ColourUniform::new(transform, output, depth, backdrop, zebra, Thresholds::default())),
             usage: wgpu::BufferUsages::UNIFORM,
         });
 
@@ -2083,7 +2210,14 @@ mod tests {
         let curve_sampler = device.create_sampler(&wgpu::SamplerDescriptor::default());
         let colour = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
-            contents: bytemuck::bytes_of(&ColourUniform::new(&transform, output, Depth::Eight, Backdrop::default(), false)),
+            contents: bytemuck::bytes_of(&ColourUniform::new(
+                &transform,
+                output,
+                Depth::Eight,
+                Backdrop::default(),
+                false,
+                Thresholds::default(),
+            )),
             usage: wgpu::BufferUsages::UNIFORM,
         });
 
