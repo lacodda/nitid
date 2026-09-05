@@ -111,3 +111,8 @@ tempfile = "3"
 lto = true
 codegen-units = 1
 strip = true
+
+# Line-table debug info keeps backtraces readable while cutting the .pdb weight
+# that dominates target/debug. Full debug info is a one-line revert when needed.
+[profile.dev]
+debug = 1
