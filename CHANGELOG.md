@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.25.0] - 2026-09-07
+
+### Documentation
+- Describe the eyedropper's magnifier, and the setting that turns it off
+
+### Features
+- The pixels around the pointer, magnified
 ## [0.24.0] - 2026-09-05
 
 ### Documentation
