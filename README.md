@@ -257,7 +257,12 @@ that matter — the numbers the file holds, and what they become on this display
 They differ whenever the image carries a profile the display does not share,
 and a viewer reporting only one of them would be answering a question nobody
 asked. Clicking copies the file's value as hex, because that is the one that
-stays true when the window moves to another monitor.
+stays true when the window moves to another monitor. Above the numbers sit the
+nine-by-nine pixels around the one being read, magnified, with that one marked:
+a single pixel is a number, and its neighbours are what say whether the number
+is the colour of the thing or a speck on it — and, at a zoom where a pixel is
+smaller than the pointer, which pixel is being read at all. The plain swatch is
+still there as a setting, for anyone who wants the panel small.
 
 **The colour passport**, with `K` or by clicking the colour in the status line:
 what the file says its numbers mean, what the display says it can show, and
@@ -413,7 +418,7 @@ has no size limit to hide behind.
 
 ## Status
 
-Early development — v0.24.0 is out. Startup, colour and format coverage hold:
+Early development — v0.25.0 is out. Startup, colour and format coverage hold:
 every modern still format opens, a phone's photographs included, every one of
 them reaches the screen without a wait, and the ones that animate play. The
 process that decodes the heavy formats runs with no network in either
@@ -432,7 +437,8 @@ the file says about itself. **And the picture can be read now**: `H` draws a
 histogram of the file's own values, and holding `Z` puts 100% under the cursor
 for as long as the key is down. **And the colour can be interrogated now**: `C`
 marks what the file clipped, `P` reads the pixel under the pointer in the
-file's terms and the display's, and `K` spells out the path between the two.
+file's terms and the display's — with its neighbours magnified beside it — and
+`K` spells out the path between the two.
 **And it talks to the clipboard**: the picture out with `Ctrl+C`, whatever is
 on the clipboard in with `Ctrl+V`, and the path — quoted for a terminal — with
 `Ctrl+Shift+C`. **And pictures come and go by hand now**: files dropped on the
@@ -474,7 +480,8 @@ in small versions, each one theme; the road to 1.0 is fixed:
 | ✅ v0.23.0 | Drag and drop: files dropped on the window open, `Ctrl` and a drag hands the picture out |
 | ✅ v0.23.1 | The window's own icon, and a shortcut on the desktop |
 | ✅ v0.24.0 | Settings: gestures, chrome, how a picture opens, the colour tools |
-| v0.25.0 – v0.37.0 | The everyday viewer: file operations, culling, comparison, slideshow |
+| ✅ v0.25.0 | The eyedropper's magnifier: the pixels around the pointer, with the one being read marked |
+| v0.26.0 – v0.37.0 | The everyday viewer: a minimap, file operations, culling, comparison, slideshow |
 | v0.39.0 – v0.42.0 | Windows integration: context menu, installer, auto-update, thumbnails |
 | v0.43.0 – v0.44.0 | Documentation site, stabilisation |
 | v1.0.0 | Public release — the default viewer, nothing missing |
@@ -558,7 +565,7 @@ Opening a file opens its folder: the arrow keys walk the images beside it.
 | `I` | what the file says about itself |
 | `H` | what tones the picture is made of |
 | `C` | mark what the file clipped |
-| `P` | read the colour under the pointer; click to copy |
+| `P` | read the colour under the pointer, with the pixels around it magnified; click to copy |
 | `K` | what is happening to this image's colour |
 | `Ctrl+Drag` | drag the picture into another window |
 | `Ctrl+C` | copy the picture |
@@ -583,7 +590,7 @@ dragged while watching what it marks. Four sections:
 | Gestures | what the bare wheel does — zoom or step through the folder — how far one notch zooms, whether the wheel is reversed, whether the middle button toggles fit and 100% |
 | View | when the toolbar and the status line are on screen: on hover, always, or never; and what shows behind transparency when a picture opens |
 | Opening | fit or 100% for a picture that arrives, whether the framing is held across a step, whether the folder wraps at its ends, and the order it is walked in — name, date or size |
-| Colour | where the clipping zebra draws its two lines, the units the eyedropper reads in, and what a click copies |
+| Colour | where the clipping zebra draws its two lines, the units the eyedropper reads in, what a click copies, and whether the eyedropper magnifies the pixels around the pointer |
 
 Ctrl+wheel always performs whichever gesture the bare wheel does not, so both
 are reachable whichever way round the setting is.
