@@ -297,6 +297,13 @@ pub struct Tools {
     pub clip_low: f32,
     pub units: Units,
     pub copies: Copies,
+    /// Whether the eyedropper shows the pixels around the one it reads,
+    /// magnified, or only the one.
+    ///
+    /// On by default: the neighbourhood is what makes a reading trustworthy at
+    /// a zoom where a pixel is smaller than the pointer. The single swatch
+    /// stays as a choice for someone who wants the panel small.
+    pub magnifier: bool,
 }
 
 impl Default for Tools {
@@ -306,6 +313,7 @@ impl Default for Tools {
             clip_low: DEFAULT_CLIP_LOW,
             units: Units::default(),
             copies: Copies::default(),
+            magnifier: true,
         }
     }
 }
@@ -401,6 +409,7 @@ impl Config {
                 "clip_low" => config.tools.clip_low = parse_fraction(value).unwrap_or(DEFAULT_CLIP_LOW),
                 "units" => config.tools.units = Units::parse(value).unwrap_or_default(),
                 "copies" => config.tools.copies = Copies::parse(value).unwrap_or_default(),
+                "magnifier" => config.tools.magnifier = value != "false",
 
                 // Not a key this version knows. It belongs to a build that
                 // wrote the file before or after this one; either way it is
@@ -443,6 +452,7 @@ impl Config {
         out.push_str(&format!("clip_low = {}\n", self.tools.clip_low));
         out.push_str(&format!("units = {}\n", self.tools.units.render()));
         out.push_str(&format!("copies = {}\n", self.tools.copies.render()));
+        out.push_str(&format!("magnifier = {}\n", self.tools.magnifier));
 
         for (key, value) in &self.unknown {
             out.push_str(&format!("{key} = {value}\n"));
@@ -551,10 +561,20 @@ mod tests {
                 clip_low: 0.02,
                 units: Units::Percent,
                 copies: Copies::Channels,
+                magnifier: false,
             },
             unknown: BTreeMap::new(),
         };
         assert_eq!(Config::parse(&config.render()), config);
+    }
+
+    /// The magnifier is on unless the file says otherwise, and only the word
+    /// `false` says otherwise — a typo must not quietly shrink the panel.
+    #[test]
+    fn the_magnifier_is_on_unless_turned_off() {
+        assert!(Config::parse("").tools.magnifier);
+        assert!(!Config::parse("magnifier = false").tools.magnifier);
+        assert!(Config::parse("magnifier = off").tools.magnifier);
     }
 
     /// The defaults have to survive the file too: a viewer that wrote its

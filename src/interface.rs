@@ -19,7 +19,7 @@ use std::path::PathBuf;
 
 use crate::color::Passport;
 use crate::config::{Appearance, Behaviour, Chrome, Config, Copies, Gestures, MAX_ZOOM_STEP, MIN_ZOOM_STEP, Opening, Order, Tools, Units, Wheel};
-use crate::eyedropper::Reading;
+use crate::eyedropper::{NEIGHBOURHOOD_RADIUS, NEIGHBOURHOOD_SIDE, Neighbourhood, Reading};
 use crate::format::Format;
 use crate::gpu::Backdrop;
 use crate::histogram::{BUCKETS, Histogram};
@@ -192,6 +192,9 @@ pub struct Interface {
     /// whichever units it is written in, so nothing else in the digest moves
     /// when the setting does.
     units: Units,
+    /// Whether the eyedropper last drew the pixels around its reading, kept
+    /// in the digest for the same reason as the units.
+    magnifier: bool,
     toasts: Vec<Toast>,
     /// The last thing laid out, kept so an unchanged frame can be skipped.
     last: Option<String>,
@@ -256,6 +259,7 @@ impl Interface {
             chrome: Appearance::default(),
             owed_frame: false,
             units: Units::default(),
+            magnifier: true,
             toasts: Vec::new(),
             last: None,
         }
@@ -402,6 +406,8 @@ impl Interface {
         let status_shown = self.chrome.status_line != Chrome::Never;
         let units = config.tools.units;
         self.units = units;
+        let magnifier = config.tools.magnifier;
+        self.magnifier = magnifier;
         let toasts: Vec<(String, f32)> = self
             .toasts
             .iter()
@@ -431,7 +437,7 @@ impl Interface {
                 histogram_panel(ui, status);
             }
             if status.picking {
-                eyedropper_panel(ui, status, units);
+                eyedropper_panel(ui, status, units, magnifier);
             }
             if let Some(passport) = &status.passport {
                 passport_panel(ui, passport);
@@ -447,6 +453,15 @@ impl Interface {
             }
             toast_stack(ui, &toasts);
         });
+        // A section chosen inside this layout is drawn inconsistently by it:
+        // the list was painted before the click landed, so the old name is
+        // still lit while the new section's controls are already on the
+        // right. The frame that agrees with itself has to be asked for. Found
+        // by a live screenshot after the fix for the cross below — the same
+        // shape of defect, one control over.
+        if section != self.section {
+            self.owed_frame = true;
+        }
         self.section = section;
         // The cross was pressed inside this very layout, so the frame that
         // carried the press still has the dialog in it. Reported alongside an
@@ -499,7 +514,7 @@ impl Interface {
         ) + &format!(
             "|{}|{}|{:?}|{:?}|{:?}",
             status.hovering, self.settings_shown, self.section, self.chrome.toolbar, self.chrome.status_line
-        ) + &format!("|{:?}", self.units)
+        ) + &format!("|{:?}|{}", self.units, self.magnifier)
     }
 
     /// Whether the interface would draw something different from last time.
@@ -905,7 +920,7 @@ fn histogram_panel(ui: &mut egui::Ui, status: &Status) {
     // whole window, which is how the first attempt drew the panel through the
     // status line.
     let free = ui.available_rect_before_wrap();
-    egui::Area::new("histogram".into())
+    area("histogram")
         .fixed_pos(egui::pos2(free.left() + 12.0, free.bottom() - HISTOGRAM_PANEL_HEIGHT - 12.0))
         .interactable(false)
         .show(ui.ctx(), |ui| {
@@ -1042,8 +1057,8 @@ fn band_colour(lit: [bool; 3]) -> egui::Color32 {
 /// chased the cursor would cover the pixel being read, which is the one thing
 /// the person is looking at. It sits under the toolbar's band so the two never
 /// argue over the same strip.
-fn eyedropper_panel(ui: &mut egui::Ui, status: &Status, units: Units) {
-    egui::Area::new("eyedropper".into())
+fn eyedropper_panel(ui: &mut egui::Ui, status: &Status, units: Units, magnifier: bool) {
+    area("eyedropper")
         .fixed_pos(egui::pos2(ui.max_rect().left() + 12.0, ui.max_rect().top() + TOOLBAR_HEIGHT + 12.0))
         .interactable(false)
         .show(ui.ctx(), |ui| {
@@ -1052,7 +1067,7 @@ fn eyedropper_panel(ui: &mut egui::Ui, status: &Status, units: Units) {
                 .inner_margin(egui::Margin::symmetric(12, 10))
                 .corner_radius(6)
                 .show(ui, |ui| {
-                    ui.set_width(200.0);
+                    ui.set_width(EYEDROPPER_WIDTH);
                     let Some(reading) = status.reading else {
                         // Off the picture: said rather than shown as a blank
                         // swatch, which would read as "black".
@@ -1061,15 +1076,25 @@ fn eyedropper_panel(ui: &mut egui::Ui, status: &Status, units: Units) {
                         return;
                     };
 
-                    ui.horizontal(|ui| {
-                        // The colour itself, as the display shows it — a
-                        // swatch drawn in the file's numbers would be a
-                        // different colour from the pixel beside it.
-                        let (rect, _) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::hover());
-                        ui.painter()
-                            .rect_filled(rect, 3.0, egui::Color32::from_rgb(reading.display[0], reading.display[1], reading.display[2]));
+                    if magnifier {
+                        // The pixel and its neighbours, magnified, with the
+                        // one being read marked: the swatch's job done by the
+                        // centre cell, and the question "which pixel is that"
+                        // answered by the cells around it.
+                        neighbourhood(ui, &reading.around);
+                        ui.add_space(6.0);
                         ui.label(egui::RichText::new(reading.hex()).strong().monospace());
-                    });
+                    } else {
+                        ui.horizontal(|ui| {
+                            // The colour itself, as the display shows it — a
+                            // swatch drawn in the file's numbers would be a
+                            // different colour from the pixel beside it.
+                            let (rect, _) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::hover());
+                            ui.painter()
+                                .rect_filled(rect, 3.0, egui::Color32::from_rgb(reading.display[0], reading.display[1], reading.display[2]));
+                            ui.label(egui::RichText::new(reading.hex()).strong().monospace());
+                        });
+                    }
 
                     ui.add_space(4.0);
                     row(ui, "File", &reading.channels(units), true);
@@ -1092,6 +1117,61 @@ fn eyedropper_panel(ui: &mut egui::Ui, status: &Status, units: Units) {
                     ui.label(egui::RichText::new("click to copy").weak().small());
                 });
         });
+}
+
+/// The width of the eyedropper panel's contents, in points.
+///
+/// Wide enough for the neighbourhood with a margin to spare; the same width
+/// with the magnifier off, so turning it off does not make the panel jump.
+const EYEDROPPER_WIDTH: f32 = 200.0;
+
+/// One cell of the neighbourhood, in points. Nine of them fit the panel.
+const NEIGHBOURHOOD_CELL: f32 = 20.0;
+
+const _: () = assert!(
+    NEIGHBOURHOOD_CELL * NEIGHBOURHOOD_SIDE as f32 <= EYEDROPPER_WIDTH,
+    "the neighbourhood is wider than the panel it sits in"
+);
+
+/// The pixels around the reading, magnified, with the one being read marked.
+///
+/// Every cell is painted, including the ones outside the picture, which get
+/// the panel's own dark: a corner pixel's neighbourhood is mostly not there,
+/// and leaving those cells unpainted would let the grid change size as the
+/// pointer nears an edge.
+fn neighbourhood(ui: &mut egui::Ui, around: &Neighbourhood) {
+    let side = NEIGHBOURHOOD_CELL * NEIGHBOURHOOD_SIDE as f32;
+    let (grid, _) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::hover());
+    let painter = ui.painter();
+
+    for row in 0..NEIGHBOURHOOD_SIDE {
+        for column in 0..NEIGHBOURHOOD_SIDE {
+            let cell = egui::Rect::from_min_size(
+                grid.min + egui::vec2(column as f32 * NEIGHBOURHOOD_CELL, row as f32 * NEIGHBOURHOOD_CELL),
+                egui::vec2(NEIGHBOURHOOD_CELL, NEIGHBOURHOOD_CELL),
+            );
+            let colour = match around.cell(column, row) {
+                Some([r, g, b]) => egui::Color32::from_rgb(r, g, b),
+                // Outside the picture: a dark that is not a colour the file
+                // could hold, so it reads as absence rather than as black.
+                None => egui::Color32::from_rgb(28, 31, 37),
+            };
+            painter.rect_filled(cell, 0.0, colour);
+        }
+    }
+
+    // The centre, marked in white inside black so it shows against a light
+    // pixel and a dark one alike. Drawn last so no neighbour paints over it.
+    let centre = egui::Rect::from_min_size(
+        grid.min
+            + egui::vec2(
+                NEIGHBOURHOOD_RADIUS as f32 * NEIGHBOURHOOD_CELL,
+                NEIGHBOURHOOD_RADIUS as f32 * NEIGHBOURHOOD_CELL,
+            ),
+        egui::vec2(NEIGHBOURHOOD_CELL, NEIGHBOURHOOD_CELL),
+    );
+    painter.rect_stroke(centre, 0.0, egui::Stroke::new(1.0, egui::Color32::BLACK), egui::StrokeKind::Outside);
+    painter.rect_stroke(centre, 0.0, egui::Stroke::new(1.5, egui::Color32::WHITE), egui::StrokeKind::Inside);
 }
 
 /// The colour path, spelled out.
@@ -1400,6 +1480,8 @@ fn tools_section(ui: &mut egui::Ui, tools: &mut Tools) -> bool {
     );
     ui.add_space(6.0);
     edited |= choice(ui, "A click copies", &mut tools.copies, &[(Copies::Hex, "hex"), (Copies::Channels, "channels")]);
+    ui.add_space(6.0);
+    edited |= ui.checkbox(&mut tools.magnifier, "Show the pixels around the pointer, magnified").changed();
 
     edited
 }
@@ -1487,7 +1569,7 @@ fn toast_stack(ui: &mut egui::Ui, toasts: &[(String, f32)]) {
         return;
     }
 
-    egui::Area::new("toasts".into())
+    area("toasts")
         .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -52.0))
         .interactable(false)
         .show(ui.ctx(), |ui| {
@@ -1511,7 +1593,7 @@ fn toast_stack(ui: &mut egui::Ui, toasts: &[(String, f32)]) {
 /// aiming at, and the photograph underneath stays visible while it is given.
 fn drop_invitation(ui: &mut egui::Ui) {
     let screen = ui.ctx().viewport_rect();
-    egui::Area::new("drop".into()).fixed_pos(screen.min).interactable(false).show(ui.ctx(), |ui| {
+    area("drop").fixed_pos(screen.min).interactable(false).show(ui.ctx(), |ui| {
         let painter = ui.painter();
         painter.rect_stroke(
             screen.shrink(3.0),
@@ -1520,6 +1602,18 @@ fn drop_invitation(ui: &mut egui::Ui) {
             egui::StrokeKind::Inside,
         );
     });
+}
+
+/// An overlay panel, by name.
+///
+/// With egui's fade-in turned off, like the windows: egui animates a panel's
+/// opacity over a fifth of a second and needs a frame for every step, and this
+/// viewer lays out only when something asks it to. A fading panel stopped
+/// part-transparent until the pointer moved. The owner found it on the settings
+/// window in v0.24.0; the test on the eyedropper's cells found it again here,
+/// on every `Area`, where the fix for the windows had not reached.
+fn area(name: &'static str) -> egui::Area {
+    egui::Area::new(name.into()).fade_in(false)
 }
 
 fn separator(ui: &mut egui::Ui) {
@@ -2106,6 +2200,121 @@ mod tests {
         assert!(copied.is_empty(), "a hidden panel copied {copied:?}");
     }
 
+    /// A reading taken from a real picture through a real conversion, so what
+    /// the panel paints can be told from the file's own numbers: every pixel is
+    /// its own colour, and its display colour is not its file colour.
+    fn converted_reading() -> Reading {
+        let transform = crate::color::ColorTransform::new(&moxcms::ColorProfile::new_display_p3(), &moxcms::ColorProfile::new_srgb());
+        let side = NEIGHBOURHOOD_SIDE as u32;
+        let mut pixels = Vec::new();
+        for y in 0..side {
+            for x in 0..side {
+                pixels.extend_from_slice(&[(200 - x * 10) as u8, (60 + y * 10) as u8, 60, 255]);
+            }
+        }
+        let image = crate::image_source::DecodedImage {
+            width: side,
+            height: side,
+            pixels,
+            depth: Depth::Eight,
+        };
+        let centre = NEIGHBOURHOOD_RADIUS as u32;
+        let reading =
+            crate::eyedropper::read(&image, crate::image_source::Orientation::Normal, &transform, (centre, centre)).expect("the centre is inside the picture");
+        assert!(
+            reading.converted(),
+            "the fixture does not convert, so the test could not tell file from display"
+        );
+        reading
+    }
+
+    /// Every rectangle's fill in one laid-out frame.
+    fn painted_fills(interface: &mut Interface, status: &Status, config: &mut Config) -> Vec<egui::Color32> {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 600.0))),
+            ..Default::default()
+        };
+        let (mut output, _, _) = interface.layout(raw, status, config, Instant::now());
+        output.textures_delta.clear();
+        output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Rect(rect) => Some(rect.fill),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// With the magnifier on, the eyedropper paints every pixel of the
+    /// neighbourhood in the display's colour; with it off, only the one being
+    /// read. A grid computed and never drawn, or drawn in the file's numbers,
+    /// would pass every test in `eyedropper.rs` and show the person nothing.
+    #[test]
+    fn the_eyedropper_paints_the_pixels_around_the_pointer() {
+        let reading = converted_reading();
+        let mut status = status();
+        status.picking = true;
+        status.reading = Some(reading);
+        let mut interface = Interface::new();
+        let mut config = Config::default();
+        assert!(config.tools.magnifier, "the magnifier is meant to be on by default");
+
+        // Settle first: an `Area` places itself on the frame after it measures.
+        painted_fills(&mut interface, &status, &mut config);
+        let fills = painted_fills(&mut interface, &status, &mut config);
+        for row in 0..NEIGHBOURHOOD_SIDE {
+            for column in 0..NEIGHBOURHOOD_SIDE {
+                let [r, g, b] = reading.around.cell(column, row).expect("every cell of a centred reading is inside");
+                assert!(
+                    fills.contains(&egui::Color32::from_rgb(r, g, b)),
+                    "cell ({column}, {row}) of the neighbourhood, {:?}, was not painted",
+                    [r, g, b],
+                );
+            }
+        }
+
+        config.tools.magnifier = false;
+        painted_fills(&mut interface, &status, &mut config);
+        let fills = painted_fills(&mut interface, &status, &mut config);
+        let [r, g, b] = reading.display;
+        assert!(
+            fills.contains(&egui::Color32::from_rgb(r, g, b)),
+            "with the magnifier off the swatch was not painted"
+        );
+        for row in 0..NEIGHBOURHOOD_SIDE {
+            for column in 0..NEIGHBOURHOOD_SIDE {
+                if (column, row) == (NEIGHBOURHOOD_RADIUS, NEIGHBOURHOOD_RADIUS) {
+                    continue;
+                }
+                let [r, g, b] = reading.around.cell(column, row).expect("inside");
+                assert!(
+                    !fills.contains(&egui::Color32::from_rgb(r, g, b)),
+                    "with the magnifier off, neighbour ({column}, {row}) was still painted",
+                );
+            }
+        }
+    }
+
+    /// Turning the magnifier on or off is a change worth a frame: nothing else
+    /// in the status moves when the setting does.
+    #[test]
+    fn switching_the_magnifier_is_a_change() {
+        let mut status = status();
+        status.picking = true;
+        status.reading = Some(converted_reading());
+        let mut interface = Interface::new();
+        let mut config = Config::default();
+
+        painted_fills(&mut interface, &status, &mut config);
+        interface.changed(&status);
+        assert!(!interface.changed(&status), "an unchanged panel asked for a frame");
+
+        config.tools.magnifier = false;
+        painted_fills(&mut interface, &status, &mut config);
+        assert!(interface.changed(&status), "turning the magnifier off went unnoticed");
+    }
+
     /// The panel opening and closing is a change worth drawing.
     #[test]
     fn opening_the_panel_is_a_change() {
@@ -2246,7 +2455,7 @@ mod tests {
     /// line are painted at 220 in the same frame and drown the window out.
     #[test]
     fn a_window_is_opaque_on_the_frame_it_appears() {
-        let painted = |shown: fn(&mut Interface), name: &str| {
+        let painted = |shown: fn(&mut Interface), status: Status, name: &str| {
             let mut interface = Interface::new();
             shown(&mut interface);
             let mut config = Config::default();
@@ -2256,7 +2465,7 @@ mod tests {
                     screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 600.0))),
                     ..Default::default()
                 };
-                let (mut output, _, _) = interface.layout(raw, &status(), &mut config, Instant::now());
+                let (mut output, _, _) = interface.layout(raw, &status, &mut config, Instant::now());
                 output.textures_delta.clear();
                 // How much colour the frame carries altogether. A window
                 // drawn at a fraction of its opacity contributes less of it.
@@ -2286,8 +2495,22 @@ mod tests {
             );
         };
 
-        painted(Interface::toggle_settings, "settings");
-        painted(Interface::toggle_keys, "keys");
+        painted(Interface::toggle_settings, status(), "settings");
+        painted(Interface::toggle_keys, status(), "keys");
+
+        // The overlay panels are `Area`s rather than `Window`s, and egui fades
+        // those in too. The fix for the windows in v0.24.0 did not reach them,
+        // and the eyedropper's cells were the first thing measured closely
+        // enough to show it: the frame they appeared on carried a quarter of
+        // their colour.
+        let mut counted = status();
+        counted.histogram = Some(counted_histogram());
+        painted(Interface::toggle_histogram, counted, "histogram");
+
+        let mut picking = status();
+        picking.picking = true;
+        picking.reading = Some(converted_reading());
+        painted(|_| {}, picking, "eyedropper");
     }
 
     /// Pressing the cross leaves a frame owed.
@@ -2324,10 +2547,15 @@ mod tests {
     }
 
     /// Every section of the dialog is reachable by clicking its name, and
-    /// picking one is a change the viewer would redraw for.
+    /// picking one leaves a frame owed.
     ///
     /// The list down the left is the only way between sections, so a section
-    /// whose name does not select it is a section nobody can open.
+    /// whose name does not select it is a section nobody can open. And the
+    /// frame that carries the click is painted half-way: the list was drawn
+    /// before the click landed and still lights the old name, while the new
+    /// section's controls are already on the right. A live screenshot showed
+    /// exactly that, stuck until the pointer moved; the frame that agrees with
+    /// itself has to be asked for.
     #[test]
     fn every_section_can_be_reached_from_the_list() {
         let mut interface = Interface::new();
@@ -2335,14 +2563,24 @@ mod tests {
         let mut config = Config::default();
         settings_frame(&mut interface, &mut config, None);
         settings_frame(&mut interface, &mut config, None);
+        // Any debt from opening is not what this is measuring.
+        interface.take_owed_frame();
 
         let mut seen = std::collections::BTreeSet::new();
         // The list sits at the left of a window centred in 900x600.
         for y in (120..300).step_by(2) {
             for x in (230..340).step_by(4) {
+                let before = interface.section;
                 settings_frame(&mut interface, &mut config, Some(egui::pos2(x as f32, y as f32)));
                 seen.insert(format!("{:?}", interface.section));
-                interface.take_owed_frame();
+                let owed = interface.take_owed_frame();
+                if interface.section != before {
+                    assert!(
+                        owed,
+                        "choosing {:?} in the list did not ask for the frame that lights it, so the old name would stay lit until something else woke the loop",
+                        interface.section,
+                    );
+                }
             }
         }
 

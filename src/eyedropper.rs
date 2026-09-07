@@ -11,6 +11,12 @@
 //! The file's value is the one that goes to the clipboard, for the same reason
 //! the histogram counts the file (ADR 0019): it is a fact about the picture,
 //! and it does not change when the window moves to another monitor.
+//!
+//! A reading also carries the pixels around the one under the pointer. One
+//! pixel is a number; its neighbourhood is what tells whether the number is
+//! the colour of the thing or a speck of noise on it, and at a zoom where
+//! pixels are smaller than the pointer it is the only way to see which one is
+//! being read at all.
 
 use crate::color::ColorTransform;
 use crate::config::{Copies, Units};
@@ -19,6 +25,49 @@ use crate::image_source::{DecodedImage, Depth, Orientation};
 /// One eight-bit channel as a percentage of full scale.
 fn percent(value: u8) -> f32 {
     f32::from(value) / 255.0 * 100.0
+}
+
+/// How far the neighbourhood reaches from the pixel under the pointer, in
+/// pixels of the picture, on each side.
+///
+/// Four: nine across is enough to see a texture and to tell an edge from a
+/// speck, and at twenty points a cell it fits the panel the eyedropper already
+/// has. A wider reach would want smaller cells, and a cell smaller than the
+/// pointer's own tip is the problem the neighbourhood exists to solve.
+pub const NEIGHBOURHOOD_RADIUS: usize = 4;
+
+/// Pixels along one side of the neighbourhood.
+pub const NEIGHBOURHOOD_SIDE: usize = NEIGHBOURHOOD_RADIUS * 2 + 1;
+
+/// The pixels around the one being read, as the display shows them.
+///
+/// Display values rather than the file's, for the reason the swatch beside the
+/// hex is drawn in display values: these cells sit next to the picture, and a
+/// cell painted in the file's numbers would be a different colour from the
+/// pixel it claims to magnify. The numbers a person copies are the centre's,
+/// and those stay the file's.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Neighbourhood {
+    /// Row-major, `NEIGHBOURHOOD_SIDE` to a row. `None` where the cell falls
+    /// outside the picture.
+    cells: [Option<[u8; 3]>; NEIGHBOURHOOD_SIDE * NEIGHBOURHOOD_SIDE],
+}
+
+impl Neighbourhood {
+    /// A neighbourhood with nothing in it, for a reading that has no picture
+    /// around it.
+    pub const fn empty() -> Self {
+        Self {
+            cells: [None; NEIGHBOURHOOD_SIDE * NEIGHBOURHOOD_SIDE],
+        }
+    }
+
+    /// The cell at `column`, `row`, counted from the top-left of the
+    /// neighbourhood; the centre is at `(NEIGHBOURHOOD_RADIUS,
+    /// NEIGHBOURHOOD_RADIUS)`.
+    pub fn cell(&self, column: usize, row: usize) -> Option<[u8; 3]> {
+        self.cells.get(row * NEIGHBOURHOOD_SIDE + column).copied().flatten()
+    }
 }
 
 /// One pixel, in both the terms that matter.
@@ -46,6 +95,8 @@ pub struct Reading {
     pub raw: [u16; 3],
     /// The depth those raw values are in.
     pub depth: Depth,
+    /// The pixels around this one, as the display shows them.
+    pub around: Neighbourhood,
 }
 
 impl Reading {
@@ -97,28 +148,7 @@ impl Reading {
 /// in the image as stored.
 pub fn read(image: &DecodedImage, orientation: Orientation, transform: &ColorTransform, at: (u32, u32)) -> Option<Reading> {
     let shown = shown_size(image, orientation);
-    if at.0 >= shown.0 || at.1 >= shown.1 {
-        return None;
-    }
-
-    let stored = to_stored(at, shown, orientation);
-    let index = (stored.1 as usize) * (image.width as usize) + (stored.0 as usize);
-
-    let (raw, alpha) = match image.depth {
-        Depth::Eight => {
-            let offset = index * 4;
-            let bytes = image.pixels.get(offset..offset + 4)?;
-            ([u16::from(bytes[0]), u16::from(bytes[1]), u16::from(bytes[2])], bytes[3])
-        }
-        Depth::Sixteen => {
-            let offset = index * 8;
-            let bytes = image.pixels.get(offset..offset + 8)?;
-            let sample = |channel: usize| u16::from_ne_bytes([bytes[channel * 2], bytes[channel * 2 + 1]]);
-            // Alpha is reported at eight bits like the rest of the display
-            // values; the full-depth channels are in `raw`.
-            ((sample(0), sample(1), sample(2)).into(), (sample(3) >> 8) as u8)
-        }
-    };
+    let (raw, alpha) = sample(image, orientation, shown, at)?;
 
     let file = [to_eight(raw[0], image.depth), to_eight(raw[1], image.depth), to_eight(raw[2], image.depth)];
     let display = through(transform, raw, image.depth);
@@ -130,7 +160,60 @@ pub fn read(image: &DecodedImage, orientation: Orientation, transform: &ColorTra
         alpha,
         raw,
         depth: image.depth,
+        around: neighbourhood(image, orientation, transform, shown, at),
     })
+}
+
+/// The pixels around `at`, each read the way the centre is.
+///
+/// In the picture's oriented coordinates, like `at` itself: the cell to the
+/// right of the centre is the pixel drawn to the right of the one under the
+/// pointer, whatever turn the file or the person asked for. A neighbourhood
+/// laid out in stored coordinates would come out turned against the picture
+/// it sits beside on every rotated photograph.
+fn neighbourhood(image: &DecodedImage, orientation: Orientation, transform: &ColorTransform, shown: (u32, u32), at: (u32, u32)) -> Neighbourhood {
+    let mut around = Neighbourhood::empty();
+    let radius = NEIGHBOURHOOD_RADIUS as i64;
+    for row in 0..NEIGHBOURHOOD_SIDE {
+        for column in 0..NEIGHBOURHOOD_SIDE {
+            let x = i64::from(at.0) + column as i64 - radius;
+            let y = i64::from(at.1) + row as i64 - radius;
+            // Left of or above the picture. `sample` answers for the other two
+            // edges, so this is the only bound to check here.
+            let (Ok(x), Ok(y)) = (u32::try_from(x), u32::try_from(y)) else {
+                continue;
+            };
+            around.cells[row * NEIGHBOURHOOD_SIDE + column] = sample(image, orientation, shown, (x, y)).map(|(raw, _)| through(transform, raw, image.depth));
+        }
+    }
+    around
+}
+
+/// The stored channels and alpha of the pixel shown at `at`, or `None` when
+/// `at` is outside the picture as shown.
+fn sample(image: &DecodedImage, orientation: Orientation, shown: (u32, u32), at: (u32, u32)) -> Option<([u16; 3], u8)> {
+    if at.0 >= shown.0 || at.1 >= shown.1 {
+        return None;
+    }
+
+    let stored = to_stored(at, shown, orientation);
+    let index = (stored.1 as usize) * (image.width as usize) + (stored.0 as usize);
+
+    match image.depth {
+        Depth::Eight => {
+            let offset = index * 4;
+            let bytes = image.pixels.get(offset..offset + 4)?;
+            Some(([u16::from(bytes[0]), u16::from(bytes[1]), u16::from(bytes[2])], bytes[3]))
+        }
+        Depth::Sixteen => {
+            let offset = index * 8;
+            let bytes = image.pixels.get(offset..offset + 8)?;
+            let sample = |channel: usize| u16::from_ne_bytes([bytes[channel * 2], bytes[channel * 2 + 1]]);
+            // Alpha is reported at eight bits like the rest of the display
+            // values; the full-depth channels are in `raw`.
+            Some(((sample(0), sample(1), sample(2)).into(), (sample(3) >> 8) as u8))
+        }
+    }
 }
 
 /// The picture's size as shown, which is the stored size with the axes
@@ -535,6 +618,7 @@ mod tests {
             alpha: 255,
             raw: [100, 100, 100],
             depth: Depth::Eight,
+            around: Neighbourhood::empty(),
         };
         assert!(!reading.converted(), "a rounding step was reported as a conversion");
     }
@@ -544,5 +628,153 @@ mod tests {
         // The header claims more pixels than the buffer holds.
         let image = image(4, 4, vec![0; 8]);
         assert_eq!(read(&image, Orientation::Normal, &ColorTransform::identity(), (3, 3)), None);
+    }
+
+    /// A picture large enough to hold a whole neighbourhood, with every pixel
+    /// its own colour so a cell taken from the wrong place cannot pass.
+    fn graded(width: u32, height: u32) -> DecodedImage {
+        let mut pixels = Vec::new();
+        for y in 0..height {
+            for x in 0..width {
+                pixels.extend_from_slice(&[(x * 20) as u8, (y * 20) as u8, 7, 255]);
+            }
+        }
+        image(width, height, pixels)
+    }
+
+    /// The neighbourhood is centred on the pixel read, and each cell is the
+    /// pixel at that offset from it.
+    #[test]
+    fn the_neighbourhood_is_centred_on_the_pixel_read() {
+        let image = graded(12, 12);
+        let reading = read(&image, Orientation::Normal, &ColorTransform::identity(), (5, 6)).expect("inside the image");
+
+        assert_eq!(
+            reading.around.cell(NEIGHBOURHOOD_RADIUS, NEIGHBOURHOOD_RADIUS),
+            Some(reading.display),
+            "the centre of the neighbourhood is not the pixel read"
+        );
+        // One to the right is x + 1, one up is y - 1: the cells follow the
+        // picture's axes, not some other order.
+        assert_eq!(reading.around.cell(NEIGHBOURHOOD_RADIUS + 1, NEIGHBOURHOOD_RADIUS), Some([120, 120, 7]));
+        assert_eq!(reading.around.cell(NEIGHBOURHOOD_RADIUS, NEIGHBOURHOOD_RADIUS - 1), Some([100, 100, 7]));
+        assert_eq!(reading.around.cell(0, 0), Some([20, 40, 7]), "the corner is not four pixels up and left");
+
+        // Every cell is inside a picture this large.
+        for row in 0..NEIGHBOURHOOD_SIDE {
+            for column in 0..NEIGHBOURHOOD_SIDE {
+                assert!(
+                    reading.around.cell(column, row).is_some(),
+                    "cell ({column}, {row}) is missing inside the picture"
+                );
+            }
+        }
+    }
+
+    /// Cells that fall outside the picture are empty rather than clamped to
+    /// the edge or wrapped to the far side — a corner pixel has neighbours on
+    /// two sides only, and the panel should show that.
+    #[test]
+    fn the_neighbourhood_stops_at_the_edge_of_the_picture() {
+        let image = graded(12, 12);
+        let transform = ColorTransform::identity();
+
+        let corner = read(&image, Orientation::Normal, &transform, (0, 0)).expect("inside the image");
+        for row in 0..NEIGHBOURHOOD_SIDE {
+            for column in 0..NEIGHBOURHOOD_SIDE {
+                let inside = column >= NEIGHBOURHOOD_RADIUS && row >= NEIGHBOURHOOD_RADIUS;
+                assert_eq!(
+                    corner.around.cell(column, row).is_some(),
+                    inside,
+                    "at the top-left corner, cell ({column}, {row}) should {} be there",
+                    if inside { "" } else { "not" },
+                );
+            }
+        }
+
+        let far = read(&image, Orientation::Normal, &transform, (11, 11)).expect("inside the image");
+        for row in 0..NEIGHBOURHOOD_SIDE {
+            for column in 0..NEIGHBOURHOOD_SIDE {
+                let inside = column <= NEIGHBOURHOOD_RADIUS && row <= NEIGHBOURHOOD_RADIUS;
+                assert_eq!(
+                    far.around.cell(column, row).is_some(),
+                    inside,
+                    "at the bottom-right corner, cell ({column}, {row}) should {} be there",
+                    if inside { "" } else { "not" },
+                );
+            }
+        }
+    }
+
+    /// The neighbourhood is laid out in the picture's oriented coordinates: the
+    /// cell to the right of the centre is the pixel drawn to the right of the
+    /// one under the pointer, on a turned picture as on an upright one.
+    ///
+    /// Checked against `read` at the neighbouring position, whose orientation
+    /// handling has its own independent check above — so this cannot pass by
+    /// building the neighbourhood in stored coordinates, which would agree
+    /// with itself and disagree with the picture on every quarter turn.
+    #[test]
+    fn the_neighbourhood_follows_the_orientation_of_the_picture() {
+        const EVERY: [Orientation; 8] = [
+            Orientation::Normal,
+            Orientation::FlipHorizontal,
+            Orientation::Rotate180,
+            Orientation::FlipVertical,
+            Orientation::Transpose,
+            Orientation::Rotate90,
+            Orientation::Transverse,
+            Orientation::Rotate270,
+        ];
+        // Not square, so the axes cannot be exchanged unnoticed.
+        let image = graded(5, 3);
+        let transform = ColorTransform::identity();
+
+        for orientation in EVERY {
+            let shown = shown_size(&image, orientation);
+            for y in 0..shown.1 {
+                for x in 0..shown.0 {
+                    let reading = read(&image, orientation, &transform, (x, y)).expect("inside the picture");
+                    for dy in -1i64..=1 {
+                        for dx in -1i64..=1 {
+                            let neighbour = (i64::from(x) + dx, i64::from(y) + dy);
+                            let expected = match (u32::try_from(neighbour.0), u32::try_from(neighbour.1)) {
+                                (Ok(nx), Ok(ny)) => read(&image, orientation, &transform, (nx, ny)).map(|r| r.display),
+                                _ => None,
+                            };
+                            let column = (NEIGHBOURHOOD_RADIUS as i64 + dx) as usize;
+                            let row = (NEIGHBOURHOOD_RADIUS as i64 + dy) as usize;
+                            assert_eq!(
+                                reading.around.cell(column, row),
+                                expected,
+                                "{orientation:?}: at ({x}, {y}) the cell ({dx:+}, {dy:+}) away is not the pixel shown there",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The cells are what the display shows, like the swatch, and unlike the
+    /// numbers: a cell in the file's values would sit beside the picture in a
+    /// different colour from the pixel it magnifies.
+    #[test]
+    fn the_neighbourhood_is_drawn_in_the_displays_terms() {
+        let transform = ColorTransform::new(&moxcms::ColorProfile::new_display_p3(), &moxcms::ColorProfile::new_srgb());
+        let image = image(1, 1, vec![200, 60, 60, 255]);
+        let reading = read(&image, Orientation::Normal, &transform, (0, 0)).expect("inside the image");
+
+        assert!(reading.converted(), "the fixture does not convert, so this test could not tell the two apart");
+        assert_eq!(
+            reading.around.cell(NEIGHBOURHOOD_RADIUS, NEIGHBOURHOOD_RADIUS),
+            Some(reading.display),
+            "the centre cell is not the display's colour"
+        );
+        assert_ne!(
+            reading.around.cell(NEIGHBOURHOOD_RADIUS, NEIGHBOURHOOD_RADIUS),
+            Some(reading.file),
+            "the centre cell is the file's colour, not the display's"
+        );
     }
 }
