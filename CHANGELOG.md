@@ -2,6 +2,11 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.27.1] - 2026-09-09
+
+### Bug Fixes
+- Draw the arrow instead of a box
+- Open a panel on the first click, not on the next move
 ## [0.27.0] - 2026-09-09
 
 ### Bug Fixes

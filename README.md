@@ -475,7 +475,7 @@ has no size limit to hide behind.
 
 ## Status
 
-Early development — v0.27.0 is out. Startup, colour and format coverage hold:
+Early development — v0.27.1 is out. Startup, colour and format coverage hold:
 every modern still format opens, a phone's photographs included, every one of
 them reaches the screen without a wait, and the ones that animate play. The
 process that decodes the heavy formats runs with no network in either
@@ -547,6 +547,7 @@ one theme; the road to 1.0 is fixed:
 | ✅ v0.25.0 | The eyedropper's magnifier: the pixels around the pointer, with the one being read marked |
 | ✅ v0.26.0 | The minimap: where in the picture the window is, once part of it is off screen |
 | ✅ v0.27.0 | File operations: the recycle bin, renaming, and nine folders to sort into |
+| ✅ v0.27.1 | A panel opens on the first click, and messages draw their arrows |
 | v0.28.0 – v0.37.0 | The everyday viewer: an external editor, culling, comparison, slideshow |
 | v0.39.0 – v0.42.0 | Windows integration: context menu, installer, auto-update, thumbnails |
 | v0.43.0 – v0.44.0 | Documentation site, stabilisation |
