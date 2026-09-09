@@ -152,6 +152,54 @@ impl Folder {
         self.jump(self.entries.len() - 1)
     }
 
+    /// Take the current file out of the listing, because it is not there any
+    /// more, and say what to show instead.
+    ///
+    /// The **next** picture, not the previous one: going through a folder
+    /// deleting as you go should carry on forwards, and landing on the frame
+    /// you just judged would mean judging it twice. At the end of the folder
+    /// there is no next one, so the cursor steps back onto what is now the
+    /// last picture.
+    ///
+    /// `None` when the folder is empty afterwards — the viewer keeps showing
+    /// what is on screen, which is a picture of a file that is gone rather
+    /// than a blank window, and says so in a message.
+    ///
+    /// This does not rescan. The listing was taken when the folder opened and
+    /// a rescan here would pull in every file that has appeared since, which
+    /// is a different folder from the one being worked through.
+    pub fn remove_current(&mut self) -> Option<&Path> {
+        if self.entries.len() <= 1 {
+            self.entries.clear();
+            self.current = 0;
+            return None;
+        }
+
+        self.entries.remove(self.current);
+        // The removal already moved the next picture into this index; only at
+        // the very end is there nothing there to move.
+        if self.current >= self.entries.len() {
+            self.current = self.entries.len() - 1;
+        }
+        Some(&self.entries[self.current])
+    }
+
+    /// The current file is still here, under another name or in another place.
+    ///
+    /// A rename keeps the cursor where it is: the picture on screen has not
+    /// changed, only what it is called. A move takes the file out of this
+    /// folder, which is [`remove_current`](Self::remove_current) instead.
+    ///
+    /// The listing keeps its order rather than being re-sorted around the new
+    /// name. Re-sorting would move the picture on screen to somewhere else in
+    /// the folder mid-session, so the next arrow key would land somewhere the
+    /// person did not expect; the order is settled when the folder opens.
+    pub fn rename_current(&mut self, path: PathBuf) {
+        if let Some(entry) = self.entries.get_mut(self.current) {
+            *entry = path;
+        }
+    }
+
     fn step(&mut self, delta: isize) -> Option<&Path> {
         let len = self.entries.len();
         if len < 2 {
@@ -357,6 +405,82 @@ mod tests {
         assert_eq!(folder.len(), 1);
         assert!(folder.next().is_none());
         assert!(folder.previous().is_none());
+    }
+
+    /// Deleting carries on forwards: the next picture, not the one already
+    /// judged. Going through a folder culling as you go must not put the
+    /// frame you just threw away's neighbour behind you.
+    #[test]
+    fn removing_the_current_file_lands_on_the_next_one() {
+        let (dir, _) = folder_with(&["a.png", "b.png", "c.png"]);
+        let mut folder = Folder::open(&dir.path().join("b.png"), Order::Name, true).unwrap();
+
+        let landed = folder.remove_current().expect("nothing to show").to_path_buf();
+        assert_eq!(landed.file_name().unwrap(), "c.png");
+        assert_eq!(folder.len(), 2);
+        assert_eq!(folder.current().file_name().unwrap(), "c.png");
+    }
+
+    /// At the end there is no next one, so the cursor steps back onto what is
+    /// now the last picture rather than off the end of the listing.
+    #[test]
+    fn removing_the_last_file_steps_back() {
+        let (dir, _) = folder_with(&["a.png", "b.png"]);
+        let mut folder = Folder::open(&dir.path().join("b.png"), Order::Name, true).unwrap();
+
+        let landed = folder.remove_current().expect("nothing to show").to_path_buf();
+        assert_eq!(landed.file_name().unwrap(), "a.png");
+        assert_eq!(folder.position(), 0);
+        assert_eq!(folder.len(), 1);
+    }
+
+    /// The last picture of the folder leaves nothing to show, and that is
+    /// said rather than answered with a picture that is not there.
+    #[test]
+    fn removing_the_only_file_leaves_nothing() {
+        let (dir, _) = folder_with(&["only.png"]);
+        let mut folder = Folder::open(&dir.path().join("only.png"), Order::Name, true).unwrap();
+
+        assert!(folder.remove_current().is_none());
+        assert_eq!(folder.len(), 0);
+    }
+
+    /// Removing repeatedly walks the folder to its end without ever naming a
+    /// file that has been taken out — the sequence a person culling a whole
+    /// folder actually performs.
+    #[test]
+    fn removing_repeatedly_never_names_a_file_that_is_gone() {
+        let (dir, _) = folder_with(&["a.png", "b.png", "c.png"]);
+        let mut folder = Folder::open(&dir.path().join("a.png"), Order::Name, true).unwrap();
+
+        let mut removed = Vec::new();
+        loop {
+            removed.push(folder.current().to_path_buf());
+            let Some(landed) = folder.remove_current().map(Path::to_path_buf) else {
+                break;
+            };
+            assert!(!removed.contains(&landed), "landed back on {} after removing it", landed.display());
+        }
+        assert_eq!(removed.len(), 3, "the walk did not cover the folder: {removed:?}");
+        assert_eq!(folder.len(), 0);
+    }
+
+    /// A rename keeps the cursor on the same picture: it is the same picture,
+    /// and only its name changed.
+    #[test]
+    fn renaming_keeps_the_cursor_on_the_picture() {
+        let (dir, _) = folder_with(&["a.png", "b.png", "c.png"]);
+        let mut folder = Folder::open(&dir.path().join("b.png"), Order::Name, true).unwrap();
+
+        let renamed = dir.path().join("zzz.png");
+        folder.rename_current(renamed.clone());
+
+        assert_eq!(folder.current(), renamed, "the cursor left the picture");
+        assert_eq!(folder.position(), 1, "the listing was re-sorted around the new name");
+        assert_eq!(folder.len(), 3);
+        // And stepping still goes where the order says, not where the name
+        // would put it if the listing had been sorted again.
+        assert_eq!(folder.next().unwrap().file_name().unwrap(), "c.png");
     }
 
     #[test]

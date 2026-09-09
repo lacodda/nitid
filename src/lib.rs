@@ -19,6 +19,7 @@ mod config;
 mod console;
 mod drag;
 mod eyedropper;
+mod files;
 mod folder;
 mod format;
 mod gpu;

@@ -350,6 +350,12 @@ impl App {
     /// here blocks on a full decode, so the window keeps answering the user
     /// while a 60-megapixel photo is still being unpacked.
     fn show(&mut self, path: &Path) {
+        // The name box belongs to the file whose name is in it. The picture
+        // can change under it without a key being pressed — the toolbar, the
+        // wheel, a dropped file — and a box left standing would put that name
+        // on whatever arrived instead.
+        self.interface.cancel_rename();
+
         match self.loader.request(path) {
             // Prefetched: the neighbour the arrow key asked for is already in
             // memory, so it goes up in this frame with no intermediate.
@@ -826,6 +832,13 @@ impl App {
             Key::Named(NamedKey::Home) => self.navigate(Step::First),
             Key::Named(NamedKey::End) => self.navigate(Step::Last),
             Key::Named(NamedKey::F11) => self.toggle_fullscreen(),
+            // To the recycle bin, and on to the next picture. Undoable from
+            // the bin and from Explorer's own undo, which is what lets this
+            // go without a confirmation on every frame.
+            Key::Named(NamedKey::Delete) => self.recycle_current(),
+            // The name box opens with the name in it, selected — F2 means
+            // "change this name", and typing should replace it.
+            Key::Named(NamedKey::F2) => self.begin_rename(),
             Key::Character(character) => match character.as_str() {
                 "+" | "=" => self.zoom(1.0),
                 "-" | "_" => self.zoom(-1.0),
@@ -1082,6 +1095,145 @@ impl App {
             Some(Chord::Paste) => self.paste_picture(),
             None => {}
         }
+    }
+
+    /// Send the file on screen to the recycle bin and move on.
+    ///
+    /// The bin, never oblivion — see the `files` module. Nothing is asked
+    /// first: the operation is undoable both from the bin and from Explorer's
+    /// own undo, and a confirmation on every frame is what makes people stop
+    /// culling in a viewer and go back to a file manager.
+    fn recycle_current(&mut self) {
+        let Some(path) = self.file_on_screen() else {
+            return;
+        };
+
+        match crate::files::recycle(&path) {
+            Ok(_) => {
+                let name = name_of(&path);
+                self.after_removal();
+                self.interface.toast(format!("{name} → recycle bin"), Instant::now());
+            }
+            Err(error) => self.report(error),
+        }
+        self.request_redraw();
+    }
+
+    /// Put the file on screen into the folder bound to a digit key.
+    ///
+    /// A move takes it out of this folder, so the viewer steps on the way a
+    /// delete does; a copy leaves it where it is and the picture stays.
+    fn sort_current(&mut self, digit: usize, copy: bool) {
+        let Some(folder) = self.config.sorting.folder(digit).map(Path::to_path_buf) else {
+            // Said rather than ignored: a key that does nothing silently is a
+            // key the person presses again, harder.
+            self.interface.toast(format!("no folder set for {digit}"), Instant::now());
+            self.request_redraw();
+            return;
+        };
+        let Some(path) = self.file_on_screen() else {
+            return;
+        };
+
+        let name = name_of(&path);
+        let destination = folder_name(&folder);
+        let outcome = match copy {
+            true => crate::files::copy_to(&path, &folder),
+            false => crate::files::move_to(&path, &folder),
+        };
+
+        match outcome {
+            Ok(crate::files::Outcome::Copied(_)) => {
+                self.interface.toast(format!("{name} copied to {destination}"), Instant::now());
+            }
+            Ok(_) => {
+                self.after_removal();
+                self.interface.toast(format!("{name} → {destination}"), Instant::now());
+            }
+            Err(error) => self.report(error),
+        }
+        self.request_redraw();
+    }
+
+    /// Open the name box on the file on screen.
+    fn begin_rename(&mut self) {
+        let Some(path) = self.file_on_screen() else {
+            return;
+        };
+        self.interface.begin_rename(&name_of(&path));
+        self.request_redraw();
+    }
+
+    /// Give the file on screen the name that was typed.
+    fn rename_current(&mut self, name: String) {
+        let Some(path) = self.file_on_screen() else {
+            return;
+        };
+
+        match crate::files::rename(&path, &name) {
+            Ok(crate::files::Outcome::At(renamed)) => {
+                // The same picture under another name: the cursor stays on it
+                // and nothing is reloaded — the pixels have not changed.
+                if let Some(folder) = self.folder.as_mut() {
+                    folder.rename_current(renamed.clone());
+                }
+                if let Some(shown) = self.shown.as_mut() {
+                    shown.path = renamed.clone();
+                }
+                self.set_title();
+                self.interface.toast(format!("renamed to {}", name_of(&renamed)), Instant::now());
+            }
+            Ok(_) => {}
+            Err(error) => self.report(error),
+        }
+        self.request_redraw();
+    }
+
+    /// The file the picture on screen came from, or `None` when there is not
+    /// one to act on.
+    ///
+    /// A pasted picture has no file behind it, so there is nothing to delete,
+    /// rename or sort — said in a message rather than ignored, because the key
+    /// did nothing and the reason is not on screen.
+    fn file_on_screen(&mut self) -> Option<PathBuf> {
+        let shown = self.shown.as_ref()?;
+        if shown.pasted {
+            self.interface.toast("this picture is not a file", Instant::now());
+            self.request_redraw();
+            return None;
+        }
+        Some(shown.path.clone())
+    }
+
+    /// Show something else, the file on screen having left the folder.
+    ///
+    /// The next picture, or — at the end of the folder — the one before it.
+    /// With nothing left the window keeps what it is showing: a blank window
+    /// is a worse answer than the last picture of a folder that is now empty,
+    /// and the message already says what happened.
+    fn after_removal(&mut self) {
+        let next = self.folder.as_mut().and_then(|folder| folder.remove_current().map(Path::to_path_buf));
+        match next {
+            Some(path) => self.show(&path),
+            None => {
+                // The listing is empty, so stepping has nowhere to go. The
+                // title still names the file that was there, which is now
+                // wrong, so it is rewritten from what is left.
+                self.set_title();
+            }
+        }
+    }
+
+    /// Report a failed file operation to the person, and to the terminal.
+    ///
+    /// The message says what went wrong rather than "failed": these operations
+    /// fail for reasons a person can act on — a file open elsewhere, a
+    /// read-only volume, a folder that cannot be made.
+    fn report(&mut self, error: anyhow::Error) {
+        eprintln!("nitid: {error:#}");
+        // The outermost context, which is the sentence written for this
+        // situation; the chain below it is for the terminal.
+        self.interface.toast(format!("{error}"), Instant::now());
     }
 
     /// Put the picture on the clipboard.
@@ -1645,6 +1797,12 @@ impl App {
         if edited {
             self.settings_changed();
         }
+        // A name the box committed during that layout, for the same reason
+        // and in the same place: renaming touches the folder and the
+        // interface, both of which are borrowed above.
+        if let Some(name) = self.interface.take_rename() {
+            self.rename_current(name);
+        }
         // Something inside the layout changed what the next frame shows —
         // the dialog's close button, which is pressed in the frame that still
         // draws the dialog.
@@ -1844,6 +2002,53 @@ fn chord_for(key: &Key) -> Option<Chord> {
         "C" => Some(Chord::CopyPath),
         "c" => Some(Chord::CopyPicture),
         "v" | "V" => Some(Chord::Paste),
+        _ => None,
+    }
+}
+
+/// A file's name on its own, for a message. Falls back to the whole path,
+/// which is better than an empty message.
+fn name_of(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// What to call a destination folder in a message: its own name, not the whole
+/// path — the message is a confirmation, and a full path turns a glance into
+/// reading.
+fn folder_name(folder: &Path) -> String {
+    folder
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| folder.display().to_string())
+}
+
+/// Which sorting folder a key names: 1 through 9, or `None` for anything else.
+///
+/// Read from the **physical** key rather than the character it produces.
+/// `Ctrl+Shift+1` does not deliver "1" — it delivers whatever that key makes
+/// with Shift held, which is "!" on a US layout, a different symbol on others,
+/// and something else again on a Cyrillic one. The digit row is the digit row
+/// on every layout, so that is what is asked.
+fn sorting_digit(key: &winit::keyboard::PhysicalKey) -> Option<usize> {
+    use winit::keyboard::{KeyCode, PhysicalKey};
+
+    let PhysicalKey::Code(code) = key else {
+        return None;
+    };
+    // The number pad answers too: someone sorting with one hand is using it.
+    // `0` is not here — it belongs to the view, and no folder is bound to it.
+    match code {
+        KeyCode::Digit1 | KeyCode::Numpad1 => Some(1),
+        KeyCode::Digit2 | KeyCode::Numpad2 => Some(2),
+        KeyCode::Digit3 | KeyCode::Numpad3 => Some(3),
+        KeyCode::Digit4 | KeyCode::Numpad4 => Some(4),
+        KeyCode::Digit5 | KeyCode::Numpad5 => Some(5),
+        KeyCode::Digit6 | KeyCode::Numpad6 => Some(6),
+        KeyCode::Digit7 | KeyCode::Numpad7 => Some(7),
+        KeyCode::Digit8 | KeyCode::Numpad8 => Some(8),
+        KeyCode::Digit9 | KeyCode::Numpad9 => Some(9),
         _ => None,
     }
 }
@@ -2325,8 +2530,21 @@ impl ApplicationHandler<Event> for App {
                 // A chord is answered here rather than in `handle_key`, which
                 // knows nothing about modifiers: `Ctrl+C` and `C` are
                 // different keys to a person and must be to the viewer.
+                // The name box owns the keyboard while it is up. Without
+                // this, typing "gull.jpg" would step to the next picture on
+                // the "g", turn it on the "r", and delete nothing only by
+                // luck. Escape is left to egui, which the box watches for.
+                if self.interface.renaming() {
+                    return;
+                }
                 if self.modifiers.control_key() {
-                    self.handle_chord(&event.logical_key);
+                    // A digit sorts the file into a folder; Shift makes it a
+                    // copy. Asked of the physical key, because Ctrl+Shift+1
+                    // does not deliver the character "1" on any layout.
+                    match sorting_digit(&event.physical_key) {
+                        Some(digit) => self.sort_current(digit, self.modifiers.shift_key()),
+                        None => self.handle_chord(&event.logical_key),
+                    }
                 } else {
                     self.handle_key(&event.logical_key, event_loop);
                 }
@@ -2897,29 +3115,88 @@ mod tests {
     /// answers — the same rule the plain keys are held to, which is what stops
     /// the sheet promising something that does nothing.
     ///
+    /// Two kinds of chord are answered by two different routes, and both are
+    /// checked here: the letters go through `chord_for` on the character, and
+    /// the digits through `sorting_digit` on the physical key. A gate that
+    /// knew only the first would have gone green while `Ctrl+1` did nothing.
+    ///
     /// `Ctrl+Drag` and `Ctrl+Wheel` are deliberately excluded: they are
     /// gestures of the mouse, not chords of the keyboard, and there is no key
-    /// for `chord_for` to answer. The sheet lists them because a function
-    /// nobody can see is a function nobody finds, which is the rule the whole
-    /// sheet exists for.
+    /// to answer. The sheet lists them because a function nobody can see is a
+    /// function nobody finds, which is the rule the whole sheet exists for.
     #[test]
     fn every_chord_the_sheet_advertises_is_answered() {
+        use winit::keyboard::{KeyCode, PhysicalKey};
+
         let advertised: Vec<&str> = crate::interface::KEYS
             .iter()
             .map(|(key, _)| *key)
             .filter(|key| key.starts_with("Ctrl+") && !key.contains("Drag") && !key.contains("Wheel"))
             .collect();
-        assert_eq!(advertised.len(), 3, "the sheet lists {advertised:?}, which is not the three chords");
+        assert_eq!(advertised.len(), 5, "the sheet lists {advertised:?}, which is not the five chords");
 
         for key in advertised {
+            let named = key.rsplit('+').next().expect("a chord names a key");
+
+            // A range of digits — "1-9" — is answered by the physical key,
+            // and every digit in it has to be, not just the ends.
+            if named == "1-9" {
+                for (digit, code) in [
+                    (1, KeyCode::Digit1),
+                    (2, KeyCode::Digit2),
+                    (3, KeyCode::Digit3),
+                    (4, KeyCode::Digit4),
+                    (5, KeyCode::Digit5),
+                    (6, KeyCode::Digit6),
+                    (7, KeyCode::Digit7),
+                    (8, KeyCode::Digit8),
+                    (9, KeyCode::Digit9),
+                ] {
+                    assert_eq!(
+                        sorting_digit(&PhysicalKey::Code(code)),
+                        Some(digit),
+                        "the key sheet lists {key}, and {digit} is not answered",
+                    );
+                }
+                // And the keys the sheet does not promise stay unclaimed: `0`
+                // fits the picture to the window, and taking it here would be
+                // the very thing the modifier was chosen to avoid.
+                assert_eq!(sorting_digit(&PhysicalKey::Code(KeyCode::Digit0)), None, "Ctrl+0 was taken for sorting");
+                continue;
+            }
+
             // The letter at the end of the chord, and whether Shift is in it.
-            let letter = key.rsplit('+').next().expect("a chord names a key");
             let shifted = key.contains("Shift");
-            let character = if shifted { letter.to_uppercase() } else { letter.to_lowercase() };
+            let character = if shifted { named.to_uppercase() } else { named.to_lowercase() };
             assert!(
                 chord_for(&Key::Character(character.as_str().into())).is_some(),
                 "the key sheet lists {key}, which the viewer ignores",
             );
+        }
+    }
+
+    /// The number pad answers too — someone sorting with one hand is using it
+    /// — and it names the same folders as the digit row.
+    #[test]
+    fn the_number_pad_names_the_same_folders() {
+        use winit::keyboard::{KeyCode, PhysicalKey};
+
+        assert_eq!(sorting_digit(&PhysicalKey::Code(KeyCode::Numpad1)), Some(1));
+        assert_eq!(sorting_digit(&PhysicalKey::Code(KeyCode::Numpad9)), Some(9));
+        assert_eq!(sorting_digit(&PhysicalKey::Code(KeyCode::Numpad0)), None);
+    }
+
+    /// A key that is not a digit is not a folder, whatever character it makes.
+    ///
+    /// This is what the physical key buys: `Ctrl+Shift+1` delivers "!" on a US
+    /// layout and something else again on others, and none of those characters
+    /// may be mistaken for a digit — nor a real "!" for a sorting key.
+    #[test]
+    fn only_the_digit_keys_sort() {
+        use winit::keyboard::{KeyCode, PhysicalKey};
+
+        for code in [KeyCode::KeyA, KeyCode::F1, KeyCode::Minus, KeyCode::Backquote] {
+            assert_eq!(sorting_digit(&PhysicalKey::Code(code)), None, "{code:?} named a folder");
         }
     }
 

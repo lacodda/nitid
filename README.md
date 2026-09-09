@@ -331,6 +331,44 @@ The bare drag stays panning. A picture pasted from the clipboard has no file to
 hand over, so it travels as pixels only; nothing is written to disk to make it
 look otherwise.
 
+## Working through a folder
+
+A viewer that can only look is half a tool. Going through a shoot means
+throwing some frames away, naming the keepers, and putting them where they
+belong — and doing that in a file manager means leaving the picture to look at
+a list of names, which is the one view that cannot answer "is this the good
+one".
+
+**`Del` sends the file to the recycle bin** and moves to the next picture.
+Forwards, not back: culling a folder carries on the way you were going, and
+landing on the frame you just judged would mean judging it twice. Nothing is
+asked first — the bin is undoable, and Explorer's own `Ctrl+Z` takes the
+operation back — because a confirmation on every frame is what makes people
+stop culling in a viewer and go back to a file manager.
+
+**`F2` renames it.** The box opens with the whole name in it and the stem
+selected, so typing replaces the name and leaves `.jpg` alone, while renaming
+`shot.jpg` to `shot.png` is still one keystroke away. Enter commits, Escape
+cancels, and the box holds the keyboard while it is open — typing "gull" must
+not also step through the folder and turn the picture. A name carrying a path
+separator is refused rather than quietly moving the file somewhere else.
+
+**`Ctrl+1` through `Ctrl+9` sort it into folders you set**, and
+`Ctrl+Shift+1`-`9` copy it there instead of moving it. The folders are set in
+the Files section of the settings; a key with nothing set says so rather than
+doing something surprising. The digits carry `Ctrl` because bare `0` and `1`
+have fitted the picture to the window and shown it at 100% since v0.1.0, and a
+sorting key added later does not get to take a viewing gesture that has been
+there from the beginning.
+
+Everything here goes through **the shell's own file operations**, never a
+direct write. That is what makes a delete land in the recycle bin instead of
+being gone, puts the operation on the shell's undo stack, and resolves a name
+that is already taken the way the rest of Windows resolves it — a second frame
+of the same name lands beside the first rather than replacing it. A viewer
+that deleted with a plain filesystem call would be a viewer that loses
+photographs, whatever it said in a confirmation dialog.
+
 ## Large images
 
 A GPU texture has a maximum side — 16384 on current integrated hardware, and
@@ -594,6 +632,10 @@ Opening a file opens its folder: the arrow keys walk the images beside it.
 | `Ctrl+C` | copy the picture |
 | `Ctrl+V` | show the picture on the clipboard |
 | `Ctrl+Shift+C` | copy the path, quoted for a terminal |
+| `Del` | send this file to the recycle bin |
+| `F2` | rename this file |
+| `Ctrl+1`-`9` | move this file to the folder set for that key |
+| `Ctrl+Shift+1`-`9` | copy it there instead |
 | `F11` | fullscreen |
 | `,` | settings |
 | `?` | every key there is |
@@ -614,6 +656,7 @@ dragged while watching what it marks. Four sections:
 | View | when the toolbar and the status line are on screen: on hover, always, or never; when the minimap is — zoomed, always or never; and what shows behind transparency when a picture opens |
 | Opening | fit or 100% for a picture that arrives, whether the framing is held across a step, whether the folder wraps at its ends, and the order it is walked in — name, date or size |
 | Colour | where the clipping zebra draws its two lines, the units the eyedropper reads in, what a click copies, and whether the eyedropper magnifies the pixels around the pointer |
+| Files | the nine folders `Ctrl+1`-`9` sort a picture into |
 
 Ctrl+wheel always performs whichever gesture the bare wheel does not, so both
 are reachable whichever way round the setting is.

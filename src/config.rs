@@ -362,6 +362,43 @@ impl Default for Tools {
 pub const DEFAULT_CLIP_HIGH: f32 = 0.996;
 pub const DEFAULT_CLIP_LOW: f32 = 0.004;
 
+/// How many folders a picture can be sorted into by key.
+///
+/// Nine, because the keys are the digits: `Ctrl+1` through `Ctrl+9` move a
+/// file, and holding Shift copies it instead. `0` is not one of them — it
+/// fits the picture to the window, and `1` shows it at 100%, both since
+/// v0.1.0. The digits carry a modifier for exactly that reason (owner,
+/// 2026-09-09): a sorting key added now does not get to take a viewing
+/// gesture that has been there since the beginning.
+pub const SORTING_FOLDERS: usize = 9;
+
+/// Where the digit keys put a picture.
+///
+/// Empty is the normal state of most of them: someone who sorts into two
+/// folders sets two, and the other seven say so when pressed rather than
+/// doing something surprising.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct Sorting {
+    /// Index 0 is the key `1`. Empty means "no folder set for that key".
+    pub folders: [PathBuf; SORTING_FOLDERS],
+}
+
+impl Sorting {
+    /// The folder for a digit key, or `None` when nothing is set for it.
+    ///
+    /// `digit` is what the person pressed: 1 through 9.
+    pub fn folder(&self, digit: usize) -> Option<&std::path::Path> {
+        let folder = self.folders.get(digit.checked_sub(1)?)?;
+        (!folder.as_os_str().is_empty()).then_some(folder.as_path())
+    }
+
+    /// Whether any folder at all is set, which is what decides whether the
+    /// key sheet mentions sorting.
+    pub fn any(&self) -> bool {
+        self.folders.iter().any(|folder| !folder.as_os_str().is_empty())
+    }
+}
+
 /// The settings as they stand.
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct Config {
@@ -370,6 +407,7 @@ pub struct Config {
     pub appearance: Appearance,
     pub behaviour: Behaviour,
     pub tools: Tools,
+    pub sorting: Sorting,
     /// Keys the file carried that this version does not know.
     ///
     /// Kept so that saving does not throw away a newer version's settings:
@@ -451,6 +489,17 @@ impl Config {
                 "copies" => config.tools.copies = Copies::parse(value).unwrap_or_default(),
                 "magnifier" => config.tools.magnifier = value != "false",
 
+                // The sorting folders, one key each. The value is taken as it
+                // stands: a path holds spaces, and trimming beyond the ends
+                // would quietly change where a picture goes.
+                _ if key.starts_with("folder_") => {
+                    if let Some(digit) = key.strip_prefix("folder_").and_then(|digit| digit.parse::<usize>().ok())
+                        && (1..=SORTING_FOLDERS).contains(&digit)
+                    {
+                        config.sorting.folders[digit - 1] = PathBuf::from(value);
+                    }
+                }
+
                 // Not a key this version knows. It belongs to a build that
                 // wrote the file before or after this one; either way it is
                 // not this version's to discard.
@@ -495,6 +544,14 @@ impl Config {
         out.push_str(&format!("copies = {}\n", self.tools.copies.render()));
         out.push_str(&format!("magnifier = {}\n", self.tools.magnifier));
 
+        // Only the ones that are set: a file listing nine empty keys says
+        // nothing and invites someone to fill them in by hand wrongly.
+        for (index, folder) in self.sorting.folders.iter().enumerate() {
+            if !folder.as_os_str().is_empty() {
+                out.push_str(&format!("folder_{} = {}\n", index + 1, folder.display()));
+            }
+        }
+
         for (key, value) in &self.unknown {
             out.push_str(&format!("{key} = {value}\n"));
         }
@@ -526,6 +583,7 @@ fn path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn defaults_apply_when_there_is_nothing_stored() {
@@ -576,6 +634,48 @@ mod tests {
         assert_eq!(config.placement.size, None);
     }
 
+    /// A path is the one setting whose value is arbitrary text: it holds
+    /// spaces, and mangling it would send a picture somewhere else.
+    #[test]
+    fn a_sorting_folder_keeps_the_path_it_was_given() {
+        let config = Config::parse("folder_1 = C:\\Users\\someone\\My Pictures\\keepers\n");
+        assert_eq!(config.sorting.folder(1), Some(Path::new("C:\\Users\\someone\\My Pictures\\keepers")));
+    }
+
+    #[test]
+    fn a_folder_that_is_not_set_is_none_rather_than_an_empty_path() {
+        let config = Config::parse("folder_1 = C:\\keep\n");
+        assert!(config.sorting.folder(2).is_none(), "an unset key named a folder");
+        assert!(config.sorting.any(), "a set folder was not noticed");
+        assert!(!Config::default().sorting.any(), "a fresh config claims to have folders");
+    }
+
+    /// The digits are 1..=9, and anything else in the file is not a folder
+    /// this version knows — `folder_0` would mean the fit-to-window key.
+    #[test]
+    fn only_the_nine_digits_name_a_folder() {
+        let config = Config::parse("folder_0 = C:\\no\nfolder_10 = C:\\no\nfolder_x = C:\\no\n");
+        assert!(!config.sorting.any(), "a key outside 1..=9 set a folder");
+        assert!(config.sorting.folder(0).is_none(), "digit 0 named a folder");
+        assert!(config.sorting.folder(10).is_none());
+    }
+
+    /// Only the folders that are set are written, and they come back the same.
+    #[test]
+    fn the_folders_survive_a_round_trip() {
+        let mut config = Config::default();
+        config.sorting.folders[0] = PathBuf::from("C:\\keep");
+        config.sorting.folders[8] = PathBuf::from("D:\\some folder\\reject");
+
+        let rendered = config.render();
+        assert!(rendered.contains("folder_1 = C:\\keep"), "{rendered}");
+        assert!(rendered.contains("folder_9 = D:\\some folder\\reject"), "{rendered}");
+        // The seven that are not set say nothing at all.
+        assert!(!rendered.contains("folder_2"), "an unset folder was written: {rendered}");
+
+        assert_eq!(Config::parse(&rendered), config);
+    }
+
     #[test]
     fn every_setting_survives_a_round_trip() {
         let config = Config {
@@ -604,6 +704,22 @@ mod tests {
                 units: Units::Percent,
                 copies: Copies::Channels,
                 magnifier: false,
+            },
+            // A folder set and a folder left alone, so the round trip covers
+            // both: writing every key would be a different bug from writing
+            // none of them.
+            sorting: Sorting {
+                folders: [
+                    PathBuf::from("C:\\keep"),
+                    PathBuf::new(),
+                    PathBuf::new(),
+                    PathBuf::new(),
+                    PathBuf::new(),
+                    PathBuf::new(),
+                    PathBuf::new(),
+                    PathBuf::new(),
+                    PathBuf::from("D:\\reject"),
+                ],
             },
             unknown: BTreeMap::new(),
         };

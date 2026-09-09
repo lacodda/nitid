@@ -18,7 +18,9 @@ use std::time::{Duration, Instant};
 use std::path::PathBuf;
 
 use crate::color::Passport;
-use crate::config::{Appearance, Behaviour, Chrome, Config, Copies, Gestures, MAX_ZOOM_STEP, MIN_ZOOM_STEP, Minimap, Opening, Order, Tools, Units, Wheel};
+use crate::config::{
+    Appearance, Behaviour, Chrome, Config, Copies, Gestures, MAX_ZOOM_STEP, MIN_ZOOM_STEP, Minimap, Opening, Order, Sorting, Tools, Units, Wheel,
+};
 use crate::eyedropper::{NEIGHBOURHOOD_RADIUS, NEIGHBOURHOOD_SIDE, Neighbourhood, Reading};
 use crate::format::Format;
 use crate::gpu::Backdrop;
@@ -177,6 +179,25 @@ pub struct Interface {
     info_shown: bool,
     /// Whether the histogram is showing.
     histogram_shown: bool,
+    /// A name the box committed this frame, waiting to be collected.
+    ///
+    /// Cleared by [`take_rename`](Self::take_rename), so a name is acted on
+    /// once: laying out again before it is collected would otherwise rename
+    /// the file a second time.
+    renamed: Option<String>,
+    /// The name being typed, while the rename box is up.
+    ///
+    /// `None` means the box is not showing. The name lives here rather than in
+    /// the application because it is interface state — half-typed text that
+    /// exists only while the box is open, and that the application must never
+    /// see until it is committed.
+    renaming: Option<String>,
+    /// Whether the box has been given the keyboard yet.
+    ///
+    /// egui gives focus to a widget by id, and the widget does not exist until
+    /// it is laid out — so the request has to happen on the frame after the
+    /// box appears, not on the one that opens it.
+    rename_focused: bool,
     /// The minimap's picture, uploaded once per image rather than per frame.
     ///
     /// Keyed by the copy it was made from, so a step to another picture
@@ -228,11 +249,12 @@ pub enum Section {
     Appearance,
     Opening,
     Tools,
+    Files,
 }
 
 impl Section {
     /// The sections down the left of the dialog, in the order they are shown.
-    const ALL: [Self; 4] = [Self::Gestures, Self::Appearance, Self::Opening, Self::Tools];
+    const ALL: [Self; 5] = [Self::Gestures, Self::Appearance, Self::Opening, Self::Tools, Self::Files];
 
     /// What the section is called in its list.
     fn name(self) -> &'static str {
@@ -241,6 +263,7 @@ impl Section {
             Self::Appearance => "View",
             Self::Opening => "Opening",
             Self::Tools => "Colour",
+            Self::Files => "Files",
         }
     }
 }
@@ -268,6 +291,9 @@ impl Interface {
             keys_shown: false,
             info_shown: false,
             histogram_shown: false,
+            renamed: None,
+            renaming: None,
+            rename_focused: false,
             minimap_texture: None,
             passport_shown: false,
             toolbar_shown: false,
@@ -294,6 +320,35 @@ impl Interface {
     /// Show or hide the Info panel.
     pub fn toggle_info(&mut self) {
         self.info_shown = !self.info_shown;
+    }
+
+    /// Open the rename box on `name`, with the stem selected.
+    ///
+    /// The whole name goes in — extension included — because renaming
+    /// "DSC00431.jpg" to "gull.jpg" and renaming it to "gull.png" are both
+    /// things people mean, and a box that hides the extension makes the second
+    /// one impossible. The selection covers the stem only, so typing replaces
+    /// the name and leaves the extension: that is the common case, and the
+    /// rarer one is one keystroke away.
+    pub fn begin_rename(&mut self, name: &str) {
+        self.renaming = Some(name.to_string());
+        self.rename_focused = false;
+    }
+
+    /// Whether the rename box is up, which is what tells the application that
+    /// the keyboard belongs to it.
+    pub fn renaming(&self) -> bool {
+        self.renaming.is_some()
+    }
+
+    /// Take the name the box committed, if it did this frame.
+    pub fn take_rename(&mut self) -> Option<String> {
+        self.renamed.take()
+    }
+
+    /// Put the rename box away without renaming anything.
+    pub fn cancel_rename(&mut self) {
+        self.renaming = None;
     }
 
     /// Show or hide the histogram.
@@ -430,6 +485,13 @@ impl Interface {
         // of the picture on every frame would put a texture upload inside a
         // drag, which is exactly where the viewer must not spend anything.
         let mut minimap_texture = self.minimap_texture.take();
+        // Taken out for the frame and put back after, the way the texture is:
+        // the closure cannot hold a borrow of `self`.
+        let mut renaming = self.renaming.take();
+        let mut rename_focused = self.rename_focused;
+        let mut rename_outcome = None;
+        // Whether any sorting folder is set, for the sheet's note.
+        let sorting_set = config.sorting.any();
         let toasts: Vec<(String, f32)> = self
             .toasts
             .iter()
@@ -468,10 +530,13 @@ impl Interface {
                 passport_panel(ui, passport);
             }
             if keys_shown {
-                key_sheet(ui);
+                key_sheet(ui, sorting_set);
             }
             if settings_shown {
                 edited = settings_dialog(ui, config, &mut section, &mut closed);
+            }
+            if let Some(name) = renaming.as_mut() {
+                rename_outcome = rename_box(ui, name, &mut rename_focused);
             }
             if status.hovering {
                 drop_invitation(ui);
@@ -479,6 +544,23 @@ impl Interface {
             toast_stack(ui, &toasts);
         });
         self.minimap_texture = minimap_texture;
+        self.rename_focused = rename_focused;
+        // A box that was committed or cancelled does not come back next frame.
+        self.renaming = match rename_outcome {
+            Some(_) => None,
+            None => renaming,
+        };
+        // Held for the application to collect rather than added to what
+        // `layout` returns: a fourth element on that tuple would make every
+        // call site say what it is ignoring. A frame is owed either way — the
+        // box appearing and the box going away both have to be drawn.
+        if let Some(outcome) = rename_outcome {
+            self.renamed = match outcome {
+                Renamed::To(name) => Some(name),
+                Renamed::Cancelled => None,
+            };
+            self.owed_frame = true;
+        }
         // A section chosen inside this layout is drawn inconsistently by it:
         // the list was painted before the click landed, so the old name is
         // still lit while the new section's controls are already on the
@@ -560,6 +642,8 @@ impl Interface {
                 status.thumbnail.as_ref().map(|thumbnail| thumbnail.pixels.len()).unwrap_or(0),
             )
             + &format!("|{:?}", self.chrome.minimap)
+            // The box itself, and every keystroke in it.
+            + &format!("|{:?}", self.renaming)
     }
 
     /// Whether the interface would draw something different from last time.
@@ -1372,6 +1456,102 @@ fn frame_on_map(painter: &egui::Painter, map: egui::Rect, visible: (f32, f32, f3
     painter.rect_stroke(rect, 0.0, egui::Stroke::new(1.5, egui::Color32::WHITE), egui::StrokeKind::Inside);
 }
 
+/// What the rename box decided this frame.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Renamed {
+    /// Commit this name.
+    To(String),
+    /// Put the box away and change nothing.
+    Cancelled,
+}
+
+/// The name box: type a new name for the file on screen.
+///
+/// Centred like the colour passport, and for the same reason — this is done
+/// deliberately, once, and the picture behind it is not what is being read
+/// while it is up.
+///
+/// Enter commits, Escape cancels, and the box takes the keyboard while it is
+/// open so that typing a name does not also step through the folder and
+/// toggle the zebra. That last part is the application's job: this reports
+/// that it is open, and the application stops answering keys.
+fn rename_box(ui: &mut egui::Ui, name: &mut String, focused: &mut bool) -> Option<Renamed> {
+    let mut outcome = None;
+
+    egui::Window::new("Rename")
+        .collapsible(false)
+        .resizable(false)
+        // See the settings dialog: a viewer that lays out only on demand
+        // cannot animate, so a faded window stalls half-drawn.
+        .fade_in(false)
+        .fade_out(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(ui.ctx(), |ui| {
+            ui.set_min_width(360.0);
+
+            let field = ui.add(egui::TextEdit::singleline(name).desired_width(f32::INFINITY).hint_text("a name for this file"));
+
+            // Focus on the frame after the box appears: egui gives focus to a
+            // widget by id, and the widget does not exist until it has been
+            // laid out once.
+            if !*focused {
+                field.request_focus();
+                *focused = true;
+            }
+
+            // The name without its extension, selected, so typing replaces
+            // the name and leaves ".jpg" alone — the common case. Done once,
+            // on the frame focus is taken, or every keystroke would put the
+            // selection back and the box could not be edited at all.
+            if field.gained_focus()
+                && let Some(stem) = name.rfind('.').filter(|dot| *dot > 0)
+            {
+                select_range(ui, field.id, 0, stem);
+            }
+
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Rename").clicked() {
+                    outcome = Some(Renamed::To(name.clone()));
+                }
+                if ui.button("Cancel").clicked() {
+                    outcome = Some(Renamed::Cancelled);
+                }
+                ui.label(egui::RichText::new("Enter to rename, Esc to cancel").weak().small());
+            });
+
+            // Enter commits from inside the field, which is where the hands
+            // already are.
+            if field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                outcome = Some(Renamed::To(name.clone()));
+            }
+            if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                outcome = Some(Renamed::Cancelled);
+            }
+        });
+
+    // An empty name is not a rename. Treated as a cancel rather than handed
+    // to the file layer, which would refuse it with a message about something
+    // the person can see for themselves.
+    match outcome {
+        Some(Renamed::To(name)) if name.trim().is_empty() => Some(Renamed::Cancelled),
+        other => other,
+    }
+}
+
+/// Select part of the text in a `TextEdit`, by character index.
+///
+/// egui keeps the cursor in the widget's own state rather than in the string,
+/// so a selection is set by writing that state back.
+fn select_range(ui: &egui::Ui, id: egui::Id, from: usize, to: usize) {
+    let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), id) else {
+        return;
+    };
+    let range = egui::text::CCursorRange::two(egui::text::CCursor::new(from), egui::text::CCursor::new(to));
+    state.cursor.set_char_range(Some(range));
+    state.store(ui.ctx(), id);
+}
+
 /// The colour path, spelled out.
 ///
 /// Centred like the key sheet rather than tucked in a corner: this is read
@@ -1427,7 +1607,7 @@ fn passport_panel(ui: &mut egui::Ui, passport: &Passport) {
 }
 
 /// Every key there is, because the chrome does not advertise them.
-fn key_sheet(ui: &mut egui::Ui) {
+fn key_sheet(ui: &mut egui::Ui, sorting_set: bool) {
     egui::Window::new("Keys")
         .collapsible(false)
         .resizable(false)
@@ -1445,6 +1625,10 @@ fn key_sheet(ui: &mut egui::Ui) {
                 }
             });
             ui.add_space(8.0);
+            if !sorting_set {
+                ui.label(egui::RichText::new("The digit keys have no folders yet — set them in Settings, under Files.").weak());
+                ui.add_space(4.0);
+            }
             ui.label(egui::RichText::new(TOOLBAR_HINT).weak());
         });
 }
@@ -1510,6 +1694,7 @@ fn settings_dialog(ui: &mut egui::Ui, config: &mut Config, section: &mut Section
                         .show(ui, |ui| {
                             edited = match *section {
                                 Section::Gestures => gestures_section(ui, &mut config.gestures),
+                                Section::Files => files_section(ui, &mut config.sorting),
                                 Section::Appearance => appearance_section(ui, &mut config.appearance),
                                 Section::Opening => opening_section(ui, &mut config.behaviour),
                                 Section::Tools => tools_section(ui, &mut config.tools),
@@ -1619,6 +1804,47 @@ fn appearance_section(ui: &mut egui::Ui, appearance: &mut Appearance) -> bool {
             .weak()
             .small(),
     );
+
+    edited
+}
+
+/// The folders the digit keys sort a picture into.
+///
+/// Nine rows, all of them shown even when empty: a list that grows as it is
+/// filled in would make "which key is free" a question you answer by counting,
+/// and the keys are fixed anyway.
+///
+/// The path is typed rather than picked from a folder dialog. A dialog needs
+/// the shell's own picker on a thread that is not the one drawing the picture,
+/// which is a version of its own; typing works today, and a path can be pasted
+/// from an Explorer window with Ctrl+V.
+fn files_section(ui: &mut egui::Ui, sorting: &mut Sorting) -> bool {
+    let mut edited = false;
+
+    ui.label(egui::RichText::new("Sorting folders").strong());
+    ui.add_space(2.0);
+    ui.label(
+        egui::RichText::new("Ctrl and a digit move the picture there; add Shift to copy it. The folder is made if it is not there yet.")
+            .weak()
+            .small(),
+    );
+    ui.add_space(8.0);
+
+    egui::Grid::new("sorting").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+        for (index, folder) in sorting.folders.iter_mut().enumerate() {
+            ui.label(format!("Ctrl+{}", index + 1));
+
+            // The path is edited as text, so an empty box means "no folder"
+            // and there is nothing to clear separately.
+            let mut text = folder.to_string_lossy().into_owned();
+            let response = ui.add(egui::TextEdit::singleline(&mut text).desired_width(300.0).hint_text("no folder set"));
+            if response.changed() {
+                *folder = std::path::PathBuf::from(text.trim());
+                edited = true;
+            }
+            ui.end_row();
+        }
+    });
 
     edited
 }
@@ -1763,6 +1989,10 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Ctrl+C", "copy the picture"),
     ("Ctrl+V", "show the picture on the clipboard"),
     ("Ctrl+Shift+C", "copy the path, quoted for a terminal"),
+    ("Del", "send this file to the recycle bin"),
+    ("F2", "rename this file"),
+    ("Ctrl+1-9", "move this file to the folder set for that key"),
+    ("Ctrl+Shift+1-9", "copy it there instead"),
     ("+ -", "zoom in / out"),
     ("F11", "full screen"),
     (",", "settings"),
