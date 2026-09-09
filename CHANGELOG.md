@@ -2,6 +2,16 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.27.0] - 2026-09-09
+
+### Documentation
+- File operations, and v0.27.0
+
+### Features
+- The recycle bin, a new name, and nine folders
+
+### Testing
+- Ask the bin whether the file reached it
 ## [0.26.0] - 2026-09-09
 
 ### Documentation
