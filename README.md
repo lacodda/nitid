@@ -475,7 +475,7 @@ has no size limit to hide behind.
 
 ## Status
 
-Early development — v0.26.0 is out. Startup, colour and format coverage hold:
+Early development — v0.27.0 is out. Startup, colour and format coverage hold:
 every modern still format opens, a phone's photographs included, every one of
 them reaches the screen without a wait, and the ones that animate play. The
 process that decodes the heavy formats runs with no network in either
@@ -507,8 +507,12 @@ picture is framed when it arrives, where the zebra draws its lines and what
 the eyedropper reads in — each taking effect as it is made. **And you can see
 where you are now**: zoom into a photograph and a minimap appears in the
 corner, the whole picture small with the part you are looking at framed, so a
-deep zoom stops being a view with no map. Development runs in small versions,
-each one theme; the road to 1.0 is fixed:
+deep zoom stops being a view with no map. **And the folder is yours to work
+through**: `Del` sends a file to the recycle bin and moves on, `F2` renames it,
+and `Ctrl+1`-`9` sort it into folders you set — all through the shell's own
+operations, so a delete is undoable and a name that is taken never costs you
+the picture that was already there. Development runs in small versions, each
+one theme; the road to 1.0 is fixed:
 
 | Version | What lands |
 | --- | --- |
@@ -542,7 +546,8 @@ each one theme; the road to 1.0 is fixed:
 | ✅ v0.24.0 | Settings: gestures, chrome, how a picture opens, the colour tools |
 | ✅ v0.25.0 | The eyedropper's magnifier: the pixels around the pointer, with the one being read marked |
 | ✅ v0.26.0 | The minimap: where in the picture the window is, once part of it is off screen |
-| v0.27.0 – v0.37.0 | The everyday viewer: file operations, culling, comparison, slideshow |
+| ✅ v0.27.0 | File operations: the recycle bin, renaming, and nine folders to sort into |
+| v0.28.0 – v0.37.0 | The everyday viewer: an external editor, culling, comparison, slideshow |
 | v0.39.0 – v0.42.0 | Windows integration: context menu, installer, auto-update, thumbnails |
 | v0.43.0 – v0.44.0 | Documentation site, stabilisation |
 | v1.0.0 | Public release — the default viewer, nothing missing |
