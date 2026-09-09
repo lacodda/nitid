@@ -21,17 +21,22 @@
 //! window that has to be told what happened to a file it may already have
 //! stepped away from.
 
-use std::path::{Path, PathBuf};
-
-use anyhow::Result;
 #[cfg(windows)]
-use anyhow::{Context, bail};
+use std::path::Path;
+use std::path::PathBuf;
+
+#[cfg(windows)]
+use anyhow::{Context, Result, bail};
 
 /// What became of the file.
 ///
 /// The path matters to the caller: after a rename or a move the folder is
 /// holding a name that is no longer there, and it has to be told what replaced
 /// it — or, for a delete, that nothing did.
+/// Nothing constructs these off Windows: every operation there fails, and the
+/// type is present because the callers name its variants on both platforms.
+/// The same arrangement `sandbox` uses for the same reason.
+#[cfg_attr(not(windows), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
     /// The file is in the recycle bin; nothing stands where it was.
