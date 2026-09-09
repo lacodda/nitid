@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.26.0] - 2026-09-09
+
+### Documentation
+- The minimap, and v0.26.0
+
+### Features
+- Where in the picture the window is
 ## [0.25.0] - 2026-09-07
 
 ### Documentation
@@ -15,7 +22,7 @@ All notable changes to this project are documented in this file.
 - The settings in the README, and a roadmap that matches the plan
 
 ### Features
-- A place for the choices, and the first fifteen in it
+- A place for the choices, and the first sixteen in it
 ## [0.23.1] - 2026-09-04
 
 ### Bug Fixes
