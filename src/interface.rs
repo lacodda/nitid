@@ -277,6 +277,7 @@ impl Default for Interface {
 impl Interface {
     pub fn new() -> Self {
         let context = egui::Context::default();
+        context.set_fonts(fonts());
         // The viewer is dark by decision, not by system theme: the scene
         // behind a photograph stays dark so the photograph is what is lit.
         let mut visuals = egui::Visuals::dark();
@@ -2060,6 +2061,29 @@ fn separator(ui: &mut egui::Ui) {
     ui.label(egui::RichText::new("·").weak());
 }
 
+/// The fonts, with the monospace face added to the proportional family as a
+/// last resort.
+///
+/// egui's proportional family is Ubuntu-Light, then two emoji faces, and none
+/// of the three carries an arrow: `→` is in Hack alone, which is the monospace
+/// face. So a message saying "photo.jpg → keepers" drew a box where the arrow
+/// should be, while the same arrow in the key sheet — set in monospace —
+/// looked fine. Reported from a hands-on run, and confirmed by reading the
+/// four bundled fonts: U+2192 is present in `Hack-Regular.ttf` and in none of
+/// the others.
+///
+/// Appended rather than inserted: Ubuntu-Light still draws every letter and
+/// digit, and Hack is only reached for a character the others do not have. The
+/// alternative — picking characters that Ubuntu-Light happens to carry — makes
+/// every future message a question about font coverage.
+fn fonts() -> egui::FontDefinitions {
+    let mut fonts = egui::FontDefinitions::default();
+    if let Some(proportional) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+        proportional.push("Hack".to_owned());
+    }
+    fonts
+}
+
 fn monospace(text: impl Into<String>) -> egui::RichText {
     // Monospace for anything measurable, so digits do not jitter as they
     // change — the reference layout's rule.
@@ -2109,6 +2133,65 @@ mod tests {
             visible,
             ..status()
         }
+    }
+
+    /// The proportional family can draw an arrow.
+    ///
+    /// Reported from a hands-on run of v0.27.0: "photo.jpg -> keepers" drew a
+    /// box where the arrow should be. egui's proportional family is
+    /// Ubuntu-Light and two emoji faces, and U+2192 is in none of them — it is
+    /// in Hack, the monospace face, which is why the same arrow in the key
+    /// sheet looked right.
+    ///
+    /// The test asks the font definitions rather than the screen: what went
+    /// wrong is a list of family members, and that is a fact this can hold.
+    /// It does not prove a glyph is drawn — only that the face carrying it is
+    /// reachable from the family that draws ordinary text.
+    #[test]
+    fn the_proportional_family_falls_back_to_the_face_with_the_arrows() {
+        let fonts = fonts();
+        let proportional = fonts.families.get(&egui::FontFamily::Proportional).expect("egui has no proportional family");
+
+        assert!(
+            proportional.iter().any(|face| face == "Hack"),
+            "the proportional family is {proportional:?}, none of which carries U+2192 — a message with an arrow will draw a box",
+        );
+        // And the ordinary text face still comes first: Hack is a fallback for
+        // what the others lack, not the font the interface is set in.
+        assert_eq!(
+            proportional.first().map(String::as_str),
+            Some("Ubuntu-Light"),
+            "the interface changed typeface: {proportional:?}",
+        );
+    }
+
+    /// The arrow is drawn as an arrow, not as the replacement box.
+    ///
+    /// The family list is one fact; this is the other, and it is the one the
+    /// owner actually saw. epaint substitutes a white square for a character
+    /// no face in the family carries, so a message with a missing glyph and a
+    /// message with a box in it are the *same picture*. Laying both out and
+    /// comparing their widths tells them apart without a screenshot.
+    #[test]
+    fn an_arrow_in_ordinary_text_is_not_the_replacement_box() {
+        let context = egui::Context::default();
+        context.set_fonts(fonts());
+        // Fonts are built lazily, so a frame has to happen before anything can
+        // be measured.
+        let mut output = context.run_ui(egui::RawInput::default(), |_| {});
+        // The frame produced textures nobody is going to upload; epaint panics
+        // on a dropped delta, as the layout tests already know.
+        output.textures_delta.clear();
+
+        let width = |character: char| context.fonts_mut(|fonts| fonts.glyph_width(&egui::FontId::proportional(14.0), character));
+
+        let arrow = width('\u{2192}');
+        let replacement = width('\u{25FB}');
+        assert!(arrow > 0.0, "the arrow laid out to nothing at all");
+        assert!(
+            (arrow - replacement).abs() > 0.01,
+            "the arrow measures the same as the replacement box ({arrow} vs {replacement}) — it is being substituted",
+        );
     }
 
     /// The channels add rather than cover one another.
