@@ -4,6 +4,13 @@ All notable changes to this project are documented in this file.
 
 ## [0.27.0] - 2026-09-09
 
+### Bug Fixes
+- Keep the module whole where there is no Windows shell
+- Drop the imports the non-Windows build does not use
+
+### CI
+- Do not let a third-party apt source stop the Linux jobs
+
 ### Documentation
 - File operations, and v0.27.0
 
