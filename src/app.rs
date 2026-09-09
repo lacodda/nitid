@@ -892,18 +892,6 @@ impl App {
                 // picture alongside.
                 "," => {
                     self.interface.toggle_settings();
-                    // Two frames, not one. egui has no size for a window it
-                    // has just been asked for, so the frame that introduces
-                    // the dialog is the one that measures it and the next is
-                    // the one that places it. Asking for that second frame
-                    // here — once, tied to the keypress — is what makes the
-                    // dialog appear at once instead of waiting for whatever
-                    // wakes the loop next.
-                    //
-                    // Not by honouring egui's own repaint request: it renews
-                    // that request on every layout, which is a loop, measured
-                    // at 740 layouts in ten seconds on a still picture.
-                    self.wants_frame = true;
                     self.request_redraw();
                 }
                 // The colour path, spelled out. Reachable from the keyboard
@@ -1823,6 +1811,26 @@ impl App {
         self.handle_key(&key_for(action), event_loop);
         // A button press changes what is on screen, and the frame it was
         // pressed in was laid out before it happened.
+        //
+        // **A window needs two frames, and this is the route that has to ask
+        // for the second one.** egui has no size for a window it has just
+        // been told to show: the frame that introduces it measures it, and
+        // the next one places it. A keypress earns that second layout by
+        // itself — the event is input, and input is what `worth_laying_out`
+        // lets through — but a click on the toolbar is answered *inside* a
+        // layout, so nothing follows it until something else wakes the loop.
+        //
+        // Reported from a hands-on run: open the viewer, click the gear, and
+        // the settings never appear; move the pointer and they do, and behave
+        // for the rest of the session, because egui knows the size by then.
+        // The same for the key sheet, the histogram and the eyedropper —
+        // every button that opens something, which is why this is here rather
+        // than in the handlers that happened to remember it.
+        //
+        // Not by honouring egui's own repaint request: it renews that request
+        // on every layout, which is a loop, measured at 740 layouts in ten
+        // seconds on a still picture.
+        self.wants_frame = true;
         self.request_redraw();
     }
 
@@ -2884,6 +2892,50 @@ mod tests {
 
         // And with nothing drawn yet, there is always a first frame.
         assert!(worth_laying_out(false, false, false, false), "the first frame was skipped");
+    }
+
+    /// A click on the toolbar leaves a frame owed, and the frame that answers
+    /// it must not be the last one.
+    ///
+    /// The defect, reported from a hands-on run of v0.27.0: click the gear on
+    /// a freshly opened viewer and the settings never appear — until the
+    /// pointer moves, after which they behave for the rest of the session.
+    ///
+    /// The sequence is what makes it happen, and it is what this walks:
+    ///
+    /// 1. the click arrives as input, so a frame is pending;
+    /// 2. that frame is laid out — and laying out **consumes** the pending
+    ///    flag — and the button is answered inside it;
+    /// 3. answering it opens a window, which moves the digest, so a frame is
+    ///    laid out for it: the one egui uses to *measure* the window;
+    /// 4. placing the window needs one more, and by now the digest has settled
+    ///    and nothing is pending — so unless step 3 asked, none comes.
+    ///
+    /// A keypress never showed this, because the key event is itself input and
+    /// raises the flag again at step 3.
+    #[test]
+    fn the_frame_that_answers_a_click_is_not_the_last_one() {
+        // 1-2: a click is pending, and the frame it earns is laid out.
+        let mut pending = true;
+        assert!(worth_laying_out(false, false, pending, true), "the click earned no frame");
+        pending = false; // `lay_out_interface` clears it before laying out.
+
+        // 3: the action opened something, which moved the digest.
+        assert!(worth_laying_out(true, false, pending, true), "the opening was not drawn");
+
+        // 4: this is the frame that has to exist, and the only thing that can
+        // ask for it is the handler that acted. With the digest settled and
+        // nothing pending, the answer is no — which is the defect.
+        assert!(
+            !worth_laying_out(false, false, false, true),
+            "this test no longer describes the viewer: an idle frame is being laid out",
+        );
+
+        // So `act` raises the flag, and that is the whole fix.
+        assert!(
+            worth_laying_out(false, false, true, true),
+            "a frame asked for after acting was refused, so a window would never be placed",
+        );
     }
 
     /// A quarter turn exchanges what the picture presents; a half turn does
