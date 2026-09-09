@@ -309,13 +309,49 @@ mod tests {
         path
     }
 
+    /// Recycled means **in the recycle bin**, not merely gone.
+    ///
+    /// "The file is not where it was" is what a plain delete achieves too, so
+    /// checking only that would pass for the one implementation this module
+    /// exists to rule out. The bin is asked how many items it holds, before
+    /// and after: a real delete would leave that number alone.
+    ///
+    /// The count rather than the name, because a file in the bin is stored
+    /// under a generated name and its original path is metadata; the count is
+    /// the cheap question that still cannot be satisfied by deleting.
     #[test]
-    fn a_recycled_file_leaves_its_place() {
+    fn a_recycled_file_goes_to_the_recycle_bin() {
         let dir = scratch("recycle");
         let path = file(&dir, "gone.txt", "x");
 
+        let before = bin_count();
         assert_eq!(recycle(&path).expect("recycling"), Outcome::Recycled);
         assert!(!path.exists(), "the file is still where it was");
+
+        // `None` means the bin could not be asked — a locked-down machine, or
+        // a shell that will not answer. The rest of the test still holds, and
+        // failing here would be reporting on the environment rather than on
+        // this code.
+        if let (Some(before), Some(after)) = (before, bin_count()) {
+            assert_eq!(after, before + 1, "the file did not reach the recycle bin: {before} -> {after}");
+        }
+    }
+
+    /// How many items the recycle bin holds, or `None` if it cannot be asked.
+    ///
+    /// Through the shell's own namespace, which is the only thing that knows:
+    /// the bin is not one directory, and reading `$Recycle.Bin` off the disk
+    /// would be reading an implementation detail that differs per volume.
+    fn bin_count() -> Option<usize> {
+        let output = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "(New-Object -ComObject Shell.Application).NameSpace(10).Items().Count",
+            ])
+            .output()
+            .ok()?;
+        String::from_utf8_lossy(&output.stdout).trim().parse().ok()
     }
 
     #[test]
