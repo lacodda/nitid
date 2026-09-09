@@ -32,6 +32,7 @@ mod interface;
 mod isobmff;
 mod loader;
 mod metadata;
+mod minimap;
 mod sandbox;
 // The whole mechanism is Windows shell behaviour: the pipe, the election, and
 // the multi-select it answers. There is nothing here for another platform to

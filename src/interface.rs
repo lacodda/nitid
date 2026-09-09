@@ -18,13 +18,14 @@ use std::time::{Duration, Instant};
 use std::path::PathBuf;
 
 use crate::color::Passport;
-use crate::config::{Appearance, Behaviour, Chrome, Config, Copies, Gestures, MAX_ZOOM_STEP, MIN_ZOOM_STEP, Opening, Order, Tools, Units, Wheel};
+use crate::config::{Appearance, Behaviour, Chrome, Config, Copies, Gestures, MAX_ZOOM_STEP, MIN_ZOOM_STEP, Minimap, Opening, Order, Tools, Units, Wheel};
 use crate::eyedropper::{NEIGHBOURHOOD_RADIUS, NEIGHBOURHOOD_SIDE, Neighbourhood, Reading};
 use crate::format::Format;
 use crate::gpu::Backdrop;
 use crate::histogram::{BUCKETS, Histogram};
 use crate::image_source::Depth;
 use crate::metadata::Metadata;
+use crate::minimap::Thumbnail;
 use crate::view::FitMode;
 
 /// How long a toast stays up before it fades.
@@ -103,6 +104,16 @@ pub struct Status {
     /// A drag that gets no answer looks like a window that will not take it,
     /// so the viewer says it will before the button comes up.
     pub hovering: bool,
+    /// A small copy of the whole picture, for the minimap.
+    ///
+    /// `None` until it has been made, and for a thumbnail standing in for a
+    /// picture that is still decoding: a map of the stand-in is a map of the
+    /// right scene at the wrong detail, and it would be replaced a moment
+    /// later by one that looks the same.
+    pub thumbnail: Option<Thumbnail>,
+    /// Which part of the picture the window is showing: `(left, top, width,
+    /// height)` as fractions of the whole. The rectangle drawn on the map.
+    pub visible: (f32, f32, f32, f32),
 }
 
 /// What a toolbar button asks the viewer to do.
@@ -166,6 +177,11 @@ pub struct Interface {
     info_shown: bool,
     /// Whether the histogram is showing.
     histogram_shown: bool,
+    /// The minimap's picture, uploaded once per image rather than per frame.
+    ///
+    /// Keyed by the copy it was made from, so a step to another picture
+    /// replaces it and a redraw of the same one does not.
+    minimap_texture: Option<(egui::TextureHandle, usize)>,
     /// Whether the colour passport is showing.
     passport_shown: bool,
     /// Whether the toolbar is showing, decided by where the pointer is.
@@ -252,6 +268,7 @@ impl Interface {
             keys_shown: false,
             info_shown: false,
             histogram_shown: false,
+            minimap_texture: None,
             passport_shown: false,
             toolbar_shown: false,
             settings_shown: false,
@@ -408,6 +425,11 @@ impl Interface {
         self.units = units;
         let magnifier = config.tools.magnifier;
         self.magnifier = magnifier;
+        let minimap = self.chrome.minimap;
+        // The texture the minimap draws, kept across frames: uploading a copy
+        // of the picture on every frame would put a texture upload inside a
+        // drag, which is exactly where the viewer must not spend anything.
+        let mut minimap_texture = self.minimap_texture.take();
         let toasts: Vec<(String, f32)> = self
             .toasts
             .iter()
@@ -436,6 +458,9 @@ impl Interface {
             if histogram_shown {
                 histogram_panel(ui, status);
             }
+            if minimap_wanted(minimap, status) {
+                minimap_panel(ui, status, &mut minimap_texture);
+            }
             if status.picking {
                 eyedropper_panel(ui, status, units, magnifier);
             }
@@ -453,6 +478,7 @@ impl Interface {
             }
             toast_stack(ui, &toasts);
         });
+        self.minimap_texture = minimap_texture;
         // A section chosen inside this layout is drawn inconsistently by it:
         // the list was painted before the click landed, so the old name is
         // still lit while the new section's controls are already on the
@@ -515,6 +541,25 @@ impl Interface {
             "|{}|{}|{:?}|{:?}|{:?}",
             status.hovering, self.settings_shown, self.section, self.chrome.toolbar, self.chrome.status_line
         ) + &format!("|{:?}|{}", self.units, self.magnifier)
+            + &format!(
+                // The framing, rounded to a thousandth of the picture. This is
+                // what makes a pan a change: the scale in the digest above
+                // moves when zooming but not when dragging, and without this
+                // the frame on the minimap would stay where the drag started.
+                // Rounded rather than raw so that a float a hair from itself
+                // does not ask for a frame nobody would see.
+                "|{:?}|{}",
+                (
+                    (status.visible.0 * 1000.0) as i32,
+                    (status.visible.1 * 1000.0) as i32,
+                    (status.visible.2 * 1000.0) as i32,
+                    (status.visible.3 * 1000.0) as i32,
+                ),
+                // Which picture the map is of, so a step to a neighbour of the
+                // same shape redraws it.
+                status.thumbnail.as_ref().map(|thumbnail| thumbnail.pixels.len()).unwrap_or(0),
+            )
+            + &format!("|{:?}", self.chrome.minimap)
     }
 
     /// Whether the interface would draw something different from last time.
@@ -1174,6 +1219,159 @@ fn neighbourhood(ui: &mut egui::Ui, around: &Neighbourhood) {
     painter.rect_stroke(centre, 0.0, egui::Stroke::new(1.5, egui::Color32::WHITE), egui::StrokeKind::Inside);
 }
 
+/// How wide the minimap is drawn, in logical points.
+///
+/// Small enough to sit in a corner of a photograph without becoming furniture,
+/// big enough that the frame inside it is a shape rather than a dot: at a
+/// tenth of the picture — a reasonable zoom to want a map at — the frame is
+/// fourteen points across.
+const MINIMAP_WIDTH: f32 = 140.0;
+
+/// The thinnest the frame is allowed to be drawn, in points.
+///
+/// At a deep zoom the visible fraction is a hair, and a rectangle drawn to
+/// scale would be thinner than its own outline — a frame that vanishes exactly
+/// when the map is most needed. Held to something the eye can find instead,
+/// which makes it a marker rather than a measurement at that zoom, and the
+/// zoom in the status line is what states the measurement.
+const MINIMAP_MIN_FRAME: f32 = 6.0;
+
+/// Whether the minimap is on screen this frame.
+///
+/// The default answer is about the picture rather than the pointer: a map of a
+/// photograph that is wholly on screen would point at all of itself, which is
+/// furniture that says nothing. `Always` is for someone who would rather have
+/// the thumbnail there than have it appear and disappear as they zoom.
+fn minimap_wanted(minimap: Minimap, status: &Status) -> bool {
+    if status.thumbnail.is_none() {
+        return false;
+    }
+    match minimap {
+        Minimap::Never => false,
+        Minimap::Always => true,
+        // A whisker under the whole, so a picture fitted to the window — where
+        // the fractions come out at one but for floating-point dust — counts
+        // as wholly visible rather than as a map worth showing.
+        Minimap::Zoomed => status.visible.2 < 0.999 || status.visible.3 < 0.999,
+    }
+}
+
+/// Where in the picture the window is: the whole image small, with the visible
+/// part framed.
+///
+/// Bottom right, which is the corner the other panels leave alone: the
+/// histogram sits bottom left and the Info panel takes the right edge from the
+/// top. Placed against the area the panels have left rather than against the
+/// window, for the reason the histogram is — the status line's height is its
+/// text, and an offset guessed to clear it is a guess.
+fn minimap_panel(ui: &mut egui::Ui, status: &Status, texture: &mut Option<(egui::TextureHandle, usize)>) {
+    let Some(thumbnail) = &status.thumbnail else {
+        return;
+    };
+    if thumbnail.width == 0 || thumbnail.height == 0 {
+        return;
+    }
+
+    // The picture's proportions decide the height; only the width is fixed.
+    let height = MINIMAP_WIDTH * thumbnail.height as f32 / thumbnail.width as f32;
+    let free = ui.available_rect_before_wrap();
+
+    // Uploaded once per picture. The key is the copy's own length, which
+    // changes with the picture and not with the framing: re-uploading inside a
+    // drag is precisely the cost this panel must not have.
+    let handle = match texture {
+        Some((handle, key)) if *key == thumbnail.pixels.len() => handle.clone(),
+        _ => {
+            let image = egui::ColorImage::from_rgb([thumbnail.width as usize, thumbnail.height as usize], &thumbnail.pixels);
+            let handle = ui.ctx().load_texture("minimap", image, egui::TextureOptions::LINEAR);
+            *texture = Some((handle.clone(), thumbnail.pixels.len()));
+            handle
+        }
+    };
+
+    area("minimap")
+        .fixed_pos(egui::pos2(free.right() - MINIMAP_WIDTH - 22.0, free.bottom() - height - 22.0))
+        .interactable(false)
+        .show(ui.ctx(), |ui| {
+            egui::Frame::new()
+                .fill(egui::Color32::from_rgba_unmultiplied(14, 16, 20, 235))
+                .inner_margin(egui::Margin::same(5))
+                .corner_radius(6)
+                .show(ui, |ui| {
+                    let (map, _) = ui.allocate_exact_size(egui::vec2(MINIMAP_WIDTH, height), egui::Sense::hover());
+                    let painter = ui.painter();
+                    painter.image(
+                        handle.id(),
+                        map,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
+                    frame_on_map(painter, map, status.visible);
+                });
+        });
+}
+
+/// Where on the map the frame goes: the visible fraction in the map's own
+/// points, widened if it came out too thin to find, and held inside the map.
+///
+/// Separated from the drawing so the property the panel exists for — the frame
+/// points at the part of the picture on screen — is checkable without a
+/// painter or a screenshot.
+fn framed(map: egui::Rect, visible: (f32, f32, f32, f32)) -> egui::Rect {
+    let (left, top, width, height) = visible;
+
+    // The frame in points, then widened if it came out too thin to see. The
+    // widening is centred on where the frame actually is, so it still points
+    // at the right part rather than growing from one corner.
+    let mut rect = egui::Rect::from_min_size(
+        map.min + egui::vec2(left * map.width(), top * map.height()),
+        egui::vec2(width * map.width(), height * map.height()),
+    );
+    if rect.width() < MINIMAP_MIN_FRAME {
+        rect = rect.expand2(egui::vec2((MINIMAP_MIN_FRAME - rect.width()) / 2.0, 0.0));
+    }
+    if rect.height() < MINIMAP_MIN_FRAME {
+        rect = rect.expand2(egui::vec2(0.0, (MINIMAP_MIN_FRAME - rect.height()) / 2.0));
+    }
+    // Held inside the map after the widening, which can push it past an edge
+    // when the visible part is against one.
+    rect.translate(egui::vec2(
+        (map.left() - rect.left()).max(0.0) + (map.right() - rect.right()).min(0.0),
+        (map.top() - rect.top()).max(0.0) + (map.bottom() - rect.bottom()).min(0.0),
+    ))
+}
+
+/// The rectangle saying which part of the map is on screen.
+///
+/// Drawn in white inside black, the way the eyedropper marks its centre: a
+/// single-coloured outline disappears into whichever photograph it lands on,
+/// and a map whose frame cannot be found is a map that has stopped answering.
+fn frame_on_map(painter: &egui::Painter, map: egui::Rect, visible: (f32, f32, f32, f32)) {
+    let rect = framed(map, visible);
+
+    // What is off screen, dimmed, so the frame reads as "this part" rather
+    // than as a rectangle drawn on a picture.
+    let shade = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 110);
+    for outside in [
+        egui::Rect::from_min_max(map.min, egui::pos2(map.right(), rect.top())),
+        egui::Rect::from_min_max(egui::pos2(map.left(), rect.bottom()), map.max),
+        egui::Rect::from_min_max(egui::pos2(map.left(), rect.top()), egui::pos2(rect.left(), rect.bottom())),
+        egui::Rect::from_min_max(egui::pos2(rect.right(), rect.top()), egui::pos2(map.right(), rect.bottom())),
+    ] {
+        if outside.width() > 0.0 && outside.height() > 0.0 {
+            painter.rect_filled(outside, 0.0, shade);
+        }
+    }
+
+    painter.rect_stroke(
+        rect,
+        0.0,
+        egui::Stroke::new(3.0, egui::Color32::from_black_alpha(160)),
+        egui::StrokeKind::Outside,
+    );
+    painter.rect_stroke(rect, 0.0, egui::Stroke::new(1.5, egui::Color32::WHITE), egui::StrokeKind::Inside);
+}
+
 /// The colour path, spelled out.
 ///
 /// Centred like the key sheet rather than tucked in a corner: this is read
@@ -1390,6 +1588,18 @@ fn appearance_section(ui: &mut egui::Ui, appearance: &mut Appearance) -> bool {
     edited |= chrome_choice(ui, "Toolbar", &mut appearance.toolbar);
     ui.add_space(6.0);
     edited |= chrome_choice(ui, "Status line", &mut appearance.status_line);
+    ui.add_space(6.0);
+    edited |= choice(
+        ui,
+        "Minimap",
+        &mut appearance.minimap,
+        &[(Minimap::Zoomed, "when zoomed"), (Minimap::Always, "always"), (Minimap::Never, "never")],
+    );
+    ui.label(
+        egui::RichText::new("Where in the picture the window is, once part of it is off screen.")
+            .weak()
+            .small(),
+    );
 
     ui.add_space(8.0);
     ui.label("Behind transparency");
@@ -1653,6 +1863,21 @@ mod tests {
             reading: None,
             passport: None,
             hovering: false,
+            thumbnail: None,
+            visible: (0.0, 0.0, 1.0, 1.0),
+        }
+    }
+
+    /// A status carrying a map of a picture, framed on the part named.
+    fn mapped(visible: (f32, f32, f32, f32)) -> Status {
+        Status {
+            thumbnail: Some(Thumbnail {
+                width: 8,
+                height: 4,
+                pixels: vec![128; 8 * 4 * 3],
+            }),
+            visible,
+            ..status()
         }
     }
 
@@ -1893,6 +2118,7 @@ mod tests {
             toolbar: Chrome::Always,
             status_line: Chrome::Hover,
             backdrop: Backdrop::default(),
+            ..Appearance::default()
         });
         assert!(interface.toolbar_shown, "pinning it open did not show it");
 
@@ -1914,11 +2140,132 @@ mod tests {
             toolbar: Chrome::Never,
             status_line: Chrome::Hover,
             backdrop: Backdrop::default(),
+            ..Appearance::default()
         });
         assert!(!interface.toolbar_shown, "turning it off left it on screen");
 
         interface.follow_pointer(Some((400.0, 10.0)));
         assert!(!interface.toolbar_shown, "the pointer brought back a toolbar that was turned off");
+    }
+
+    /// The default rule shows the map exactly when part of the picture is off
+    /// screen, and not before: a map of a photograph that is wholly visible
+    /// points at all of itself, which is furniture that says nothing.
+    #[test]
+    fn the_map_arrives_with_the_zoom() {
+        assert!(
+            !minimap_wanted(Minimap::Zoomed, &mapped((0.0, 0.0, 1.0, 1.0))),
+            "a wholly visible picture got a map",
+        );
+        assert!(minimap_wanted(Minimap::Zoomed, &mapped((0.25, 0.25, 0.5, 0.5))), "a zoomed picture got no map",);
+    }
+
+    /// One axis off screen is enough: a panorama in a square window is exactly
+    /// the case where "where am I" is hardest to answer.
+    #[test]
+    fn one_axis_off_screen_is_enough() {
+        assert!(minimap_wanted(Minimap::Zoomed, &mapped((0.3, 0.0, 0.4, 1.0))));
+    }
+
+    #[test]
+    fn the_other_two_rules_do_what_they_say() {
+        assert!(minimap_wanted(Minimap::Always, &mapped((0.0, 0.0, 1.0, 1.0))));
+        assert!(!minimap_wanted(Minimap::Never, &mapped((0.25, 0.25, 0.5, 0.5))));
+    }
+
+    /// No picture, no map — including under `Always`, which is a rule about
+    /// zoom rather than an instruction to draw an empty frame.
+    #[test]
+    fn there_is_no_map_without_a_picture() {
+        assert!(!minimap_wanted(Minimap::Always, &status()));
+    }
+
+    /// Panning has to reach the digest, or the picture moves under a drag and
+    /// the frame stays where it started: the layout is skipped entirely when
+    /// the digest is unchanged, so a frame nobody asks for is never drawn.
+    ///
+    /// This is the failure the project has met before — an action inside the
+    /// layout that does not order a frame — and it looks like a minimap that
+    /// works until you actually drag.
+    #[test]
+    fn a_pan_is_a_change() {
+        let mut interface = Interface::new();
+        let before = mapped((0.25, 0.25, 0.5, 0.5));
+        interface.changed(&before);
+
+        let after = mapped((0.4, 0.25, 0.5, 0.5));
+        assert!(interface.changed(&after), "panning did not ask for a frame");
+    }
+
+    /// And a framing that has not moved does not ask for one, or the viewer
+    /// redraws forever over a still picture.
+    #[test]
+    fn a_still_framing_is_not_a_change() {
+        let mut interface = Interface::new();
+        let status = mapped((0.25, 0.25, 0.5, 0.5));
+        interface.changed(&status);
+
+        assert!(!interface.changed(&status), "an unchanged framing asked for a frame");
+    }
+
+    /// The map sits in the corner the other panels leave alone. Measured off
+    /// the layout rather than reasoned about, the way the histogram's place is.
+    #[test]
+    fn the_map_does_not_cover_the_histogram() {
+        let mut interface = Interface::new();
+        interface.toggle_histogram();
+        let status = Status {
+            histogram: Some(crate::histogram::Histogram {
+                channels: [vec![1; BUCKETS], vec![1; BUCKETS], vec![1; BUCKETS]],
+                luma: vec![1; BUCKETS],
+                counted: BUCKETS as u32,
+            }),
+            ..mapped((0.25, 0.25, 0.5, 0.5))
+        };
+
+        let histogram = laid_out_rect(&mut interface, &status, egui::Id::new("histogram"), 700.0);
+        let minimap = laid_out_rect(&mut interface, &status, egui::Id::new("minimap"), 700.0);
+        let (Some(histogram), Some(minimap)) = (histogram, minimap) else {
+            panic!("a panel that is showing was not laid out: {histogram:?}, {minimap:?}");
+        };
+
+        assert!(!histogram.intersects(minimap), "the map covers the histogram: {histogram:?} and {minimap:?}");
+    }
+
+    /// The frame points at the part of the picture that is on screen, in the
+    /// map's own coordinates. The property the whole panel exists for, checked
+    /// against the arithmetic rather than against a screenshot.
+    #[test]
+    fn the_frame_lands_on_the_part_that_is_visible() {
+        let map = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(100.0, 100.0));
+        let rect = framed(map, (0.5, 0.25, 0.5, 0.5));
+
+        assert!((rect.left() - 50.0).abs() < 0.01, "left {rect:?}");
+        assert!((rect.top() - 25.0).abs() < 0.01, "top {rect:?}");
+        assert!((rect.width() - 50.0).abs() < 0.01, "width {rect:?}");
+    }
+
+    /// At a deep zoom the visible part is a hair, and a frame drawn to scale
+    /// would be thinner than its own outline — invisible exactly when the map
+    /// is most needed.
+    #[test]
+    fn a_tiny_frame_is_still_findable() {
+        let map = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(100.0, 100.0));
+        let rect = framed(map, (0.5, 0.5, 0.001, 0.001));
+
+        assert!(rect.width() >= MINIMAP_MIN_FRAME, "width {}", rect.width());
+        assert!(rect.height() >= MINIMAP_MIN_FRAME, "height {}", rect.height());
+        assert!(map.contains_rect(rect), "the widened frame left the map: {rect:?}");
+    }
+
+    /// Widened against an edge, it stays on the map rather than hanging off it.
+    #[test]
+    fn a_frame_in_the_corner_stays_on_the_map() {
+        let map = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(100.0, 100.0));
+        for at in [(0.0, 0.0), (1.0, 1.0), (0.0, 1.0), (1.0, 0.0)] {
+            let rect = framed(map, (at.0, at.1, 0.001, 0.001));
+            assert!(map.contains_rect(rect), "a frame at {at:?} left the map: {rect:?}");
+        }
     }
 
     /// A chrome rule changing has to be drawn, or the setting is chosen and
@@ -1932,6 +2279,7 @@ mod tests {
             toolbar: Chrome::Hover,
             status_line: Chrome::Never,
             backdrop: Backdrop::default(),
+            ..Appearance::default()
         });
         assert!(interface.changed(&status()), "hiding the status line went unnoticed");
     }

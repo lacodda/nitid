@@ -30,6 +30,7 @@ use crate::histogram::Histogram;
 use crate::image_source::{self, Depth, Fidelity, LoadedImage, Orientation};
 use crate::interface::{Action, Interface, Status};
 use crate::loader::{Decoded, Loader, Request};
+use crate::minimap::Thumbnail;
 use crate::startup;
 use crate::vector::VectorImage;
 use crate::view::{FitMode, View};
@@ -176,6 +177,14 @@ struct Shown {
     /// Whether a count for this picture is already running, so opening and
     /// closing the panel does not start a second one.
     counting: bool,
+    /// A small copy of this picture, for the minimap.
+    ///
+    /// Made once the full image is in hand and kept until the picture changes
+    /// — including a quarter turn, which changes the shape of the map. `None`
+    /// for a thumbnail standing in: a map of the stand-in is the right scene
+    /// at the wrong detail, and it would be replaced a moment later by one
+    /// that looks identical.
+    thumbnail: Option<Thumbnail>,
 }
 
 struct App {
@@ -519,6 +528,10 @@ impl App {
             // real image.
             histogram: None,
             counting: false,
+            // Built after the picture is on screen, for the reason the
+            // histogram is counted there: nothing goes between the file and
+            // the first pixel.
+            thumbnail: None,
         });
 
         // A file replaces whatever was pasted, and the pasted pixels go with
@@ -529,6 +542,7 @@ impl App {
         // If the panel is already open — the user stepped to this image with
         // the histogram up — the new picture has to be counted for itself.
         self.count_if_wanted();
+        self.map_if_needed();
         // The same for the eyedropper: a reading belongs to the picture it
         // was taken from, and carrying it across a step would report a colour
         // from the image the user just left.
@@ -969,6 +983,57 @@ impl App {
         });
     }
 
+    /// Make the small copy the minimap draws, if the picture on screen has
+    /// not got one.
+    ///
+    /// On this thread rather than a worker, unlike the histogram: the copy is
+    /// a sampled grid of at most 160 by 160, which is twenty-five thousand
+    /// reads however large the file is — a fraction of a millisecond, where
+    /// counting a sixty-megapixel histogram is tens of them. A worker would
+    /// cost an event round-trip to save nothing.
+    ///
+    /// Made whether or not the minimap is on screen, because it is what
+    /// `Minimap::Zoomed` needs in hand the instant a zoom crosses the point
+    /// where the map appears — building it there would put a decode-sized
+    /// pause inside a wheel notch.
+    fn map_if_needed(&mut self) {
+        let Some(shown) = self.shown.as_ref() else {
+            return;
+        };
+        // A thumbnail standing in for the picture is the right scene at the
+        // wrong detail, and the map would be replaced moments later by one
+        // that looks the same.
+        if shown.thumbnail.is_some() || shown.fidelity != Fidelity::Full {
+            return;
+        }
+
+        let path = shown.path.clone();
+        // The composition the renderer draws with, so the map is turned the
+        // way the picture is.
+        let orientation = shown.orientation.then(shown.turn);
+        let pasted = shown.pasted;
+
+        let (pixels, transform) = if pasted {
+            let Some(pixels) = self.pasted.clone() else {
+                return;
+            };
+            (pixels, ColorTransform::identity())
+        } else {
+            let Request::Ready(image) = self.loader.request(&path) else {
+                // The full decode is still on its way; `upload` calls back
+                // here when it lands.
+                return;
+            };
+            let transform = ColorTransform::for_image(image.profile.as_ref(), &self.display_profile);
+            (image.image.clone(), transform)
+        };
+
+        let thumbnail = Thumbnail::of(&pixels, orientation, &transform);
+        if let Some(shown) = self.shown.as_mut() {
+            shown.thumbnail = thumbnail;
+        }
+    }
+
     /// A background count came back.
     fn counted(&mut self, path: PathBuf, histogram: Histogram) {
         let Some(shown) = self.shown.as_mut() else {
@@ -1218,6 +1283,10 @@ impl App {
             file_size: None,
             histogram: None,
             counting: false,
+            // Built after the picture is on screen, for the reason the
+            // histogram is counted there: nothing goes between the file and
+            // the first pixel.
+            thumbnail: None,
         });
         self.pasted = Some(image);
 
@@ -1226,6 +1295,7 @@ impl App {
         // that was open before.
         self.reading = None;
         self.count_if_wanted();
+        self.map_if_needed();
         self.refresh();
     }
 
@@ -1377,11 +1447,15 @@ impl App {
 
         let before = shown.turn;
         shown.turn = shown.turn.turned(clockwise);
+        // The map is drawn in the picture's oriented shape, so a turn makes
+        // the one in hand the wrong way round.
+        shown.thumbnail = None;
 
         if let Some(turned) = size_after_turn(shown.size, before, shown.turn) {
             shown.size = turned;
             shown.view = View::new(turned, window, scale_factor);
         }
+        self.map_if_needed();
         self.refresh();
     }
 
@@ -1515,6 +1589,11 @@ impl App {
             reading: self.reading,
             passport: self.passport(),
             hovering: self.hovering,
+            thumbnail: self.shown.as_ref().and_then(|shown| shown.thumbnail.clone()),
+            // What the window is showing, for the frame drawn on the map. A
+            // picture with nothing open is wholly visible, which is what stops
+            // the minimap from appearing over an empty window.
+            visible: self.shown.as_ref().map_or((0.0, 0.0, 1.0, 1.0), |shown| shown.view.visible_fraction()),
         }
     }
 

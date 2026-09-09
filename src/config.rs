@@ -99,6 +99,43 @@ impl Chrome {
     }
 }
 
+/// When the minimap is on screen.
+///
+/// Not [`Chrome`], though both answer "when is this shown": chrome appears
+/// when the pointer reaches for it, and the minimap's middle answer is about
+/// the picture rather than the pointer. A minimap is only ever useful when
+/// part of the image is off screen, so the default shows it exactly then and
+/// keeps a fitted photograph clear of furniture.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Minimap {
+    /// Only while part of the picture is off screen.
+    #[default]
+    Zoomed,
+    /// Whenever an image is open, even wholly visible.
+    Always,
+    /// Never.
+    Never,
+}
+
+impl Minimap {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "zoomed" => Some(Self::Zoomed),
+            "always" => Some(Self::Always),
+            "never" => Some(Self::Never),
+            _ => None,
+        }
+    }
+
+    fn render(self) -> &'static str {
+        match self {
+            Self::Zoomed => "zoomed",
+            Self::Always => "always",
+            Self::Never => "never",
+        }
+    }
+}
+
 /// How an image is framed when it arrives.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Opening {
@@ -256,6 +293,8 @@ pub const MAX_ZOOM_STEP: f32 = 2.0;
 pub struct Appearance {
     pub toolbar: Chrome,
     pub status_line: Chrome,
+    /// When the minimap shows where in the picture the window is.
+    pub minimap: Minimap,
     /// What shows through a transparent pixel when an image is opened.
     ///
     /// The `B` key still walks the four for the session; this is where it
@@ -399,6 +438,7 @@ impl Config {
                 "backdrop" => config.appearance.backdrop = Backdrop::from_keyword(value).unwrap_or_default(),
                 "toolbar" => config.appearance.toolbar = Chrome::parse(value).unwrap_or_default(),
                 "status_line" => config.appearance.status_line = Chrome::parse(value).unwrap_or_default(),
+                "minimap" => config.appearance.minimap = Minimap::parse(value).unwrap_or_default(),
 
                 "opening" => config.behaviour.opening = Opening::parse(value).unwrap_or_default(),
                 "hold_zoom" => config.behaviour.hold_zoom = value == "true",
@@ -442,6 +482,7 @@ impl Config {
         out.push_str(&format!("backdrop = {}\n", self.appearance.backdrop.keyword()));
         out.push_str(&format!("toolbar = {}\n", self.appearance.toolbar.render()));
         out.push_str(&format!("status_line = {}\n", self.appearance.status_line.render()));
+        out.push_str(&format!("minimap = {}\n", self.appearance.minimap.render()));
 
         out.push_str(&format!("opening = {}\n", self.behaviour.opening.render()));
         out.push_str(&format!("hold_zoom = {}\n", self.behaviour.hold_zoom));
@@ -548,6 +589,7 @@ mod tests {
             appearance: Appearance {
                 toolbar: Chrome::Always,
                 status_line: Chrome::Never,
+                minimap: Minimap::Always,
                 backdrop: Backdrop::Checker,
             },
             behaviour: Behaviour {

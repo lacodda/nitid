@@ -207,6 +207,25 @@ grey that happens to match the scene". The checker is measured in screen
 pixels, so it stays the same size at any zoom rather than reading as part of
 the picture.
 
+**The minimap** appears once part of the picture is off screen: the whole
+image small in the bottom-right corner, with the part you are looking at framed
+and the rest dimmed. Zoomed in, a viewer answers "what is here" and stops
+answering "where is this"; the frame moves as you drag, so the photograph stays
+navigable at a zoom where nothing on screen says where in the frame you are. At
+a deep zoom the visible part is a hair, and the frame is held to something the
+eye can find rather than drawn to scale — the zoom in the status line is what
+states the measurement.
+
+It is drawn in **the display's colours**, unlike the histogram and the
+eyedropper's numbers. Those report facts about the file; a minimap is a picture
+of the picture, and one painted in the file's numbers would be a visibly
+different colour from the photograph it sits beside. It is built once per
+image, by sampling rather than averaging, so a sixty-megapixel file costs the
+same as a small one and nothing is spent inside a drag.
+
+By default it is there only when it has something to say. The View section of
+the settings has the other two answers: always, or never.
+
 ## Reading the picture
 
 Two things that answer questions the picture on screen cannot.
@@ -588,7 +607,7 @@ dragged while watching what it marks. Four sections:
 | Section | What it holds |
 | --- | --- |
 | Gestures | what the bare wheel does — zoom or step through the folder — how far one notch zooms, whether the wheel is reversed, whether the middle button toggles fit and 100% |
-| View | when the toolbar and the status line are on screen: on hover, always, or never; and what shows behind transparency when a picture opens |
+| View | when the toolbar and the status line are on screen: on hover, always, or never; when the minimap is — zoomed, always or never; and what shows behind transparency when a picture opens |
 | Opening | fit or 100% for a picture that arrives, whether the framing is held across a step, whether the folder wraps at its ends, and the order it is walked in — name, date or size |
 | Colour | where the clipping zebra draws its two lines, the units the eyedropper reads in, what a click copies, and whether the eyedropper magnifies the pixels around the pointer |
 

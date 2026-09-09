@@ -191,7 +191,7 @@ fn neighbourhood(image: &DecodedImage, orientation: Orientation, transform: &Col
 
 /// The stored channels and alpha of the pixel shown at `at`, or `None` when
 /// `at` is outside the picture as shown.
-fn sample(image: &DecodedImage, orientation: Orientation, shown: (u32, u32), at: (u32, u32)) -> Option<([u16; 3], u8)> {
+pub(crate) fn sample(image: &DecodedImage, orientation: Orientation, shown: (u32, u32), at: (u32, u32)) -> Option<([u16; 3], u8)> {
     if at.0 >= shown.0 || at.1 >= shown.1 {
         return None;
     }
@@ -218,7 +218,7 @@ fn sample(image: &DecodedImage, orientation: Orientation, shown: (u32, u32), at:
 
 /// The picture's size as shown, which is the stored size with the axes
 /// exchanged for a quarter turn.
-fn shown_size(image: &DecodedImage, orientation: Orientation) -> (u32, u32) {
+pub(crate) fn shown_size(image: &DecodedImage, orientation: Orientation) -> (u32, u32) {
     if orientation.swaps_axes() {
         (image.height, image.width)
     } else {
@@ -266,7 +266,7 @@ fn to_eight(sample: u16, depth: Depth) -> u8 {
 /// here on the CPU rather than read back from the GPU because reading one
 /// pixel off a surface costs a stall of the whole pipeline, and this is asked
 /// for on every mouse move while the eyedropper is up.
-fn through(transform: &ColorTransform, raw: [u16; 3], depth: Depth) -> [u8; 3] {
+pub(crate) fn through(transform: &ColorTransform, raw: [u16; 3], depth: Depth) -> [u8; 3] {
     let normalised = |channel: usize| match depth {
         Depth::Eight => f32::from(raw[channel]) / 255.0,
         Depth::Sixteen => f32::from(raw[channel]) / 65535.0,

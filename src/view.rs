@@ -109,6 +109,49 @@ impl View {
         (self.image.0 * self.scale, self.image.1 * self.scale)
     }
 
+    /// Which part of the picture the window is showing, as fractions of the
+    /// whole image: `(left, top, width, height)`, each in 0..=1.
+    ///
+    /// This is what the minimap draws its frame from, and it is stated in
+    /// fractions rather than pixels for the reason the zoom lock states its
+    /// position that way: the minimap is a picture of the image at whatever
+    /// size it happens to be drawn, and a rectangle in image pixels would have
+    /// to be converted at every call site that has a different size.
+    ///
+    /// The whole image visible — fitted, or zoomed out past the window — is
+    /// `(0.0, 0.0, 1.0, 1.0)`, which is what tells a minimap that its frame
+    /// would cover everything and there is nothing to point at.
+    ///
+    /// Measured on the framing that is on screen, not the one the loupe is
+    /// holding aside: the minimap answers "what am I looking at", and while
+    /// the loupe is down what the user is looking at is the loupe.
+    pub fn visible_fraction(&self) -> (f32, f32, f32, f32) {
+        let (width, height) = self.scaled_size();
+        if width <= 0.0 || height <= 0.0 {
+            return (0.0, 0.0, 1.0, 1.0);
+        }
+
+        // How much of each axis fits in the window, as a fraction of the
+        // image. Clamped at 1: an image smaller than the window shows all of
+        // itself, and the surplus window is not part of the picture.
+        let span_x = (self.window.0 / width).min(1.0);
+        let span_y = (self.window.1 / height).min(1.0);
+
+        // The window's centre, as a fraction of the image. A positive offset
+        // moves the image right, which moves the window left over it — hence
+        // the minus.
+        let centre_x = 0.5 - self.offset.0 / width;
+        let centre_y = 0.5 - self.offset.1 / height;
+
+        // Held inside the picture, so a frame never hangs off the minimap.
+        // Panning is clamped already, but an image narrower than the window on
+        // one axis is centred by that clamp rather than pinned, and the
+        // arithmetic above has to agree with what is on screen.
+        let left = (centre_x - span_x / 2.0).clamp(0.0, 1.0 - span_x);
+        let top = (centre_y - span_y / 2.0).clamp(0.0, 1.0 - span_y);
+        (left, top, span_x, span_y)
+    }
+
     /// Carry this framing onto a different picture, for the zoom lock.
     ///
     /// Unlike [`rebase`](Self::rebase), the two images are not the same
@@ -971,5 +1014,94 @@ mod tests {
     fn a_nonsense_scale_factor_falls_back_to_one() {
         let view = View::new((100, 100), (1000, 1000), 0.0);
         assert!(about(view.scale(), view.physical_scale()));
+    }
+
+    /// A fitted picture is entirely on screen, so its frame covers everything
+    /// — which is what tells the minimap it has nothing to point at.
+    #[test]
+    fn a_fitted_picture_is_wholly_visible() {
+        let view = view((2000, 1000), (1000, 1000));
+        let (left, top, width, height) = view.visible_fraction();
+        assert!(about(left, 0.0) && about(top, 0.0));
+        assert!(about(width, 1.0) && about(height, 1.0));
+    }
+
+    /// An image smaller than the window is wholly visible too: the surplus
+    /// window around it is not part of the picture, and a frame that counted
+    /// it would report less than the whole image as being on screen.
+    #[test]
+    fn a_small_picture_is_wholly_visible() {
+        let view = view((100, 80), (1000, 1000));
+        let (_, _, width, height) = view.visible_fraction();
+        assert!(about(width, 1.0) && about(height, 1.0));
+    }
+
+    /// Zoomed to twice the fitted size, half of each axis is on screen, and it
+    /// is the middle half: zooming does not move what is being looked at.
+    #[test]
+    fn zooming_in_shows_a_centred_half() {
+        let mut view = view((1000, 1000), (1000, 1000));
+        view.zoom_to_at(2.0, (500.0, 500.0));
+
+        let (left, top, width, height) = view.visible_fraction();
+        assert!(about(width, 0.5), "width {width}");
+        assert!(about(height, 0.5), "height {height}");
+        assert!(about(left, 0.25), "left {left}");
+        assert!(about(top, 0.25), "top {top}");
+    }
+
+    /// The property the minimap exists for: panning moves the frame the same
+    /// way the eye moves over the picture. Dragging the image left — which is
+    /// how a mouse moves the view rightwards — has to move the frame right.
+    ///
+    /// This is the sign the arithmetic is easiest to get backwards on, and a
+    /// frame that tracks the pan inverted is a minimap that lies while looking
+    /// perfectly plausible.
+    #[test]
+    fn panning_moves_the_frame_the_way_the_eye_moves() {
+        let mut view = view((1000, 1000), (1000, 1000));
+        view.zoom_to_at(2.0, (500.0, 500.0));
+        let (before, _, _, _) = view.visible_fraction();
+
+        // Drag the image leftwards: the window travels right over the picture.
+        view.pan((-200.0, 0.0));
+        let (after, _, _, _) = view.visible_fraction();
+
+        assert!(after > before, "the frame went the wrong way: {before} -> {after}");
+    }
+
+    /// Panned against an edge, the frame sits against that edge of the minimap
+    /// rather than hanging off it.
+    #[test]
+    fn a_frame_stays_inside_the_picture() {
+        let mut view = view((1000, 1000), (1000, 1000));
+        view.zoom_to_at(4.0, (500.0, 500.0));
+        view.pan((10_000.0, 10_000.0));
+
+        let (left, top, width, height) = view.visible_fraction();
+        assert!(about(left, 0.0) && about(top, 0.0), "not against the top left: {left}, {top}");
+        assert!(left + width <= 1.001 && top + height <= 1.001, "the frame runs past the picture");
+    }
+
+    /// A picture zoomed on one axis only — a panorama in a square window —
+    /// reports the whole of the axis that fits and a slice of the one that
+    /// does not.
+    #[test]
+    fn an_axis_that_fits_reports_all_of_itself() {
+        let mut view = view((4000, 500), (1000, 1000));
+        view.zoom_to_at(1.0, (500.0, 500.0));
+
+        let (_, top, width, height) = view.visible_fraction();
+        assert!(about(height, 1.0), "the short axis is not wholly visible: {height}");
+        assert!(about(top, 0.0));
+        assert!(width < 0.5, "the long axis should be a slice: {width}");
+    }
+
+    #[test]
+    fn a_degenerate_size_yields_the_whole_picture() {
+        let view = view((0, 0), (0, 0));
+        let (left, top, width, height) = view.visible_fraction();
+        assert!(left.is_finite() && top.is_finite());
+        assert!(width > 0.0 && height > 0.0);
     }
 }
