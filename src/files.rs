@@ -21,18 +21,17 @@
 //! window that has to be told what happened to a file it may already have
 //! stepped away from.
 
-#[cfg(windows)]
 use std::path::{Path, PathBuf};
 
+use anyhow::Result;
 #[cfg(windows)]
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, bail};
 
 /// What became of the file.
 ///
 /// The path matters to the caller: after a rename or a move the folder is
 /// holding a name that is no longer there, and it has to be told what replaced
 /// it — or, for a delete, that nothing did.
-#[cfg(windows)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
     /// The file is in the recycle bin; nothing stands where it was.
@@ -285,6 +284,42 @@ where
     }
     result
 }
+
+/// Elsewhere, these are not offered.
+///
+/// The same shape as the clipboard's counterpart, and for the same reason: the
+/// Linux build exists to keep the core portable (winit and wgpu run there), and
+/// it must compile rather than carry a hole where a caller names a function
+/// that is not there. The message says the feature is a Windows one instead of
+/// failing silently — this viewer's file operations are the shell's own, and
+/// there is no shell here to lend them.
+#[cfg(not(windows))]
+mod elsewhere {
+    use std::path::Path;
+
+    use anyhow::{Result, bail};
+
+    use super::Outcome;
+
+    pub fn recycle(_path: &Path) -> Result<Outcome> {
+        bail!("the recycle bin is a Windows feature")
+    }
+
+    pub fn rename(_path: &Path, _name: &str) -> Result<Outcome> {
+        bail!("renaming goes through the Windows shell")
+    }
+
+    pub fn move_to(_path: &Path, _folder: &Path) -> Result<Outcome> {
+        bail!("sorting goes through the Windows shell")
+    }
+
+    pub fn copy_to(_path: &Path, _folder: &Path) -> Result<Outcome> {
+        bail!("sorting goes through the Windows shell")
+    }
+}
+
+#[cfg(not(windows))]
+pub use elsewhere::{copy_to, move_to, recycle, rename};
 
 #[cfg(test)]
 #[cfg(windows)]
