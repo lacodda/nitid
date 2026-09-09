@@ -25,7 +25,15 @@ jobs:
       - uses: actions/checkout@v7
       - name: Install Linux build deps (winit/wgpu)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev pkg-config
+        # The runner image carries third-party apt sources (Google Chrome
+        # among them), and `apt-get update` exits non-zero when any one of
+        # them serves a broken index — an outage in something this project
+        # never installs would otherwise stop the build. The update may
+        # report that and carry on; the install must not, so a package that
+        # is genuinely missing still fails the job.
+        run: |
+          sudo apt-get update || echo "apt-get update reported a problem with a repository; carrying on"
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev pkg-config
       # `rav1d` assembles its own hand-written kernels and does not compile at
       # all without NASM — not "falls back to a slower path", does not build.
       - name: Install NASM (rav1d, for AVIF)
@@ -58,7 +66,15 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install Linux build deps
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev pkg-config
+        # The runner image carries third-party apt sources (Google Chrome
+        # among them), and `apt-get update` exits non-zero when any one of
+        # them serves a broken index — an outage in something this project
+        # never installs would otherwise stop the build. The update may
+        # report that and carry on; the install must not, so a package that
+        # is genuinely missing still fails the job.
+        run: |
+          sudo apt-get update || echo "apt-get update reported a problem with a repository; carrying on"
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev pkg-config
       # `rav1d` assembles its own hand-written kernels and does not compile at
       # all without NASM — not "falls back to a slower path", does not build.
       - name: Install NASM (rav1d, for AVIF)
