@@ -361,6 +361,17 @@ have fitted the picture to the window and shown it at 100% since v0.1.0, and a
 sorting key added later does not get to take a viewing gesture that has been
 there from the beginning.
 
+**`E` opens the picture in the program that edits it.** Not a copy, not an
+export — the file on screen, in whatever Windows already associates with that
+kind of image, which is the same program the context menu's own "Edit" would
+start. It works without being configured; naming an editor in the settings
+only overrides the choice. `Alt+1` through `Alt+9` open the file in programs
+you name yourself, for the ones the system would never pick: a raw converter,
+a batch stamper, an upload script.
+
+Nothing waits for the program to close, and the picture is not reloaded when
+it does — an edit takes as long as it takes, and `R` reloads when you want it.
+
 Everything here goes through **the shell's own file operations**, never a
 direct write. That is what makes a delete land in the recycle bin instead of
 being gone, puts the operation on the shell's undo stack, and resolves a name
@@ -511,7 +522,8 @@ deep zoom stops being a view with no map. **And the folder is yours to work
 through**: `Del` sends a file to the recycle bin and moves on, `F2` renames it,
 and `Ctrl+1`-`9` sort it into folders you set — all through the shell's own
 operations, so a delete is undoable and a name that is taken never costs you
-the picture that was already there. Development runs in small versions, each
+the picture that was already there. **And it hands the file on**: `E` opens
+the picture in the program that edits it, with no trip through Explorer. Development runs in small versions, each
 one theme; the road to 1.0 is fixed:
 
 | Version | What lands |
