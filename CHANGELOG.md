@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.29.0] - 2026-09-10
+
+### Documentation
+- Record why a turn is a label
+
+### Features
+- Keep a turn in the file, and mirror the picture
 ## [0.28.0] - 2026-09-10
 
 ### Documentation
@@ -9,6 +16,9 @@ All notable changes to this project are documented in this file.
 
 ### Features
 - Hand the picture to another program
+
+### Testing
+- Build the path from the platform's separator
 ## [0.27.2] - 2026-09-10
 
 ### Bug Fixes
