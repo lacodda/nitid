@@ -67,4 +67,8 @@ mutation testing confirms it is the only thing that notices when the direction
 is reversed.
 
 The user's turn is not written to the file, and does not survive a step to
-another image. Writing a rotation back — losslessly for JPEG — is v0.26.0.
+another image. **Settled in v0.29.0** by ADR 0024: `Ctrl+S` writes the turn
+as the file's EXIF orientation — the composition this document describes,
+not the turn alone — and the pixels are never touched. The version named
+here when this was written was v0.26.0, which came and went with other
+work.

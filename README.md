@@ -372,6 +372,19 @@ a batch stamper, an upload script.
 Nothing waits for the program to close, and the picture is not reloaded when
 it does — an edit takes as long as it takes, and `R` reloads when you want it.
 
+**`Ctrl+S` keeps a turn.** `R` and `Shift+R` turn the picture on screen and
+always have; pressing `Ctrl+S` writes that turn into the file, so it stays
+turned in every other program too. Nothing is re-encoded to do it — the file's
+orientation tag is rewritten and the compressed image data is left exactly as
+it was, byte for byte. A photograph turned this way a hundred times is the same
+photograph. `F` mirrors the picture left to right, `Shift+F` top to bottom, and
+those save the same way.
+
+Turning and saving are separate on purpose: looking at a photograph from
+another angle leaves nothing on disk until you say so. The one thing to know is
+that a program which ignores EXIF orientation — a few old tools do — will still
+show the original; the trade is deliberate, and the reasoning is in ADR 0024.
+
 Everything here goes through **the shell's own file operations**, never a
 direct write. That is what makes a delete land in the recycle bin instead of
 being gone, puts the operation on the shell's undo stack, and resolves a name
@@ -486,7 +499,7 @@ has no size limit to hide behind.
 
 ## Status
 
-Early development — v0.28.0 is out. Startup, colour and format coverage hold:
+Early development — v0.29.0 is out. Startup, colour and format coverage hold:
 every modern still format opens, a phone's photographs included, every one of
 them reaches the screen without a wait, and the ones that animate play. The
 process that decodes the heavy formats runs with no network in either
@@ -523,7 +536,8 @@ through**: `Del` sends a file to the recycle bin and moves on, `F2` renames it,
 and `Ctrl+1`-`9` sort it into folders you set — all through the shell's own
 operations, so a delete is undoable and a name that is taken never costs you
 the picture that was already there. **And it hands the file on**: `E` opens
-the picture in the program that edits it, with no trip through Explorer. Development runs in small versions, each
+the picture in the program that edits it, with no trip through Explorer,
+and `Ctrl+S` keeps a turn in the file without re-encoding a single pixel. Development runs in small versions, each
 one theme; the road to 1.0 is fixed:
 
 | Version | What lands |
@@ -562,7 +576,8 @@ one theme; the road to 1.0 is fixed:
 | ✅ v0.27.1 | Messages draw their arrows |
 | ✅ v0.27.2 | A panel opens on the first click, without waiting for the pointer to move |
 | ✅ v0.28.0 | An external editor: `E` opens the picture in the program that edits it |
-| v0.29.0 – v0.37.0 | The everyday viewer: lossless rotation, culling, comparison, slideshow |
+| ✅ v0.29.0 | Lossless rotation: a turn saved to the file, and mirroring |
+| v0.30.0 – v0.37.0 | The everyday viewer: export, culling, comparison, slideshow |
 | v0.39.0 – v0.42.0 | Windows integration: context menu, installer, auto-update, thumbnails |
 | v0.43.0 – v0.44.0 | Documentation site, stabilisation |
 | v1.0.0 | Public release — the default viewer, nothing missing |

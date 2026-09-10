@@ -56,8 +56,10 @@ mod view;
 pub mod testing {
     pub use crate::color::{ColorTransform, profile_from};
     pub use crate::format::Format;
+    pub use crate::image_source::Orientation;
     pub use crate::image_source::{Depth, decode_here};
     pub use crate::metadata::read as read_metadata;
+    pub use crate::rotate::save_orientation;
     pub use crate::sandbox::decode as decode_sandboxed;
 
     /// Every key the key sheet advertises, for the test that holds the README
