@@ -207,6 +207,17 @@ impl Loader {
         }
     }
 
+    /// Drop what is remembered about a file, because the file changed.
+    ///
+    /// The cache answers "what did this path hold when it was read", which
+    /// stops being true the moment the viewer itself writes to it - saving a
+    /// turn does. Without this, stepping away and back would show the picture
+    /// as it was before the turn was saved, and the file on disk and the
+    /// picture on screen would disagree with nothing to say which was right.
+    pub fn forget(&self, path: &Path) {
+        self.cache.lock().expect("the cache is poisoned").remove(path);
+    }
+
     /// How many neighbours on each side the caller should offer to `prefetch`.
     pub fn radius() -> usize {
         PREFETCH_RADIUS

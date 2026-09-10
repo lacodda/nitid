@@ -656,6 +656,8 @@ Opening a file opens its folder: the arrow keys walk the images beside it.
 | `F2` | rename this file |
 | `Ctrl+1`-`9` | move this file to the folder set for that key |
 | `Ctrl+Shift+1`-`9` | copy it there instead |
+| `F` | mirror it left to right; `Shift+F` top to bottom |
+| `Ctrl+S` | write the turn into the file, without touching its pixels |
 | `E` | open this file in the program that edits it |
 | `Alt+1`-`9` | open it in the program set for that key |
 | `F11` | fullscreen |

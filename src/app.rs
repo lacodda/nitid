@@ -871,6 +871,10 @@ impl App {
                 // arrives as the capital letter and needs no modifier state.
                 "r" => self.turn(true),
                 "R" => self.turn(false),
+                // Mirror. Horizontal is the common one - a selfie, a scan fed
+                // in the wrong way round - so it gets the bare key.
+                "f" => self.flip(true),
+                "F" => self.flip(false),
                 // Hold the framing across a step, for comparing a series
                 // frame by frame. Announced by a toast and shown in the
                 // status line: a mode with no sign of itself is a mode the
@@ -1085,8 +1089,49 @@ impl App {
             Some(Chord::CopyPath) => self.copy_path(),
             Some(Chord::CopyPicture) => self.copy_picture(),
             Some(Chord::Paste) => self.paste_picture(),
+            Some(Chord::SaveTurn) => self.save_turn(),
             None => {}
         }
+    }
+
+    /// Write the turn on screen into the file, and stop calling it a turn.
+    ///
+    /// What is written is the orientation the picture *is*, not the turn that
+    /// was asked for: the file already carried one, and the two compose the
+    /// same way the renderer composes them to draw the thing. Saving only
+    /// `turn` would throw away the file's own orientation and land a
+    /// photograph somewhere nobody asked for.
+    ///
+    /// Afterwards the turn is folded into the file's orientation and cleared.
+    /// The picture on screen does not move - it is the same composition,
+    /// described differently - but pressing save again now writes the same
+    /// value rather than turning it further, and stepping away and back shows
+    /// what was saved.
+    fn save_turn(&mut self) {
+        let Some(path) = self.file_on_screen() else {
+            return;
+        };
+        let Some(shown) = self.shown.as_ref() else {
+            return;
+        };
+        let saved = shown.orientation.then(shown.turn);
+        let name = name_of(&path);
+
+        match crate::rotate::save_orientation(&path, saved) {
+            Ok(()) => {
+                if let Some(shown) = self.shown.as_mut() {
+                    shown.orientation = saved;
+                    shown.turn = Orientation::Normal;
+                }
+                // The loader holds what the file said when it was read, and
+                // that is now out of date - without this, stepping away and
+                // back would show the turn undone.
+                self.loader.forget(&path);
+                self.interface.toast(format!("{name} keeps the turn"), Instant::now());
+            }
+            Err(error) => self.report(error),
+        }
+        self.request_redraw();
     }
 
     /// Send the file on screen to the recycle bin and move on.
@@ -1652,6 +1697,24 @@ impl App {
         self.refresh();
     }
 
+    /// Mirror the picture on screen.
+    ///
+    /// Unlike a turn, this never exchanges width and height, so the framing
+    /// the person set still fits and is deliberately left alone: a mirror that
+    /// also refitted the view would move the picture under their eyes for no
+    /// reason they asked for.
+    fn flip(&mut self, horizontal: bool) {
+        let Some(shown) = self.shown.as_mut() else {
+            return;
+        };
+        shown.turn = shown.turn.flipped(horizontal);
+        // The map is drawn in the picture's oriented shape, so mirroring makes
+        // the one in hand the wrong way round - the same reason a turn drops it.
+        shown.thumbnail = None;
+        self.map_if_needed();
+        self.refresh();
+    }
+
     fn reframe(&mut self, how: Reframe) {
         if let Some(shown) = self.shown.as_mut() {
             match how {
@@ -2023,6 +2086,8 @@ fn handled(key: &Key) -> bool {
         Key::Character(character) => matches!(
             character.as_str(),
             "e" | "E"
+                | "f"
+                | "F"
                 | "+"
                 | "="
                 | "-"
@@ -2060,6 +2125,7 @@ enum Chord {
     CopyPicture,
     CopyPath,
     Paste,
+    SaveTurn,
 }
 
 /// Which chord a key is, with Ctrl already known to be down.
@@ -2077,6 +2143,7 @@ fn chord_for(key: &Key) -> Option<Chord> {
         "C" => Some(Chord::CopyPath),
         "c" => Some(Chord::CopyPicture),
         "v" | "V" => Some(Chord::Paste),
+        "s" | "S" => Some(Chord::SaveTurn),
         _ => None,
     }
 }
@@ -3388,7 +3455,7 @@ mod tests {
             .map(|(key, _)| *key)
             .filter(|key| (key.starts_with("Ctrl+") || key.starts_with("Alt+")) && !key.contains("Drag") && !key.contains("Wheel"))
             .collect();
-        assert_eq!(advertised.len(), 6, "the sheet lists {advertised:?}, which is not the six chords");
+        assert_eq!(advertised.len(), 7, "the sheet lists {advertised:?}, which is not the seven chords");
 
         for key in advertised {
             let named = key.rsplit('+').next().expect("a chord names a key");

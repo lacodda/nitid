@@ -87,6 +87,10 @@ egui-wgpu = "0.36.1"
 egui-winit = { version = "0.36.1", default-features = false, features = ["clipboard"] }
 
 kamadak-exif = "0.6"
+# Reading EXIF and writing it are different crates: `kamadak-exif` only
+# reads, which is why a rotation saved to the file needs this one. Pure
+# Rust, like every other decoder here.
+little_exif = "0.6"
 bytemuck = { version = "1.25.2", features = ["derive"] }
 moxcms = "0.9"
 flate2 = "1.1.9"

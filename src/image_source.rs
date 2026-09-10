@@ -189,6 +189,16 @@ impl Orientation {
     pub fn turned(self, clockwise: bool) -> Self {
         self.then(if clockwise { Self::Rotate90 } else { Self::Rotate270 })
     }
+
+    /// Mirror the picture, as the person looking at it sees it.
+    ///
+    /// A viewing transform like `turned`, and composed the same way, which is
+    /// what keeps a flip after a quarter turn honest: mirroring the *screen*
+    /// horizontally is not mirroring the *file* horizontally once the file
+    /// arrives on its side, and the matrix is what knows the difference.
+    pub fn flipped(self, horizontal: bool) -> Self {
+        self.then(if horizontal { Self::FlipHorizontal } else { Self::FlipVertical })
+    }
 }
 
 /// Whether an image is the real thing or the placeholder shown while it loads.
@@ -1538,6 +1548,95 @@ mod tests {
         for start in ALL {
             assert_eq!(start.then(Orientation::Normal), start);
             assert_eq!(Orientation::Normal.then(start), start);
+        }
+    }
+
+    /// Mirroring the screen is not mirroring the file once the file arrives
+    /// on its side.
+    ///
+    /// On an upright picture `F` is plainly `FlipHorizontal`, and a viewer
+    /// that stored it as that would look correct on every ordinary photograph.
+    /// On one the file turns a quarter, mirroring what the person *sees*
+    /// left-to-right is a vertical flip of the stored pixels - which is what
+    /// composition works out and a hand-written rule would get wrong.
+    #[test]
+    fn mirroring_what_is_seen_is_not_always_mirroring_what_is_stored() {
+        // Upright: what is seen and what is stored agree.
+        assert_eq!(Orientation::Normal.flipped(true), Orientation::FlipHorizontal);
+
+        // On its side: they do not. `Rotate90` then a horizontal mirror is
+        // `Transpose`, not `FlipHorizontal`.
+        let sideways = Orientation::Rotate90.flipped(true);
+        assert_eq!(sideways, Orientation::Transpose, "mirroring a sideways picture did not compose");
+        assert_ne!(sideways, Orientation::FlipHorizontal, "the stored mirror was taken as the seen one");
+    }
+
+    /// Two mirrors of the same kind cancel, from any starting orientation.
+    ///
+    /// The property that says `flipped` composes rather than merely setting a
+    /// value: a version that assigned the flip would fail here on everything
+    /// except an upright picture.
+    #[test]
+    fn mirroring_twice_returns_to_the_start() {
+        for start in [
+            Orientation::Normal,
+            Orientation::FlipHorizontal,
+            Orientation::Rotate180,
+            Orientation::FlipVertical,
+            Orientation::Transpose,
+            Orientation::Rotate90,
+            Orientation::Transverse,
+            Orientation::Rotate270,
+        ] {
+            for horizontal in [true, false] {
+                assert_eq!(
+                    start.flipped(horizontal).flipped(horizontal),
+                    start,
+                    "mirroring {start:?} twice (horizontal: {horizontal}) did not come back",
+                );
+            }
+        }
+    }
+
+    /// What a saved turn writes is the composition, not the turn alone.
+    ///
+    /// A file already carries an orientation, and the person turned the
+    /// picture *as they saw it* - which is the file's orientation with the
+    /// turn on top, exactly the composition the renderer draws. Writing only
+    /// the turn would discard what the file said and land a photograph
+    /// somewhere nobody asked for, and it would look right on every picture
+    /// whose file said `Normal`, which is most of them: the defect would ship
+    /// and only show up on photographs from a phone held sideways.
+    #[test]
+    fn a_saved_turn_is_the_file_and_the_turn_together() {
+        // A file that already asks for a quarter turn, turned once more.
+        let file = Orientation::Rotate90;
+        let turn = Orientation::Rotate90;
+        assert_eq!(
+            file.then(turn),
+            Orientation::Rotate180,
+            "a quarter turn on a file already turned a quarter did not make a half turn",
+        );
+        // And the turn alone is not the answer, which is the mistake this
+        // guards: it would write a quarter turn over a file that needed a half.
+        assert_ne!(turn, file.then(turn), "this test cannot tell the composition from the turn");
+    }
+
+    /// Saving folds the turn into the orientation and leaves the picture where
+    /// it was: the same composition, described differently.
+    ///
+    /// This is what makes a second press write the same value rather than
+    /// turning the picture further.
+    #[test]
+    fn folding_a_saved_turn_leaves_the_picture_facing_the_same_way() {
+        for file in [Orientation::Normal, Orientation::Rotate90, Orientation::FlipHorizontal, Orientation::Transverse] {
+            for turn in [Orientation::Rotate90, Orientation::Rotate270, Orientation::FlipVertical] {
+                let shown_before = file.then(turn);
+                // What `save_turn` does: the composition becomes the file's
+                // orientation, and the turn goes back to nothing.
+                let (file_after, turn_after) = (shown_before, Orientation::Normal);
+                assert_eq!(file_after.then(turn_after), shown_before, "folding {turn:?} into {file:?} moved the picture",);
+            }
         }
     }
 
