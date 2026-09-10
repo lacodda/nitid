@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.28.0] - 2026-09-10
+
+### Documentation
+- Say what E and the program keys do
+
+### Features
+- Hand the picture to another program
 ## [0.27.2] - 2026-09-10
 
 ### Bug Fixes
@@ -10,7 +17,7 @@ All notable changes to this project are documented in this file.
 
 ### Bug Fixes
 - Draw the arrow instead of a box
-- Open a panel on the first click, not on the next move (incomplete: one frame was granted where two were due, fixed in 0.27.2)
+- Open a panel on the first click, not on the next move
 ## [0.27.0] - 2026-09-09
 
 ### Bug Fixes

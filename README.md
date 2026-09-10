@@ -486,7 +486,7 @@ has no size limit to hide behind.
 
 ## Status
 
-Early development — v0.27.2 is out. Startup, colour and format coverage hold:
+Early development — v0.28.0 is out. Startup, colour and format coverage hold:
 every modern still format opens, a phone's photographs included, every one of
 them reaches the screen without a wait, and the ones that animate play. The
 process that decodes the heavy formats runs with no network in either
@@ -561,7 +561,8 @@ one theme; the road to 1.0 is fixed:
 | ✅ v0.27.0 | File operations: the recycle bin, renaming, and nine folders to sort into |
 | ✅ v0.27.1 | Messages draw their arrows |
 | ✅ v0.27.2 | A panel opens on the first click, without waiting for the pointer to move |
-| v0.28.0 – v0.37.0 | The everyday viewer: an external editor, culling, comparison, slideshow |
+| ✅ v0.28.0 | An external editor: `E` opens the picture in the program that edits it |
+| v0.29.0 – v0.37.0 | The everyday viewer: lossless rotation, culling, comparison, slideshow |
 | v0.39.0 – v0.42.0 | Windows integration: context menu, installer, auto-update, thumbnails |
 | v0.43.0 – v0.44.0 | Documentation site, stabilisation |
 | v1.0.0 | Public release — the default viewer, nothing missing |
