@@ -2,11 +2,15 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.27.2] - 2026-09-10
+
+### Bug Fixes
+- Let egui say how many frames a panel needs
 ## [0.27.1] - 2026-09-09
 
 ### Bug Fixes
 - Draw the arrow instead of a box
-- Open a panel on the first click, not on the next move
+- Open a panel on the first click, not on the next move (incomplete: one frame was granted where two were due, fixed in 0.27.2)
 ## [0.27.0] - 2026-09-09
 
 ### Bug Fixes
