@@ -155,9 +155,17 @@ mod tests {
     /// The name in a message is the file's own, not the whole path: the
     /// settings hold `C:\Program Files\...\thing.exe` and a message that
     /// repeated it would be a message nobody reads to the end.
+    ///
+    /// Built from the platform's own separator rather than written out with
+    /// backslashes. A backslash is an ordinary character in a Linux path, so a
+    /// literal Windows path here would assert that the whole string is its own
+    /// last component - true there, and nothing to do with the behaviour being
+    /// checked. The Linux build exists to keep the core portable, and its tests
+    /// have to be about the core.
     #[test]
     fn a_message_names_the_file_rather_than_its_whole_path() {
-        assert_eq!(name_of(Path::new(r"C:\Program Files\Some Editor\editor.exe")), "editor.exe");
+        let nested: std::path::PathBuf = ["a folder", "another one", "editor.exe"].iter().collect();
+        assert_eq!(name_of(&nested), "editor.exe");
         assert_eq!(name_of(Path::new("editor.exe")), "editor.exe");
     }
 }
