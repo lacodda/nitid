@@ -3207,6 +3207,82 @@ mod tests {
         );
     }
 
+    /// A panel opened by a toolbar button is drawn in full without any further
+    /// input, and egui is the one that says how many frames that takes.
+    ///
+    /// The defect this holds shut, reported twice from hands-on runs (v0.27.0
+    /// and again after the v0.27.1 fix): click the gear on a freshly started
+    /// viewer and the settings never appear, until the pointer moves or a key
+    /// is pressed — after which they behave for the rest of the session.
+    ///
+    /// The reason a fix missed it once is worth keeping. A window egui has
+    /// just been told to show needs **two** more layouts, not one: the first
+    /// measures it, the second places it. v0.27.1 granted exactly one, so the
+    /// panel stayed measured but unplaced. Counting frames on our side is the
+    /// mistake; the number belongs to egui, which reports it by asking for an
+    /// immediate repaint until it has nothing left to finish.
+    ///
+    /// So this walks the real sequence and stops the way the viewer does —
+    /// laying out only while egui asks — then insists the panel is fully
+    /// drawn at the end. A viewer that stopped one frame early fails here.
+    #[test]
+    fn a_panel_opened_by_a_button_finishes_without_further_input() {
+        let mut interface = Interface::new();
+        let mut config = Config::default();
+        interface.toolbar_shown = true;
+
+        // A frame with nothing open, to settle the toolbar. Its size is what
+        // "the panel is not up" looks like, for the comparison at the end.
+        let quiet = layout_shapes(&mut interface, &mut config);
+
+        // The gear is answered inside a layout, which is what makes this
+        // defect possible: `act` opens the panel between frames.
+        interface.toggle_settings();
+
+        // From here nothing else may reach the viewer — no pointer, no key.
+        // The loop runs exactly while egui says it is not finished, with a
+        // ceiling so a genuine spin fails the test rather than hanging it.
+        let mut frames = 0;
+        let shapes;
+        loop {
+            let (drawn, unfinished) = layout_asking(&mut interface, &mut config);
+            frames += 1;
+            assert!(frames < 20, "egui never stopped asking for frames: this would spin the loop");
+            if !unfinished {
+                shapes = drawn;
+                break;
+            }
+        }
+
+        assert!(
+            frames >= 2,
+            "the panel settled in {frames} frame(s); if egui no longer needs two, this test has stopped describing it",
+        );
+        assert!(
+            shapes > quiet,
+            "the settings were opened but the last frame drew no more than the closed viewer ({shapes} shapes against {quiet}), so the panel never made it onto the screen",
+        );
+    }
+
+    /// Lay out one frame with no input, and say how much was drawn.
+    fn layout_shapes(interface: &mut Interface, config: &mut Config) -> usize {
+        layout_asking(interface, config).0
+    }
+
+    /// Lay out one frame with no input: what was drawn, and whether egui says
+    /// it still owes a frame.
+    fn layout_asking(interface: &mut Interface, config: &mut Config) -> (usize, bool) {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 600.0))),
+            events: Vec::new(),
+            ..Default::default()
+        };
+        let (mut output, _, _) = interface.layout(raw, &status(), config, Instant::now());
+        output.textures_delta.clear();
+        let unfinished = output.viewport_output.values().any(|viewport| viewport.repaint_delay.is_zero());
+        (output.shapes.len(), unfinished)
+    }
+
     /// Every section of the dialog is reachable by clicking its name, and
     /// picking one leaves a frame owed.
     ///

@@ -1767,6 +1767,17 @@ impl App {
 
         let raw = input.take_egui_input(&window);
         let (output, action, edited) = self.interface.layout(raw, &status, &mut self.config, now);
+        // egui says for itself when the frame it just laid out is not the
+        // finished one — a window it has only measured asks to be laid out
+        // again so it can be placed. Asked here rather than counted by the
+        // caller: only egui knows how many frames a thing it is showing still
+        // owes, and a fixed number guessed on this side is the defect this
+        // replaces (one frame was granted where two were due).
+        //
+        // This does not spin. Measured on a still viewer: two immediate asks
+        // and then silence for as long as nothing happens, with a toast up or
+        // without one.
+        let unfinished = output.viewport_output.values().any(|viewport| viewport.repaint_delay.is_zero());
         input.handle_platform_output(&window, output.platform_output);
 
         // Worth a milestone of its own: this is where the interface could
@@ -1794,7 +1805,7 @@ impl App {
         // Something inside the layout changed what the next frame shows —
         // the dialog's close button, which is pressed in the frame that still
         // draws the dialog.
-        if self.interface.take_owed_frame() {
+        if self.interface.take_owed_frame() || unfinished {
             self.wants_frame = true;
             self.request_redraw();
         }
@@ -1827,9 +1838,10 @@ impl App {
         // every button that opens something, which is why this is here rather
         // than in the handlers that happened to remember it.
         //
-        // Not by honouring egui's own repaint request: it renews that request
-        // on every layout, which is a loop, measured at 740 layouts in ten
-        // seconds on a still picture.
+        // This asks for the *next* frame only. A window needs two, and the
+        // second is asked for by `lay_out_interface`, which can see egui's own
+        // answer to "are you finished": granting a fixed number here is what
+        // shipped broken in v0.27.1, where one was granted and two were due.
         self.wants_frame = true;
         self.request_redraw();
     }
@@ -2931,7 +2943,15 @@ mod tests {
             "this test no longer describes the viewer: an idle frame is being laid out",
         );
 
-        // So `act` raises the flag, and that is the whole fix.
+        // So a frame has to be asked for. **How many** is not settled here,
+        // and that is the limit of this test: it says the gate lets an asked
+        // frame through, not that the right number was asked for. v0.27.1
+        // asked for one where two were due and this stayed green while the
+        // panel was invisible on a real screen.
+        //
+        // What holds that shut is
+        // `interface::tests::a_panel_opened_by_a_button_finishes_without_further_input`,
+        // which drives real layouts and lets egui say when it has finished.
         assert!(
             worth_laying_out(false, false, true, true),
             "a frame asked for after acting was refused, so a window would never be placed",
