@@ -19,7 +19,7 @@ use std::path::PathBuf;
 
 use crate::color::Passport;
 use crate::config::{
-    Appearance, Behaviour, Chrome, Config, Copies, Gestures, MAX_ZOOM_STEP, MIN_ZOOM_STEP, Minimap, Opening, Order, Sorting, Tools, Units, Wheel,
+    Appearance, Behaviour, Chrome, Config, Copies, Gestures, MAX_ZOOM_STEP, MIN_ZOOM_STEP, Minimap, Opening, Order, Programs, Sorting, Tools, Units, Wheel,
 };
 use crate::eyedropper::{NEIGHBOURHOOD_RADIUS, NEIGHBOURHOOD_SIDE, Neighbourhood, Reading};
 use crate::format::Format;
@@ -250,11 +250,12 @@ pub enum Section {
     Opening,
     Tools,
     Files,
+    Programs,
 }
 
 impl Section {
     /// The sections down the left of the dialog, in the order they are shown.
-    const ALL: [Self; 5] = [Self::Gestures, Self::Appearance, Self::Opening, Self::Tools, Self::Files];
+    const ALL: [Self; 6] = [Self::Gestures, Self::Appearance, Self::Opening, Self::Tools, Self::Files, Self::Programs];
 
     /// What the section is called in its list.
     fn name(self) -> &'static str {
@@ -264,6 +265,7 @@ impl Section {
             Self::Opening => "Opening",
             Self::Tools => "Colour",
             Self::Files => "Files",
+            Self::Programs => "Programs",
         }
     }
 }
@@ -493,6 +495,7 @@ impl Interface {
         let mut rename_outcome = None;
         // Whether any sorting folder is set, for the sheet's note.
         let sorting_set = config.sorting.any();
+        let programs_set = config.programs.any();
         let toasts: Vec<(String, f32)> = self
             .toasts
             .iter()
@@ -531,7 +534,7 @@ impl Interface {
                 passport_panel(ui, passport);
             }
             if keys_shown {
-                key_sheet(ui, sorting_set);
+                key_sheet(ui, sorting_set, programs_set);
             }
             if settings_shown {
                 edited = settings_dialog(ui, config, &mut section, &mut closed);
@@ -1608,7 +1611,7 @@ fn passport_panel(ui: &mut egui::Ui, passport: &Passport) {
 }
 
 /// Every key there is, because the chrome does not advertise them.
-fn key_sheet(ui: &mut egui::Ui, sorting_set: bool) {
+fn key_sheet(ui: &mut egui::Ui, sorting_set: bool, programs_set: bool) {
     egui::Window::new("Keys")
         .collapsible(false)
         .resizable(false)
@@ -1628,6 +1631,10 @@ fn key_sheet(ui: &mut egui::Ui, sorting_set: bool) {
             ui.add_space(8.0);
             if !sorting_set {
                 ui.label(egui::RichText::new("The digit keys have no folders yet — set them in Settings, under Files.").weak());
+                ui.add_space(4.0);
+            }
+            if !programs_set {
+                ui.label(egui::RichText::new("Alt and a digit have no programs yet — set them in Settings, under Programs.").weak());
                 ui.add_space(4.0);
             }
             ui.label(egui::RichText::new(TOOLBAR_HINT).weak());
@@ -1696,6 +1703,7 @@ fn settings_dialog(ui: &mut egui::Ui, config: &mut Config, section: &mut Section
                             edited = match *section {
                                 Section::Gestures => gestures_section(ui, &mut config.gestures),
                                 Section::Files => files_section(ui, &mut config.sorting),
+                                Section::Programs => programs_section(ui, &mut config.programs),
                                 Section::Appearance => appearance_section(ui, &mut config.appearance),
                                 Section::Opening => opening_section(ui, &mut config.behaviour),
                                 Section::Tools => tools_section(ui, &mut config.tools),
@@ -1850,6 +1858,64 @@ fn files_section(ui: &mut egui::Ui, sorting: &mut Sorting) -> bool {
     edited
 }
 
+/// The programs the keys hand the picture to.
+///
+/// The editor first, because it is the one key that works before anything is
+/// filled in: left empty it asks Windows for whatever edits the file, which is
+/// what most people want and nobody should have to configure.
+///
+/// Typed rather than picked, for the same reason the sorting folders are: the
+/// shell's picker needs a thread of its own, and a path pastes from Explorer.
+fn programs_section(ui: &mut egui::Ui, programs: &mut Programs) -> bool {
+    let mut edited = false;
+
+    ui.label(egui::RichText::new("Editor").strong());
+    ui.add_space(2.0);
+    ui.label(
+        egui::RichText::new("What E opens the picture in. Left empty, Windows picks the program registered to edit that kind of file.")
+            .weak()
+            .small(),
+    );
+    ui.add_space(8.0);
+
+    egui::Grid::new("editor").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+        ui.label("E");
+        let mut text = programs.editor.to_string_lossy().into_owned();
+        let response = ui.add(egui::TextEdit::singleline(&mut text).desired_width(300.0).hint_text("whatever Windows uses"));
+        if response.changed() {
+            programs.editor = std::path::PathBuf::from(text.trim());
+            edited = true;
+        }
+        ui.end_row();
+    });
+
+    ui.add_space(14.0);
+    ui.label(egui::RichText::new("Programs").strong());
+    ui.add_space(2.0);
+    ui.label(
+        egui::RichText::new("Alt and a digit open the picture in one of these. The file is not reloaded afterwards; R does that.")
+            .weak()
+            .small(),
+    );
+    ui.add_space(8.0);
+
+    egui::Grid::new("programs").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+        for (index, program) in programs.commands.iter_mut().enumerate() {
+            ui.label(format!("Alt+{}", index + 1));
+
+            let mut text = program.to_string_lossy().into_owned();
+            let response = ui.add(egui::TextEdit::singleline(&mut text).desired_width(300.0).hint_text("no program set"));
+            if response.changed() {
+                *program = std::path::PathBuf::from(text.trim());
+                edited = true;
+            }
+            ui.end_row();
+        }
+    });
+
+    edited
+}
+
 /// How an image arrives, and what the folder does.
 fn opening_section(ui: &mut egui::Ui, behaviour: &mut Behaviour) -> bool {
     let mut edited = false;
@@ -1994,6 +2060,8 @@ pub const KEYS: &[(&str, &str)] = &[
     ("F2", "rename this file"),
     ("Ctrl+1-9", "move this file to the folder set for that key"),
     ("Ctrl+Shift+1-9", "copy it there instead"),
+    ("E", "open this file in the program that edits it"),
+    ("Alt+1-9", "open it in the program set for that key"),
     ("+ -", "zoom in / out"),
     ("F11", "full screen"),
     (",", "settings"),

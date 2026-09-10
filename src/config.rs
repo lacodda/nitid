@@ -372,6 +372,49 @@ pub const DEFAULT_CLIP_LOW: f32 = 0.004;
 /// gesture that has been there since the beginning.
 pub const SORTING_FOLDERS: usize = 9;
 
+/// How many programs the number keys can hold, one per digit.
+///
+/// The same nine as the sorting folders, and on the same reasoning: the digit
+/// row is what a hand finds without looking. They do not collide because the
+/// modifier differs — `Ctrl` sorts, `Alt` hands the picture to a program.
+pub const PROGRAMS: usize = 9;
+
+/// The programs the number keys start, and the editor `E` uses.
+///
+/// Empty is the normal state of all of them. An unset key says so when it is
+/// pressed rather than doing something surprising, and `E` with no program set
+/// is not unset at all — it asks Windows for whatever edits this kind of file,
+/// which is what makes the key work on a viewer nobody has configured.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct Programs {
+    /// Index 0 is `Alt+1`. Empty means "no program set for that key".
+    pub commands: [PathBuf; PROGRAMS],
+    /// What `E` starts. Empty means "ask Windows", which is the default and
+    /// the reason the key is useful before anyone opens the settings.
+    pub editor: PathBuf,
+}
+
+impl Programs {
+    /// The program for a digit key, or `None` when nothing is set for it.
+    ///
+    /// `digit` is what the person pressed: 1 through 9.
+    pub fn command(&self, digit: usize) -> Option<&std::path::Path> {
+        let program = self.commands.get(digit.checked_sub(1)?)?;
+        (!program.as_os_str().is_empty()).then_some(program.as_path())
+    }
+
+    /// The editor `E` should start, or `None` to let Windows choose.
+    pub fn editor(&self) -> Option<&std::path::Path> {
+        (!self.editor.as_os_str().is_empty()).then_some(self.editor.as_path())
+    }
+
+    /// Whether any program at all is set, which is what decides whether the
+    /// key sheet mentions the number keys.
+    pub fn any(&self) -> bool {
+        self.commands.iter().any(|program| !program.as_os_str().is_empty())
+    }
+}
+
 /// Where the digit keys put a picture.
 ///
 /// Empty is the normal state of most of them: someone who sorts into two
@@ -408,6 +451,7 @@ pub struct Config {
     pub behaviour: Behaviour,
     pub tools: Tools,
     pub sorting: Sorting,
+    pub programs: Programs,
     /// Keys the file carried that this version does not know.
     ///
     /// Kept so that saving does not throw away a newer version's settings:
@@ -499,6 +543,16 @@ impl Config {
                         config.sorting.folders[digit - 1] = PathBuf::from(value);
                     }
                 }
+                // The same as the folders above, and untrimmed for the same
+                // reason: a program lives at a path with spaces in it.
+                "editor" => config.programs.editor = PathBuf::from(value),
+                _ if key.starts_with("program_") => {
+                    if let Some(digit) = key.strip_prefix("program_").and_then(|digit| digit.parse::<usize>().ok())
+                        && (1..=PROGRAMS).contains(&digit)
+                    {
+                        config.programs.commands[digit - 1] = PathBuf::from(value);
+                    }
+                }
 
                 // Not a key this version knows. It belongs to a build that
                 // wrote the file before or after this one; either way it is
@@ -549,6 +603,14 @@ impl Config {
         for (index, folder) in self.sorting.folders.iter().enumerate() {
             if !folder.as_os_str().is_empty() {
                 out.push_str(&format!("folder_{} = {}\n", index + 1, folder.display()));
+            }
+        }
+        if !self.programs.editor.as_os_str().is_empty() {
+            out.push_str(&format!("editor = {}\n", self.programs.editor.display()));
+        }
+        for (index, program) in self.programs.commands.iter().enumerate() {
+            if !program.as_os_str().is_empty() {
+                out.push_str(&format!("program_{} = {}\n", index + 1, program.display()));
             }
         }
 
@@ -721,9 +783,81 @@ mod tests {
                     PathBuf::from("D:\\reject"),
                 ],
             },
+            // A program set at each end and the middle left alone, on the same
+            // reasoning as the folders above. The editor carries a path with a
+            // space in it, which is where a program normally lives.
+            programs: Programs {
+                commands: [
+                    PathBuf::from("C:/Program Files/Some Editor/editor.exe"),
+                    PathBuf::new(),
+                    PathBuf::new(),
+                    PathBuf::new(),
+                    PathBuf::new(),
+                    PathBuf::new(),
+                    PathBuf::new(),
+                    PathBuf::new(),
+                    PathBuf::from("D:/tools/stamp.exe"),
+                ],
+                editor: PathBuf::from("C:/Program Files/Paint Something/paint.exe"),
+            },
             unknown: BTreeMap::new(),
         };
         assert_eq!(Config::parse(&config.render()), config);
+    }
+
+    /// A program keeps the path it was given, spaces and all.
+    ///
+    /// Programs live under `Program Files` more often than not, so a value
+    /// trimmed past its ends would break the common case rather than an
+    /// unusual one.
+    #[test]
+    fn a_program_keeps_the_path_it_was_given() {
+        let config = Config::parse("program_1 = C:/Program Files/Some Editor/editor.exe");
+        assert_eq!(
+            config.programs.command(1),
+            Some(std::path::Path::new("C:/Program Files/Some Editor/editor.exe")),
+        );
+    }
+
+    /// A key with nothing on it is `None`, not an empty path.
+    ///
+    /// The caller decides what to say about an unset key, and it can only do
+    /// that if the setting admits to being unset.
+    #[test]
+    fn a_program_that_is_not_set_is_none_rather_than_an_empty_path() {
+        let config = Config::parse("program_1 = C:/tools/one.exe");
+        assert_eq!(config.programs.command(2), None);
+        assert_eq!(config.programs.command(9), None);
+        assert_eq!(config.programs.editor(), None);
+    }
+
+    /// Only the nine digits name a program, and `0` is not one of them.
+    ///
+    /// `0` belongs to the view — it is the key that fits the picture to the
+    /// window — and binding a program to it would take a viewing gesture that
+    /// has been there since v0.1.0.
+    #[test]
+    fn only_the_nine_digits_name_a_program() {
+        let config = Config::parse("program_0 = C:/zero.exe\nprogram_10 = C:/ten.exe\nprogram_x = C:/x.exe\nprogram_9 = C:/nine.exe");
+        assert_eq!(config.programs.command(9), Some(std::path::Path::new("C:/nine.exe")));
+        assert!(
+            config.programs.commands.iter().filter(|program| !program.as_os_str().is_empty()).count() == 1,
+            "a key outside 1-9 was bound to a program",
+        );
+    }
+
+    /// The editor is empty by default, and empty means "ask Windows".
+    ///
+    /// This is what makes `E` work on a viewer nobody has configured: an
+    /// editor that had to be set before the key did anything would be a
+    /// setting standing in for a choice.
+    #[test]
+    fn the_editor_is_unset_by_default_so_windows_chooses() {
+        assert_eq!(Config::parse("").programs.editor(), None);
+        assert_eq!(
+            Config::parse("editor = C:/Program Files/Paint Something/paint.exe").programs.editor(),
+            Some(std::path::Path::new("C:/Program Files/Paint Something/paint.exe")),
+        );
     }
 
     /// The magnifier is on unless the file says otherwise, and only the word

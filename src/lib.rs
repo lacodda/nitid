@@ -18,6 +18,7 @@ mod color;
 mod config;
 mod console;
 mod drag;
+mod editor;
 mod eyedropper;
 mod files;
 mod folder;

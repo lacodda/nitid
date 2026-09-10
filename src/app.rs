@@ -917,6 +917,10 @@ impl App {
                 // here rather than at load: a file nobody asked to measure
                 // stays unmeasured, which is what keeps this off the path to
                 // the first pixel.
+                // Hand the picture to the program that edits it. Windows
+                // knows which one that is, so the key works before anyone
+                // has opened the settings.
+                "e" | "E" => self.open_in_program(None),
                 "h" | "H" => {
                     self.interface.toggle_histogram();
                     self.count_if_wanted();
@@ -1137,6 +1141,55 @@ impl App {
             Ok(_) => {
                 self.after_removal();
                 self.interface.toast(format!("{name} → {destination}"), Instant::now());
+            }
+            Err(error) => self.report(error),
+        }
+        self.request_redraw();
+    }
+
+    /// Hand the picture on screen to a program.
+    ///
+    /// `None` means the editor key `E`, which asks Windows for whatever edits
+    /// this kind of file unless the settings name a program; a digit means one
+    /// of the nine keys, which does nothing until it has been assigned.
+    ///
+    /// The file is not reloaded afterwards. A program that edits it will take
+    /// as long as a person takes, and guessing when that is finished would be
+    /// worse than the `R` that reloads on request.
+    fn open_in_program(&mut self, digit: Option<usize>) {
+        let program = match program_for(&self.config.programs, digit) {
+            Chosen::Named(program) => Some(program),
+            Chosen::AskWindows => None,
+            Chosen::Unset(digit) => {
+                // Said rather than ignored, for the same reason the sorting
+                // keys say it: a key that does nothing silently is a key the
+                // person presses again, harder.
+                self.interface.toast(format!("no program set for Alt+{digit}"), Instant::now());
+                self.request_redraw();
+                return;
+            }
+        };
+
+        let Some(path) = self.file_on_screen() else {
+            return;
+        };
+        let name = name_of(&path);
+
+        let outcome = match &program {
+            Some(program) => crate::editor::run(program, &path),
+            // No program named: Windows knows which one edits this kind of
+            // file, and that is the whole point of the key working before
+            // anyone opens the settings.
+            None => crate::editor::edit(&path),
+        };
+
+        match outcome {
+            Ok(()) => {
+                let opened_in = match &program {
+                    Some(program) => name_of(program),
+                    None => "its editor".into(),
+                };
+                self.interface.toast(format!("{name} → {opened_in}"), Instant::now());
             }
             Err(error) => self.report(error),
         }
@@ -1969,7 +2022,9 @@ fn handled(key: &Key) -> bool {
         ) => true,
         Key::Character(character) => matches!(
             character.as_str(),
-            "+" | "="
+            "e" | "E"
+                | "+"
+                | "="
                 | "-"
                 | "_"
                 | "0"
@@ -2044,14 +2099,48 @@ fn folder_name(folder: &Path) -> String {
         .unwrap_or_else(|| folder.display().to_string())
 }
 
-/// Which sorting folder a key names: 1 through 9, or `None` for anything else.
+/// What a program key should start.
+#[derive(Debug, PartialEq, Eq)]
+enum Chosen {
+    /// A program the settings name.
+    Named(PathBuf),
+    /// Nothing named, and nothing needs to be: Windows knows what edits this.
+    AskWindows,
+    /// A digit key with nothing assigned to it, which is most of them.
+    Unset(usize),
+}
+
+/// Which program a key hands the picture to.
+///
+/// A free function because the alternative is not testable: the decision lives
+/// inside a method that needs a window, a renderer and an image on screen, and
+/// the difference that matters most here — an unset **digit** says so, while an
+/// unset **editor** means "ask Windows" — is exactly the kind of inversion that
+/// compiles either way and would never be noticed.
+fn program_for(programs: &crate::config::Programs, digit: Option<usize>) -> Chosen {
+    match digit {
+        Some(digit) => match programs.command(digit) {
+            Some(program) => Chosen::Named(program.to_path_buf()),
+            None => Chosen::Unset(digit),
+        },
+        None => match programs.editor() {
+            Some(editor) => Chosen::Named(editor.to_path_buf()),
+            None => Chosen::AskWindows,
+        },
+    }
+}
+
+/// Which digit a key is: 1 through 9, or `None` for anything else.
+///
+/// Both the sorting folders under `Ctrl` and the programs under `Alt` are
+/// named by these, which is why this answers a digit rather than a folder.
 ///
 /// Read from the **physical** key rather than the character it produces.
 /// `Ctrl+Shift+1` does not deliver "1" — it delivers whatever that key makes
 /// with Shift held, which is "!" on a US layout, a different symbol on others,
-/// and something else again on a Cyrillic one. The digit row is the digit row
-/// on every layout, so that is what is asked.
-fn sorting_digit(key: &winit::keyboard::PhysicalKey) -> Option<usize> {
+/// and something else again on a Cyrillic one. `Alt` is the same story. The
+/// digit row is the digit row on every layout, so that is what is asked.
+fn digit_key(key: &winit::keyboard::PhysicalKey) -> Option<usize> {
     use winit::keyboard::{KeyCode, PhysicalKey};
 
     let PhysicalKey::Code(code) = key else {
@@ -2557,11 +2646,20 @@ impl ApplicationHandler<Event> for App {
                 if self.interface.renaming() {
                     return;
                 }
-                if self.modifiers.control_key() {
+                if self.modifiers.alt_key() {
+                    // Alt and a digit hand the picture to a program. The
+                    // digits belong to sorting under Ctrl, so the programs
+                    // take a modifier of their own rather than a gesture
+                    // that is already spoken for. Read from the physical key
+                    // for the same reason sorting is.
+                    if let Some(digit) = digit_key(&event.physical_key) {
+                        self.open_in_program(Some(digit));
+                    }
+                } else if self.modifiers.control_key() {
                     // A digit sorts the file into a folder; Shift makes it a
                     // copy. Asked of the physical key, because Ctrl+Shift+1
                     // does not deliver the character "1" on any layout.
-                    match sorting_digit(&event.physical_key) {
+                    match digit_key(&event.physical_key) {
                         Some(digit) => self.sort_current(digit, self.modifiers.shift_key()),
                         None => self.handle_chord(&event.logical_key),
                     }
@@ -3102,10 +3200,92 @@ mod tests {
         }
     }
 
+    /// The difference the whole feature turns on: an unset **digit** key says
+    /// so, while an unset **editor** asks Windows.
+    ///
+    /// Both are "nothing in the settings", and treating them alike is the
+    /// mistake that compiles: swap them and `E` starts saying "no program set"
+    /// on a fresh installation — where it is the one key that must work — while
+    /// `Alt+7` silently opens the picture in whatever edits it.
+    #[test]
+    fn an_unset_editor_asks_windows_but_an_unset_digit_says_so() {
+        let programs = crate::config::Programs::default();
+
+        assert_eq!(
+            program_for(&programs, None),
+            Chosen::AskWindows,
+            "the editor key with nothing set did not fall back to the program Windows registered",
+        );
+        assert_eq!(
+            program_for(&programs, Some(7)),
+            Chosen::Unset(7),
+            "a digit key with nothing set did not report itself as unset",
+        );
+    }
+
+    /// A program that is set is the one that starts, for either kind of key.
+    #[test]
+    fn a_program_that_is_set_is_the_one_chosen() {
+        let mut commands: [PathBuf; crate::config::PROGRAMS] = Default::default();
+        commands[2] = PathBuf::from("C:/tools/third.exe");
+        let programs = crate::config::Programs {
+            commands,
+            editor: PathBuf::from("C:/tools/editor.exe"),
+        };
+
+        assert_eq!(program_for(&programs, None), Chosen::Named(PathBuf::from("C:/tools/editor.exe")));
+        assert_eq!(program_for(&programs, Some(3)), Chosen::Named(PathBuf::from("C:/tools/third.exe")));
+        // And the keys either side of it are still unset: an off-by-one here
+        // would open the wrong program, which is worse than opening none.
+        assert_eq!(program_for(&programs, Some(2)), Chosen::Unset(2));
+        assert_eq!(program_for(&programs, Some(4)), Chosen::Unset(4));
+    }
+
+    /// Alt and Ctrl name the same digits but must not mean the same thing:
+    /// the programs took a modifier of their own precisely so that sorting
+    /// keeps the gesture it has had since v0.27.0.
+    #[test]
+    fn the_programs_and_the_sorting_folders_are_separate_settings() {
+        let mut config = Config::default();
+        config.sorting.folders[0] = PathBuf::from("C:/keep");
+        // Clippy is right about the pattern in general; here the point is
+        // that one field of a default config is set and the rest is not.
+
+        assert_eq!(config.sorting.folder(1), Some(Path::new("C:/keep")));
+        assert_eq!(
+            program_for(&config.programs, Some(1)),
+            Chosen::Unset(1),
+            "a sorting folder set for Ctrl+1 also bound Alt+1 to a program",
+        );
+    }
+
     /// `handled` is written from the same arms as `handle_key` and would drift
     /// if nothing held it down: every key the sheet advertises must be one.
+    ///
+    /// The single-character keys are read **from the sheet** rather than
+    /// listed here. A hand-written list is a list that a key added to the
+    /// sheet quietly escapes: `E` was added in v0.28.0 and this test passed
+    /// without ever asking about it, which is the whole failure this now
+    /// prevents. Named keys stay written out below, because a sheet entry
+    /// like "Del" or "F11" has no mechanical route to a `NamedKey`.
     #[test]
     fn the_keys_the_sheet_advertises_are_all_answered() {
+        // Every entry that is one bare character: no modifier, no range, no
+        // word. Those are exactly the ones `handled` must answer.
+        let bare: Vec<&str> = crate::interface::KEYS
+            .iter()
+            .map(|(key, _)| *key)
+            .filter(|key| key.chars().count() == 1 && !key.contains('+'))
+            .collect();
+        assert!(
+            bare.len() >= 12,
+            "only {} bare keys were read from the sheet ({bare:?}), so this stopped reading it",
+            bare.len(),
+        );
+        for key in bare {
+            assert!(handled(&Key::Character(key.into())), "the key sheet lists {key}, which the viewer ignores",);
+        }
+
         for key in [
             Key::Named(NamedKey::ArrowLeft),
             Key::Named(NamedKey::ArrowRight),
@@ -3189,7 +3369,7 @@ mod tests {
     ///
     /// Two kinds of chord are answered by two different routes, and both are
     /// checked here: the letters go through `chord_for` on the character, and
-    /// the digits through `sorting_digit` on the physical key. A gate that
+    /// the digits through `digit_key` on the physical key. A gate that
     /// knew only the first would have gone green while `Ctrl+1` did nothing.
     ///
     /// `Ctrl+Drag` and `Ctrl+Wheel` are deliberately excluded: they are
@@ -3200,12 +3380,15 @@ mod tests {
     fn every_chord_the_sheet_advertises_is_answered() {
         use winit::keyboard::{KeyCode, PhysicalKey};
 
+        // Alt as well as Ctrl. Filtering on "Ctrl+" alone is what let
+        // `Alt+1-9` onto the sheet in v0.28.0 without this gate asking a
+        // single question about it.
         let advertised: Vec<&str> = crate::interface::KEYS
             .iter()
             .map(|(key, _)| *key)
-            .filter(|key| key.starts_with("Ctrl+") && !key.contains("Drag") && !key.contains("Wheel"))
+            .filter(|key| (key.starts_with("Ctrl+") || key.starts_with("Alt+")) && !key.contains("Drag") && !key.contains("Wheel"))
             .collect();
-        assert_eq!(advertised.len(), 5, "the sheet lists {advertised:?}, which is not the five chords");
+        assert_eq!(advertised.len(), 6, "the sheet lists {advertised:?}, which is not the six chords");
 
         for key in advertised {
             let named = key.rsplit('+').next().expect("a chord names a key");
@@ -3225,7 +3408,7 @@ mod tests {
                     (9, KeyCode::Digit9),
                 ] {
                     assert_eq!(
-                        sorting_digit(&PhysicalKey::Code(code)),
+                        digit_key(&PhysicalKey::Code(code)),
                         Some(digit),
                         "the key sheet lists {key}, and {digit} is not answered",
                     );
@@ -3233,7 +3416,7 @@ mod tests {
                 // And the keys the sheet does not promise stay unclaimed: `0`
                 // fits the picture to the window, and taking it here would be
                 // the very thing the modifier was chosen to avoid.
-                assert_eq!(sorting_digit(&PhysicalKey::Code(KeyCode::Digit0)), None, "Ctrl+0 was taken for sorting");
+                assert_eq!(digit_key(&PhysicalKey::Code(KeyCode::Digit0)), None, "{key} took the 0 that fits the picture");
                 continue;
             }
 
@@ -3253,9 +3436,9 @@ mod tests {
     fn the_number_pad_names_the_same_folders() {
         use winit::keyboard::{KeyCode, PhysicalKey};
 
-        assert_eq!(sorting_digit(&PhysicalKey::Code(KeyCode::Numpad1)), Some(1));
-        assert_eq!(sorting_digit(&PhysicalKey::Code(KeyCode::Numpad9)), Some(9));
-        assert_eq!(sorting_digit(&PhysicalKey::Code(KeyCode::Numpad0)), None);
+        assert_eq!(digit_key(&PhysicalKey::Code(KeyCode::Numpad1)), Some(1));
+        assert_eq!(digit_key(&PhysicalKey::Code(KeyCode::Numpad9)), Some(9));
+        assert_eq!(digit_key(&PhysicalKey::Code(KeyCode::Numpad0)), None);
     }
 
     /// A key that is not a digit is not a folder, whatever character it makes.
@@ -3268,7 +3451,7 @@ mod tests {
         use winit::keyboard::{KeyCode, PhysicalKey};
 
         for code in [KeyCode::KeyA, KeyCode::F1, KeyCode::Minus, KeyCode::Backquote] {
-            assert_eq!(sorting_digit(&PhysicalKey::Code(code)), None, "{code:?} named a folder");
+            assert_eq!(digit_key(&PhysicalKey::Code(code)), None, "{code:?} named a folder");
         }
     }
 
