@@ -63,6 +63,27 @@ pub mod testing {
     pub use crate::rotate::save_orientation;
     pub use crate::sandbox::decode as decode_sandboxed;
 
+    /// Write a loaded image out, the way the save box does.
+    ///
+    /// Here so a run over real files can exercise the export itself rather
+    /// than a copy of it: the save box is behind a window, and a gate that
+    /// re-implemented the request would be testing its own re-implementation.
+    pub fn export_for_test(loaded: &crate::image_source::LoadedImage, extension: &str, bake: bool, quality: u8) -> anyhow::Result<Vec<u8>> {
+        let target = crate::export::Target::from_extension(extension).ok_or_else(|| anyhow::anyhow!("no target named {extension}"))?;
+        crate::export::encode(&crate::export::Request {
+            image: &loaded.image,
+            profile: loaded.profile.as_ref(),
+            target,
+            colour: if bake {
+                crate::export::Colour::BakeToSrgb
+            } else {
+                crate::export::Colour::KeepProfile
+            },
+            quality,
+            caveat: loaded.caveat.as_deref(),
+        })
+    }
+
     /// Every key the key sheet advertises, for the test that holds the README
     /// to it. The two lists are written for different readers and drifted
     /// apart silently until v0.23.1 tied them together.
