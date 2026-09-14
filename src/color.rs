@@ -45,6 +45,14 @@ pub struct Passport {
     /// presented as one: it answers "is this a big change or a small one",
     /// which is what someone reading a passport wants to know.
     pub distance: f32,
+    /// What the file claims that the viewer cannot honour.
+    ///
+    /// `None` when there is nothing to confess. It exists for one case today:
+    /// a HEIC whose `nclx` box states wide primaries or an HDR transfer, which
+    /// `heif-oxide` resolves to sRGB before the viewer ever sees a pixel. The
+    /// colour on screen is then right for sRGB and wrong for the file, and
+    /// nothing in the numbers says so — see ADR 0007.
+    pub caveat: Option<String>,
 }
 
 impl Passport {
@@ -55,12 +63,28 @@ impl Passport {
             display: profile_name(display),
             converting: !transform.is_identity,
             distance: matrix_distance(&transform.matrix),
+            caveat: None,
         }
+    }
+
+    /// Note something the file states that the decoder did not honour.
+    pub fn with_caveat(mut self, caveat: Option<String>) -> Self {
+        self.caveat = caveat;
+        self
     }
 
     /// One line saying what is happening, for a panel that has room for a
     /// sentence rather than a word.
     pub fn summary(&self) -> String {
+        let said = self.described();
+        match &self.caveat {
+            Some(caveat) => format!("{said} {caveat}"),
+            None => said,
+        }
+    }
+
+    /// The colour path itself, before any caveat about it.
+    fn described(&self) -> String {
         match (&self.source, self.converting) {
             // An untagged file states nothing about its numbers, so nothing is
             // assumed and nothing is converted.

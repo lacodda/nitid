@@ -188,6 +188,9 @@ pub fn decode(bytes: &[u8], format: Format, timeout: Duration) -> Result<LoadedI
         // The same, for the same reason: what the file *says* is read on this
         // side, from bytes the caller already holds.
         metadata: Default::default(),
+        // And the same again: what the file claims about its colour is read
+        // from the bytes here, never taken from what the decoder says.
+        caveat: crate::image_source::colour_caveat(bytes, format),
         // A vector document does not cross the boundary: the formats that
         // need a sandbox are all raster, and re-rasterising on zoom would
         // mean a round trip per frame.

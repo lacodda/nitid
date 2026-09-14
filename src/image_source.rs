@@ -247,6 +247,14 @@ pub struct LoadedImage {
     /// because the loader clones `LoadedImage` out of its prefetch cache, and
     /// an animation is the one part worth not copying.
     pub animation: Option<std::sync::Arc<crate::animation::Animation>>,
+    /// What the file states about its colour that the viewer does not honour.
+    ///
+    /// `None` when there is nothing to confess, which is nearly always. Worked
+    /// out here, where the bytes are already in hand, rather than when the
+    /// colour passport is drawn: the passport is drawn every frame it is up,
+    /// and reading the file again for each of them to say the same thing would
+    /// be paying for the answer over and over.
+    pub caveat: Option<String>,
 }
 
 impl LoadedImage {
@@ -334,6 +342,7 @@ fn decode_with(bytes: &[u8], confinement: Confinement) -> Result<LoadedImage> {
             // practice, and their decoders deliver the canvas as shown.
             orientation: Orientation::Normal,
             metadata: crate::metadata::read(bytes),
+            caveat: colour_caveat(bytes, format),
             fidelity: Fidelity::Full,
             format,
             profile: color::profile_from(bytes),
@@ -357,6 +366,7 @@ fn decode_with(bytes: &[u8], confinement: Confinement) -> Result<LoadedImage> {
             fidelity: Fidelity::Full,
             format,
             metadata: crate::metadata::read(bytes),
+            caveat: colour_caveat(bytes, format),
             profile: None,
             vector: Some(vector),
             animation: None,
@@ -402,6 +412,7 @@ fn decode_with(bytes: &[u8], confinement: Confinement) -> Result<LoadedImage> {
         fidelity: Fidelity::Full,
         format,
         metadata: crate::metadata::read(bytes),
+        caveat: colour_caveat(bytes, format),
         profile,
         // A raster format is its pixels; there is nothing to redraw from.
         vector: None,
@@ -454,6 +465,7 @@ pub fn decode_thumbnail(bytes: &[u8]) -> Option<LoadedImage> {
         // The same file, so the same metadata: the quick frame is what the
         // panel describes until the full image replaces it.
         metadata: crate::metadata::read(bytes),
+        caveat: colour_caveat(bytes, format),
         // The orientation tag lives in the primary IFD and applies to both the
         // full image and its thumbnail, so the quick frame is not shown
         // sideways for the moment before the real one replaces it.
@@ -503,6 +515,7 @@ fn decode_heic_thumbnail(bytes: &[u8]) -> Option<LoadedImage> {
     Some(LoadedImage {
         image,
         metadata: crate::metadata::read(bytes),
+        caveat: colour_caveat(bytes, Format::Heic),
         // HEIC states its rotation in the container and the decoder applies
         // it — to the thumbnail as much as to the full image, since both are
         // items in the same file. See `Format::orients_itself`.
@@ -614,6 +627,34 @@ fn decode_webp(bytes: &[u8]) -> Result<DecodedImage> {
 /// the same pixels libheif does, and the ICC profile is handed on to the
 /// shader — which is how every other format in the viewer is treated, and
 /// better than what the CICP path manages.
+/// What a file states about its colour that the viewer does not honour.
+///
+/// One case today, and it is a real one: a HEIC that describes itself with
+/// CICP codes for wide primaries or an HDR transfer. `heif-oxide` resolves
+/// those to sRGB inside the decoder and hands over pixels with nothing said
+/// about them (ADR 0007), so the picture on screen is right for sRGB and wrong
+/// for the file — and no profile, no histogram and no eyedropper reading can
+/// reveal it, because every one of them is looking at the resolved numbers.
+///
+/// Saying so is all the viewer can do about it until the decoder grows the
+/// ability to keep them. Saying nothing would be worse: a colour that is
+/// quietly wrong is the one kind of wrong a person cannot find.
+pub fn colour_caveat(bytes: &[u8], format: Format) -> Option<String> {
+    if format != Format::Heic {
+        return None;
+    }
+    let colour = crate::isobmff::colour_box(bytes)?;
+    let cicp = colour.cicp?;
+    if cicp.is_srgb() {
+        return None;
+    }
+
+    Some(format!(
+        "The file states colour codes {}/{}/{} that the HEIC decoder resolves to sRGB, so the colour may differ from the original.",
+        cicp.primaries, cicp.transfer, cicp.matrix
+    ))
+}
+
 fn decode_heic_with_colour(bytes: &[u8]) -> Result<(DecodedImage, Option<ColorProfile>)> {
     let Some(colour) = crate::isobmff::colour_box(bytes).filter(|colour| colour.is_icc) else {
         // The ordinary case: the file states CICP codes, the decoder reads
@@ -1787,6 +1828,7 @@ mod tests {
             },
             orientation: Orientation::Rotate90,
             fidelity: Fidelity::Full,
+            caveat: None,
             // Irrelevant to this test; any variant would do.
             format: Format::Png,
             metadata: Default::default(),

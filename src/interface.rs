@@ -267,7 +267,15 @@ pub enum Section {
 
 impl Section {
     /// The sections down the left of the dialog, in the order they are shown.
-    const ALL: [Self; 7] = [Self::Gestures, Self::Appearance, Self::Opening, Self::Tools, Self::Sending, Self::Files, Self::Programs];
+    const ALL: [Self; 7] = [
+        Self::Gestures,
+        Self::Appearance,
+        Self::Opening,
+        Self::Tools,
+        Self::Sending,
+        Self::Files,
+        Self::Programs,
+    ];
 
     /// What the section is called in its list.
     fn name(self) -> &'static str {
@@ -2215,7 +2223,11 @@ fn sending_section(ui: &mut egui::Ui, sending: &mut crate::config::Sending) -> b
     ui.label("Shrunk so its longest side is at most");
     edited |= ui.add(egui::Slider::new(&mut sending.width, 0..=8000).suffix(" px")).changed();
     if sending.width == 0 {
-        ui.label(egui::RichText::new("Zero leaves the size alone and lets the budget do the work.").weak().small());
+        ui.label(
+            egui::RichText::new("Zero leaves the size alone and lets the budget do the work.")
+                .weak()
+                .small(),
+        );
     }
 
     edited

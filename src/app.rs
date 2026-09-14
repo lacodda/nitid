@@ -1076,7 +1076,7 @@ impl App {
             return None;
         };
         let transform = ColorTransform::for_image(image.profile.as_ref(), &self.display_profile);
-        Some(crate::color::Passport::new(image.profile.as_ref(), &self.display_profile, &transform))
+        Some(crate::color::Passport::new(image.profile.as_ref(), &self.display_profile, &transform).with_caveat(image.caveat.clone()))
     }
 
     /// Answer a key pressed with Ctrl held.
@@ -1146,6 +1146,9 @@ impl App {
             target: crate::export::Target::Jpeg,
             colour: crate::export::Colour::BakeToSrgb,
             quality: 90,
+            // Nothing reads a warning on a copy: it goes straight onto the
+            // clipboard with no box to say it in. The passport still does.
+            caveat: None,
         };
 
         let budget = sending.budget_kb as usize * 1024;
@@ -1453,6 +1456,7 @@ impl App {
         };
 
         let profile = self.profile_on_screen();
+        let caveat = self.caveat_on_screen();
         let losses = crate::export::warnings(&crate::export::Request {
             image: &image,
             profile: profile.as_ref(),
@@ -1463,8 +1467,26 @@ impl App {
                 crate::export::Colour::KeepProfile
             },
             quality,
+            caveat: caveat.as_deref(),
         });
         self.interface.set_save_losses(losses);
+    }
+
+    /// What the file on screen states about its colour that the viewer could
+    /// not honour, if anything.
+    ///
+    /// Read from the loaded image rather than from the file again: it was
+    /// worked out once, where the bytes were already in hand.
+    fn caveat_on_screen(&mut self) -> Option<String> {
+        let shown = self.shown.as_ref()?;
+        if shown.pasted {
+            return None;
+        }
+        let path = shown.path.clone();
+        match self.loader.request(&path) {
+            Request::Ready(image) => image.caveat.clone(),
+            Request::Pending => None,
+        }
     }
 
     /// The colour profile of the picture on screen, if it carries one.
@@ -1509,6 +1531,7 @@ impl App {
         };
 
         let profile = self.profile_on_screen();
+        let caveat = self.caveat_on_screen();
         let request = crate::export::Request {
             image: &image,
             profile: profile.as_ref(),
@@ -1519,6 +1542,7 @@ impl App {
                 crate::export::Colour::KeepProfile
             },
             quality,
+            caveat: caveat.as_deref(),
         };
 
         // Beside the file it came from, which is where a person looking at

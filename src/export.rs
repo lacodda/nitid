@@ -112,6 +112,13 @@ pub struct Request<'a> {
     pub colour: Colour,
     /// JPEG and WebP quality, 1-100. Ignored by PNG, which is lossless.
     pub quality: u8,
+    /// What the file states about its colour that the decoder did not honour,
+    /// carried through so a save can repeat it.
+    ///
+    /// It matters more here than on screen: a picture whose colour is a little
+    /// off is something a person can live with until they notice, and the same
+    /// colour baked into a file sent to somebody else is not.
+    pub caveat: Option<&'a str>,
 }
 
 /// What the picture will lose on the way out, in the words the interface says
@@ -124,6 +131,13 @@ pub fn warnings(request: &Request<'_>) -> Vec<String> {
 
     if is_hdr(request.profile) {
         said.push("HDR to SDR, as on an ordinary screen: highlights above white are clipped".to_string());
+    }
+
+    // What the viewer could not honour when it read the file, repeated at the
+    // moment it would be written into a new one. The colour passport, on `K`,
+    // says the same thing at more length.
+    if let Some(caveat) = request.caveat {
+        said.push(format!("{caveat} See the colour passport (K)."));
     }
 
     if !request.target.keeps_alpha() && has_transparency(request.image) {
@@ -310,6 +324,7 @@ fn copy_of<'a>(request: &Request<'a>) -> Request<'a> {
         target: request.target,
         colour: request.colour,
         quality: request.quality,
+        caveat: request.caveat,
     }
 }
 
@@ -446,6 +461,7 @@ mod tests {
             target,
             colour: Colour::KeepProfile,
             quality: 90,
+            caveat: None,
         }
     }
 
@@ -625,6 +641,7 @@ mod tests {
             target: Target::Jpeg,
             colour: Colour::BakeToSrgb,
             quality: 90,
+            caveat: None,
         };
 
         assert!(is_hdr(Some(&profile)), "a PQ profile was not recognised as HDR");
@@ -751,6 +768,7 @@ mod tests {
             target: Target::Jpeg,
             colour: Colour::KeepProfile,
             quality: 90,
+            caveat: None,
         };
 
         let budget = 6000;
@@ -791,6 +809,7 @@ mod tests {
             target: Target::Jpeg,
             colour: Colour::KeepProfile,
             quality: 90,
+            caveat: None,
         };
         assert_eq!(within_budget(&request, 200).expect("searching"), None, "a 200-byte budget was somehow met");
     }

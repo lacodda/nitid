@@ -166,6 +166,37 @@ pub struct ColourBox {
     pub kind_offset: usize,
     /// `true` when the box carries an ICC profile rather than CICP codes.
     pub is_icc: bool,
+    /// The three CICP code points, when the box states them rather than an ICC
+    /// profile: colour primaries, transfer characteristics, matrix
+    /// coefficients.
+    ///
+    /// Read rather than only located, because what a file *says* about its
+    /// colour and what the decoder *does* with it are two different things —
+    /// and where they differ, the viewer can at least say so.
+    pub cicp: Option<Cicp>,
+}
+
+/// The three code points an `nclx` box states.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Cicp {
+    pub primaries: u16,
+    pub transfer: u16,
+    pub matrix: u16,
+}
+
+impl Cicp {
+    /// Whether these codes describe plain sRGB.
+    ///
+    /// BT.709 primaries (1) and the sRGB transfer (13). The matrix is not part
+    /// of the question: it says how YUV was encoded, not what the colours
+    /// mean, and every still HEIC uses one of a handful.
+    pub fn is_srgb(self) -> bool {
+        // 0 and 2 are "unspecified" and "reserved": a file that declines to
+        // say is not a file claiming something wide, so it is left alone.
+        let primaries = matches!(self.primaries, 0..=2);
+        let transfer = matches!(self.transfer, 0 | 1 | 2 | 13);
+        primaries && transfer
+    }
 }
 
 /// Locate the colour description box.
@@ -177,9 +208,23 @@ pub fn colour_box(bytes: &[u8]) -> Option<ColourBox> {
     let start = body.as_ptr() as usize - bytes.as_ptr() as usize;
     let kind = body.get(..4)?;
 
+    let is_icc = kind == b"prof" || kind == b"rICC";
+    // `nclx`: the kind tag is followed by three big-endian shorts and a byte
+    // whose top bit is the full-range flag.
+    let cicp = (!is_icc)
+        .then(|| {
+            Some(Cicp {
+                primaries: u16::from_be_bytes([*body.get(4)?, *body.get(5)?]),
+                transfer: u16::from_be_bytes([*body.get(6)?, *body.get(7)?]),
+                matrix: u16::from_be_bytes([*body.get(8)?, *body.get(9)?]),
+            })
+        })
+        .flatten();
+
     Some(ColourBox {
         kind_offset: start,
-        is_icc: kind == b"prof" || kind == b"rICC",
+        is_icc,
+        cicp,
     })
 }
 
@@ -200,6 +245,103 @@ mod tests {
         let mut inner = vec![version, 0, 0, 0];
         inner.extend_from_slice(body);
         boxed(name, &inner)
+    }
+
+    /// An `nclx` colour box, as a real file states one: the tag, three
+    /// big-endian shorts, and a byte whose top bit is the full-range flag.
+    fn nclx(primaries: u16, transfer: u16, matrix: u16) -> Vec<u8> {
+        let mut body = b"nclx".to_vec();
+        body.extend_from_slice(&primaries.to_be_bytes());
+        body.extend_from_slice(&transfer.to_be_bytes());
+        body.extend_from_slice(&matrix.to_be_bytes());
+        body.push(0x80);
+        boxed(b"colr", &body)
+    }
+
+    /// The codes are read, not merely located. Until v0.30.0 only the kind tag
+    /// was looked at, so a file could declare BT.2020 and PQ and the viewer had
+    /// no idea.
+    #[test]
+    fn the_colour_codes_are_read_from_an_nclx_box() {
+        // BT.2020 primaries, PQ transfer, BT.2020 non-constant luminance.
+        let colour = colour_box(&nclx(9, 16, 9)).expect("an nclx box is a colour box");
+        assert!(!colour.is_icc);
+        assert_eq!(
+            colour.cicp,
+            Some(Cicp {
+                primaries: 9,
+                transfer: 16,
+                matrix: 9
+            })
+        );
+    }
+
+    /// An ICC box states no codes, and is not pretended to.
+    #[test]
+    fn an_icc_colour_box_states_no_codes() {
+        let colour = colour_box(&boxed(b"colr", b"profsome profile bytes")).expect("a prof box is a colour box");
+        assert!(colour.is_icc);
+        assert_eq!(colour.cicp, None);
+    }
+
+    /// What the warning turns on. BT.709 and sRGB are the ordinary case and
+    /// must stay silent; anything wider or brighter is what the decoder cannot
+    /// honour.
+    #[test]
+    fn only_codes_beyond_srgb_are_called_out() {
+        // BT.709 primaries, sRGB transfer: exactly what is shown.
+        assert!(
+            Cicp {
+                primaries: 1,
+                transfer: 13,
+                matrix: 6
+            }
+            .is_srgb()
+        );
+        // Unspecified: a file that declines to say is not a file claiming
+        // something wide.
+        assert!(
+            Cicp {
+                primaries: 2,
+                transfer: 2,
+                matrix: 2
+            }
+            .is_srgb()
+        );
+        // BT.2020 primaries: wider than what arrives.
+        assert!(
+            !Cicp {
+                primaries: 9,
+                transfer: 13,
+                matrix: 6
+            }
+            .is_srgb()
+        );
+        // PQ: brighter than what arrives.
+        assert!(
+            !Cicp {
+                primaries: 1,
+                transfer: 16,
+                matrix: 6
+            }
+            .is_srgb()
+        );
+        // HLG, the other HDR curve.
+        assert!(
+            !Cicp {
+                primaries: 9,
+                transfer: 18,
+                matrix: 9
+            }
+            .is_srgb()
+        );
+    }
+
+    /// A truncated box says nothing rather than reading past its end.
+    #[test]
+    fn a_short_colour_box_states_no_codes() {
+        let colour = colour_box(&boxed(b"colr", b"nclx")).expect("the box is still found");
+        assert_eq!(colour.cicp, None, "codes were invented from bytes that are not there");
     }
 
     #[test]
