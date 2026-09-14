@@ -185,6 +185,11 @@ pub struct Interface {
     /// once: laying out again before it is collected would otherwise rename
     /// the file a second time.
     renamed: Option<String>,
+    /// A save the box committed this frame, waiting to be collected.
+    ///
+    /// Cleared by [`take_save`](Self::take_save), for the reason the rename is:
+    /// laying out again before it is collected would write the file twice.
+    saved: Option<Saved>,
     /// The name being typed, while the rename box is up.
     ///
     /// `None` means the box is not showing. The name lives here rather than in
@@ -198,6 +203,12 @@ pub struct Interface {
     /// it is laid out — so the request has to happen on the frame after the
     /// box appears, not on the one that opens it.
     rename_focused: bool,
+    /// The save box, when it is up. Interface state for the same reason the
+    /// rename box is: a half-made choice the application must not see until it
+    /// is committed.
+    saving: Option<Saving>,
+    /// Whether the save box has been given the keyboard yet.
+    save_focused: bool,
     /// The minimap's picture, uploaded once per image rather than per frame.
     ///
     /// Keyed by the copy it was made from, so a step to another picture
@@ -295,8 +306,11 @@ impl Interface {
             info_shown: false,
             histogram_shown: false,
             renamed: None,
+            saved: None,
             renaming: None,
             rename_focused: false,
+            saving: None,
+            save_focused: false,
             minimap_texture: None,
             passport_shown: false,
             toolbar_shown: false,
@@ -338,6 +352,53 @@ impl Interface {
         self.rename_focused = false;
     }
 
+    /// Open the save box for the file on screen.
+    ///
+    /// `name` is the file's own name, whose stem becomes the suggestion: a
+    /// picture saved as something else is nearly always the same picture, so
+    /// "DSC00431.jpg" offers "DSC00431" and the chosen format supplies the
+    /// extension. `hdr` and `wide` decide what the box says before anything is
+    /// written — the losses are stated where the choice is made, not reported
+    /// after the file exists.
+    pub fn begin_save(&mut self, name: &str, hdr: bool, wide: bool) {
+        let stem = std::path::Path::new(name)
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.saving = Some(Saving {
+            stem,
+            target: crate::export::Target::Jpeg,
+            // A wide-gamut or HDR picture is the case the bake exists for, so
+            // it starts on; an ordinary sRGB one has nothing to bake and
+            // starts off, where it changes nothing either way.
+            bake: hdr || wide,
+            quality: 90,
+            losses: Vec::new(),
+        });
+        self.save_focused = false;
+    }
+
+    /// Whether the save box is up.
+    pub fn saving(&self) -> bool {
+        self.saving.is_some()
+    }
+
+    /// What the save box is currently asking for, so the application can work
+    /// out what it would cost.
+    pub fn saving_request(&self) -> Option<(crate::export::Target, bool, u8)> {
+        self.saving.as_ref().map(|saving| (saving.target, saving.bake, saving.quality))
+    }
+
+    /// Hand the losses back for the box to show.
+    ///
+    /// Worked out by the code that writes the file rather than by the box, so
+    /// the warning and the behaviour cannot disagree.
+    pub fn set_save_losses(&mut self, losses: Vec<String>) {
+        if let Some(saving) = self.saving.as_mut() {
+            saving.losses = losses;
+        }
+    }
+
     /// Whether the rename box is up, which is what tells the application that
     /// the keyboard belongs to it.
     pub fn renaming(&self) -> bool {
@@ -347,6 +408,11 @@ impl Interface {
     /// Take the name the box committed, if it did this frame.
     pub fn take_rename(&mut self) -> Option<String> {
         self.renamed.take()
+    }
+
+    /// Take the save the box committed, if it did this frame.
+    pub fn take_save(&mut self) -> Option<Saved> {
+        self.saved.take()
     }
 
     /// Put the rename box away without renaming anything.
@@ -493,6 +559,9 @@ impl Interface {
         let mut renaming = self.renaming.take();
         let mut rename_focused = self.rename_focused;
         let mut rename_outcome = None;
+        let mut saving = self.saving.take();
+        let mut save_focused = self.save_focused;
+        let mut save_outcome = None;
         // Whether any sorting folder is set, for the sheet's note.
         let sorting_set = config.sorting.any();
         let programs_set = config.programs.any();
@@ -542,6 +611,9 @@ impl Interface {
             if let Some(name) = renaming.as_mut() {
                 rename_outcome = rename_box(ui, name, &mut rename_focused);
             }
+            if let Some(save) = saving.as_mut() {
+                save_outcome = save_box(ui, save, &mut save_focused);
+            }
             if status.hovering {
                 drop_invitation(ui);
             }
@@ -549,10 +621,19 @@ impl Interface {
         });
         self.minimap_texture = minimap_texture;
         self.rename_focused = rename_focused;
+        self.save_focused = save_focused;
         // A box that was committed or cancelled does not come back next frame.
         self.renaming = match rename_outcome {
             Some(_) => None,
             None => renaming,
+        };
+        self.saving = match save_outcome {
+            Some(_) => None,
+            None => saving,
+        };
+        self.saved = match save_outcome {
+            Some(Saved::As { name, target, bake, quality }) => Some(Saved::As { name, target, bake, quality }),
+            Some(Saved::Cancelled) | None => None,
         };
         // Held for the application to collect rather than added to what
         // `layout` returns: a fourth element on that tuple would make every
@@ -1460,6 +1541,168 @@ fn frame_on_map(painter: &egui::Painter, map: egui::Rect, visible: (f32, f32, f3
     painter.rect_stroke(rect, 0.0, egui::Stroke::new(1.5, egui::Color32::WHITE), egui::StrokeKind::Inside);
 }
 
+/// A save in the making: what the box is showing before anything is written.
+pub struct Saving {
+    /// The name without its extension. The format supplies that.
+    stem: String,
+    target: crate::export::Target,
+    /// Whether to convert the colour to sRGB rather than hand the profile
+    /// along with the numbers.
+    bake: bool,
+    /// JPEG and WebP quality. PNG ignores it, and the box hides it there.
+    quality: u8,
+    /// What this choice would cost, as the export module words it. Refreshed
+    /// each frame, because it changes with the format chosen in the box.
+    losses: Vec<String>,
+}
+
+/// What the save box decided this frame.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Saved {
+    /// Write the picture this way.
+    As {
+        name: String,
+        target: crate::export::Target,
+        bake: bool,
+        quality: u8,
+    },
+    /// Put the box away and write nothing.
+    Cancelled,
+}
+
+/// The save box: choose a format and a colour, and say what each costs.
+///
+/// Everything it can lose is stated here rather than reported afterwards. A
+/// file that has already been written is a poor place to learn that its
+/// highlights are gone.
+fn save_box(ui: &mut egui::Ui, saving: &mut Saving, focused: &mut bool) -> Option<Saved> {
+    let mut outcome = None;
+
+    egui::Window::new("Save as")
+        .collapsible(false)
+        .resizable(false)
+        // As the rename box and the settings dialog: a viewer that lays out
+        // only on demand cannot animate, so a faded window stalls half-drawn.
+        .fade_in(false)
+        .fade_out(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(ui.ctx(), |ui| {
+            ui.set_min_width(380.0);
+
+            let field = ui.add(
+                egui::TextEdit::singleline(&mut saving.stem)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("a name for the new file"),
+            );
+            if !*focused {
+                field.request_focus();
+                *focused = true;
+            }
+            // The whole stem, selected: unlike a rename, the name offered here
+            // is a suggestion rather than the file's own, so typing over all
+            // of it is the common case.
+            if field.gained_focus() {
+                let end = saving.stem.chars().count();
+                select_range(ui, field.id, 0, end);
+            }
+
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label("Format");
+                for target in crate::export::Target::ALL {
+                    ui.selectable_value(&mut saving.target, *target, target.label());
+                }
+                ui.label(egui::RichText::new(format!(".{}", saving.target.extension())).weak());
+            });
+
+            if saving.target != crate::export::Target::Png {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("Quality");
+                    ui.add(egui::Slider::new(&mut saving.quality, 1..=100));
+                });
+            }
+
+            ui.add_space(4.0);
+            ui.checkbox(&mut saving.bake, "Bake the colour into sRGB");
+            ui.label(
+                egui::RichText::new(if saving.bake {
+                    "The colour you see is written into the numbers. For anywhere that ignores a profile."
+                } else {
+                    "The file's own numbers, with its profile alongside. Nothing is converted."
+                })
+                .weak()
+                .small(),
+            );
+
+            // What this choice costs, in the export module's own words: the
+            // code that writes the file is the one that knows, and a second
+            // wording here would be a second thing to keep true.
+            if !saving.losses.is_empty() {
+                ui.add_space(6.0);
+                for loss in &saving.losses {
+                    ui.label(egui::RichText::new(loss).weak().small());
+                }
+            }
+
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Save").clicked() {
+                    outcome = Some(saving.committed());
+                }
+                if ui.button("Cancel").clicked() {
+                    outcome = Some(Saved::Cancelled);
+                }
+                ui.label(egui::RichText::new("Enter to save, Esc to cancel").weak().small());
+            });
+
+            if field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                outcome = Some(saving.committed());
+            }
+            if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                outcome = Some(Saved::Cancelled);
+            }
+        });
+
+    // An empty name is not a save, the same way an empty one is not a rename.
+    match outcome {
+        Some(Saved::As { ref name, .. }) if name.trim().is_empty() => Some(Saved::Cancelled),
+        other => other,
+    }
+}
+
+impl Saving {
+    /// What this box is asking for, as the application will receive it.
+    ///
+    /// An extension typed into the name decides the format, rather than being
+    /// appended to by a second one: someone who types "gull.png" while the
+    /// buttons say JPEG means a PNG, and a viewer that wrote "gull.png.jpg"
+    /// would be arguing with them. Anything else — "v2.final", a name with a
+    /// dot in it — is a name, and the chosen format still supplies the
+    /// extension.
+    fn committed(&self) -> Saved {
+        let typed = self.stem.trim();
+        let named = std::path::Path::new(typed)
+            .extension()
+            .and_then(|extension| crate::export::Target::from_extension(&extension.to_string_lossy()));
+
+        match named {
+            Some(target) => Saved::As {
+                name: typed.to_string(),
+                target,
+                bake: self.bake,
+                quality: self.quality,
+            },
+            None => Saved::As {
+                name: format!("{typed}.{}", self.target.extension()),
+                target: self.target,
+                bake: self.bake,
+                quality: self.quality,
+            },
+        }
+    }
+}
+
 /// What the rename box decided this frame.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Renamed {
@@ -2062,6 +2305,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Ctrl+Shift+1-9", "copy it there instead"),
     ("F", "mirror it left to right; Shift+F top to bottom"),
     ("Ctrl+S", "write the turn into the file, without touching its pixels"),
+    ("Ctrl+Shift+S", "save as another format, with the colour you see"),
     ("E", "open this file in the program that edits it"),
     ("Alt+1-9", "open it in the program set for that key"),
     ("+ -", "zoom in / out"),
@@ -2163,6 +2407,64 @@ fn monospace(text: impl Into<String>) -> egui::RichText {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn saving_box(stem: &str, target: crate::export::Target) -> Saving {
+        Saving {
+            stem: stem.to_string(),
+            target,
+            bake: false,
+            quality: 90,
+            losses: Vec::new(),
+        }
+    }
+
+    /// The format buttons name the file when the name does not.
+    #[test]
+    fn a_plain_name_takes_the_extension_of_the_chosen_format() {
+        let box_ = saving_box("gull", crate::export::Target::WebP);
+        assert_eq!(
+            box_.committed(),
+            Saved::As {
+                name: "gull.webp".into(),
+                target: crate::export::Target::WebP,
+                bake: false,
+                quality: 90
+            }
+        );
+    }
+
+    /// An extension typed into the name wins over the buttons: someone who
+    /// writes "gull.png" means a PNG, and "gull.png.jpg" would be the viewer
+    /// arguing with them.
+    #[test]
+    fn a_typed_extension_decides_the_format() {
+        let box_ = saving_box("gull.png", crate::export::Target::Jpeg);
+        assert_eq!(
+            box_.committed(),
+            Saved::As {
+                name: "gull.png".into(),
+                target: crate::export::Target::Png,
+                bake: false,
+                quality: 90
+            }
+        );
+    }
+
+    /// A dot that is not an extension is part of the name, and the chosen
+    /// format still supplies the real one.
+    #[test]
+    fn a_dot_that_names_nothing_is_left_in_the_name() {
+        let box_ = saving_box("gull.v2", crate::export::Target::Jpeg);
+        assert_eq!(
+            box_.committed(),
+            Saved::As {
+                name: "gull.v2.jpg".into(),
+                target: crate::export::Target::Jpeg,
+                bake: false,
+                quality: 90
+            }
+        );
+    }
 
     fn status() -> Status {
         Status {

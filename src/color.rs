@@ -177,6 +177,18 @@ impl ColorTransform {
         curve[below] + (curve[above] - curve[below]) * fraction
     }
 
+    /// Linear source light to linear display light, by the matrix.
+    ///
+    /// The shader's `colour.matrix * linear`, for the export, which walks
+    /// every pixel on the CPU rather than the visible ones on the GPU.
+    pub fn to_display(&self, linear: [f32; 3]) -> [f32; 3] {
+        let mut out = [0.0f32; 3];
+        for (row, weights) in self.matrix.iter().enumerate() {
+            out[row] = weights[0] * linear[0] + weights[1] * linear[1] + weights[2] * linear[2];
+        }
+        out
+    }
+
     /// The transform that changes nothing.
     ///
     /// Used when the image and the display agree, which is the common case and

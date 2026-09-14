@@ -19,6 +19,7 @@ mod config;
 mod console;
 mod drag;
 mod editor;
+mod export;
 mod eyedropper;
 mod files;
 mod folder;

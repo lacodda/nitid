@@ -386,6 +386,29 @@ it was, byte for byte. A photograph turned this way a hundred times is the same
 photograph. `F` mirrors the picture left to right, `Shift+F` top to bottom, and
 those save the same way.
 
+**`Ctrl+Shift+S` saves the picture as something else.** JPEG, PNG or WebP,
+beside the file it came from, under a name you type — the original is never
+touched and an existing neighbour is never replaced.
+
+What comes out is what was on screen. The colour path is the one the shader
+draws with, step for step: the same curves, the same matrix, the same clamp,
+run over every pixel instead of the visible ones, and a gate reads the shader
+itself to keep the two from drifting apart. So a wide-gamut photograph can go
+out with its colour **baked into sRGB** — the numbers say what you were
+looking at, which is what a chat window or a forum will show, since neither
+reads a profile. Left unbaked, the file keeps its own numbers and its profile
+travels with them; that is the default for an ordinary picture, because it is
+the choice that can be undone.
+
+The box says what a save will cost before it writes anything. JPEG has no
+transparency, so a picture with any will be filled with white. Eight bits per
+channel is all JPEG and WebP store, so a sixteen-bit source loses the rest. And
+an HDR picture becomes SDR the way it already looks on an ordinary screen:
+reference white lands on white, and highlights above it clip. That is a real
+loss and it is stated plainly — those highlights are not coming back — but it
+is exactly what you were seeing, rather than a second rendering that would make
+the file disagree with its own preview.
+
 Turning and saving are separate on purpose: looking at a photograph from
 another angle leaves nothing on disk until you say so. The one thing to know is
 that a program which ignores EXIF orientation — a few old tools do — will still
@@ -679,6 +702,7 @@ Opening a file opens its folder: the arrow keys walk the images beside it.
 | `Ctrl+Shift+1`-`9` | copy it there instead |
 | `F` | mirror it left to right; `Shift+F` top to bottom |
 | `Ctrl+S` | write the turn into the file, without touching its pixels |
+| `Ctrl+Shift+S` | save as another format, with the colour you see |
 | `E` | open this file in the program that edits it |
 | `Alt+1`-`9` | open it in the program set for that key |
 | `F11` | fullscreen |

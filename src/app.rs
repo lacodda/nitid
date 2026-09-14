@@ -1090,6 +1090,7 @@ impl App {
             Some(Chord::CopyPicture) => self.copy_picture(),
             Some(Chord::Paste) => self.paste_picture(),
             Some(Chord::SaveTurn) => self.save_turn(),
+            Some(Chord::SaveAs) => self.begin_save_as(),
             None => {}
         }
     }
@@ -1270,6 +1271,163 @@ impl App {
                 self.interface.toast(format!("renamed to {}", name_of(&renamed)), Instant::now());
             }
             Ok(_) => {}
+            Err(error) => self.report(error),
+        }
+        self.request_redraw();
+    }
+
+    /// Open the save box for the picture on screen.
+    ///
+    /// The box is opened rather than a file written straight away, because
+    /// every choice it offers — the format, whether the colour is baked, what
+    /// a JPEG costs in quality — changes what arrives at the other end, and a
+    /// viewer that guessed them would be guessing on the user's behalf about a
+    /// file they are about to send someone.
+    fn begin_save_as(&mut self) {
+        let Some(shown) = self.shown.as_ref() else {
+            return;
+        };
+
+        // A pasted picture has no name of its own, so the box opens on one
+        // that says what it is rather than on an empty field.
+        let name = if shown.pasted { "pasted.png".to_string() } else { name_of(&shown.path) };
+
+        let profile = self.profile_on_screen();
+        let hdr = crate::export::is_hdr(profile.as_ref());
+        // A picture whose colour would move is the case baking exists for, and
+        // the box starts with it on. Asked of the transform rather than of the
+        // profile's name: what matters is whether the numbers change.
+        let wide = profile
+            .as_ref()
+            .is_some_and(|profile| !crate::color::ColorTransform::new(profile, &moxcms::ColorProfile::new_srgb()).is_identity);
+
+        self.interface.begin_save(&name, hdr, wide);
+        self.request_redraw();
+    }
+
+    /// Ask the export module what the save box's current choice would cost,
+    /// and hand the answer to the box.
+    fn refresh_save_losses(&mut self) {
+        let Some((target, bake, quality)) = self.interface.saving_request() else {
+            return;
+        };
+        let Some(shown) = self.shown.as_ref() else {
+            return;
+        };
+
+        let image = if shown.pasted {
+            self.pasted.clone()
+        } else {
+            let path = shown.path.clone();
+            match self.loader.request(&path) {
+                Request::Ready(image) => Some(image.image.clone()),
+                Request::Pending => None,
+            }
+        };
+        let Some(image) = image else {
+            return;
+        };
+
+        let profile = self.profile_on_screen();
+        let losses = crate::export::warnings(&crate::export::Request {
+            image: &image,
+            profile: profile.as_ref(),
+            target,
+            colour: if bake {
+                crate::export::Colour::BakeToSrgb
+            } else {
+                crate::export::Colour::KeepProfile
+            },
+            quality,
+        });
+        self.interface.set_save_losses(losses);
+    }
+
+    /// The colour profile of the picture on screen, if it carries one.
+    fn profile_on_screen(&mut self) -> Option<moxcms::ColorProfile> {
+        let shown = self.shown.as_ref()?;
+        if shown.pasted {
+            // A pasted picture arrives as numbers with nothing said about
+            // them — see ADR 0020.
+            return None;
+        }
+        match self.loader.request(&shown.path) {
+            Request::Ready(image) => image.profile.clone(),
+            Request::Pending => None,
+        }
+    }
+
+    /// Write the picture on screen as another file.
+    fn save_as(&mut self, saved: crate::interface::Saved) {
+        let crate::interface::Saved::As { name, target, bake, quality } = saved else {
+            return;
+        };
+
+        let Some(shown) = self.shown.as_ref() else {
+            return;
+        };
+        let pasted = shown.pasted;
+        let beside = shown.path.clone();
+
+        let image = if pasted {
+            self.pasted.clone()
+        } else {
+            match self.loader.request(&beside) {
+                Request::Ready(image) => Some(image.image.clone()),
+                Request::Pending => None,
+            }
+        };
+
+        let Some(image) = image else {
+            self.interface.toast("still opening", Instant::now());
+            self.request_redraw();
+            return;
+        };
+
+        let profile = self.profile_on_screen();
+        let request = crate::export::Request {
+            image: &image,
+            profile: profile.as_ref(),
+            target,
+            colour: if bake {
+                crate::export::Colour::BakeToSrgb
+            } else {
+                crate::export::Colour::KeepProfile
+            },
+            quality,
+        };
+
+        // Beside the file it came from, which is where a person looking at
+        // that folder expects it to appear. A pasted picture has no file of
+        // its own, so it goes beside the folder the viewer is walking.
+        let beside = if pasted {
+            self.folder.as_ref().map(|folder| folder.current().to_path_buf())
+        } else {
+            Some(beside)
+        };
+        let Some(folder) = beside.as_deref().and_then(|path| path.parent()).map(|parent| parent.to_path_buf()) else {
+            self.interface.toast("nowhere to save it", Instant::now());
+            self.request_redraw();
+            return;
+        };
+        let path = folder.join(&name);
+
+        // A save must not quietly replace something. The name came from a box
+        // the user typed into, and a viewer that overwrote a neighbouring file
+        // on a name collision would destroy a picture to write one.
+        if path.exists() {
+            self.interface.toast(format!("{name} is already there"), Instant::now());
+            self.request_redraw();
+            return;
+        }
+
+        match crate::export::save(&request, &path) {
+            Ok(()) => {
+                // The folder listing is not rebuilt, the way it is not after
+                // sorting a file into another folder: the walk is what it was
+                // when it was opened, and `R` is what asks for it again.
+                self.interface.toast(format!("saved as {name}"), Instant::now());
+            }
             Err(error) => self.report(error),
         }
         self.request_redraw();
@@ -1918,6 +2076,16 @@ impl App {
         if let Some(name) = self.interface.take_rename() {
             self.rename_current(name);
         }
+        // A save the box committed during that layout, collected here for the
+        // reason the rename is: writing the file touches the folder and the
+        // interface, both borrowed above.
+        if let Some(saved) = self.interface.take_save() {
+            self.save_as(saved);
+        }
+        // What the choice in the box would cost, refreshed while it is up: the
+        // format can be changed in it, and a warning about the format chosen a
+        // moment ago is worse than none.
+        self.refresh_save_losses();
         // Something inside the layout changed what the next frame shows —
         // the dialog's close button, which is pressed in the frame that still
         // draws the dialog.
@@ -2126,6 +2294,7 @@ enum Chord {
     CopyPath,
     Paste,
     SaveTurn,
+    SaveAs,
 }
 
 /// Which chord a key is, with Ctrl already known to be down.
@@ -2143,7 +2312,11 @@ fn chord_for(key: &Key) -> Option<Chord> {
         "C" => Some(Chord::CopyPath),
         "c" => Some(Chord::CopyPicture),
         "v" | "V" => Some(Chord::Paste),
-        "s" | "S" => Some(Chord::SaveTurn),
+        // Ctrl+Shift+S arrives as the capital, like Ctrl+Shift+C. It used to
+        // be a silent synonym for Ctrl+S, which meant the viewer had two keys
+        // doing one thing and no key for the other.
+        "S" => Some(Chord::SaveAs),
+        "s" => Some(Chord::SaveTurn),
         _ => None,
     }
 }
@@ -2710,7 +2883,7 @@ impl ApplicationHandler<Event> for App {
                 // this, typing "gull.jpg" would step to the next picture on
                 // the "g", turn it on the "r", and delete nothing only by
                 // luck. Escape is left to egui, which the box watches for.
-                if self.interface.renaming() {
+                if self.interface.renaming() || self.interface.saving() {
                     return;
                 }
                 if self.modifiers.alt_key() {
@@ -3455,7 +3628,14 @@ mod tests {
             .map(|(key, _)| *key)
             .filter(|key| (key.starts_with("Ctrl+") || key.starts_with("Alt+")) && !key.contains("Drag") && !key.contains("Wheel"))
             .collect();
-        assert_eq!(advertised.len(), 7, "the sheet lists {advertised:?}, which is not the seven chords");
+        assert_eq!(advertised.len(), 8, "the sheet lists {advertised:?}, which is not the eight chords");
+
+        // What each letter chord answers with, so two rows of the sheet
+        // cannot quietly be the same key. Until v0.30.0 `chord_for` matched
+        // `"s" | "S"`, which made Ctrl+Shift+S a silent synonym for Ctrl+S:
+        // the sheet could have advertised both, and asking only whether each
+        // is answered would have said yes to both.
+        let mut answers: Vec<(&str, Chord)> = Vec::new();
 
         for key in advertised {
             let named = key.rsplit('+').next().expect("a chord names a key");
@@ -3490,10 +3670,13 @@ mod tests {
             // The letter at the end of the chord, and whether Shift is in it.
             let shifted = key.contains("Shift");
             let character = if shifted { named.to_uppercase() } else { named.to_lowercase() };
-            assert!(
-                chord_for(&Key::Character(character.as_str().into())).is_some(),
-                "the key sheet lists {key}, which the viewer ignores",
-            );
+            let answer = chord_for(&Key::Character(character.as_str().into()));
+            let answer = answer.unwrap_or_else(|| panic!("the key sheet lists {key}, which the viewer ignores"));
+
+            if let Some((first, _)) = answers.iter().find(|(_, seen)| *seen == answer) {
+                panic!("the key sheet lists {first} and {key} separately, and the viewer answers both with {answer:?}");
+            }
+            answers.push((key, answer));
         }
     }
 
