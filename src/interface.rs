@@ -260,13 +260,14 @@ pub enum Section {
     Appearance,
     Opening,
     Tools,
+    Sending,
     Files,
     Programs,
 }
 
 impl Section {
     /// The sections down the left of the dialog, in the order they are shown.
-    const ALL: [Self; 6] = [Self::Gestures, Self::Appearance, Self::Opening, Self::Tools, Self::Files, Self::Programs];
+    const ALL: [Self; 7] = [Self::Gestures, Self::Appearance, Self::Opening, Self::Tools, Self::Sending, Self::Files, Self::Programs];
 
     /// What the section is called in its list.
     fn name(self) -> &'static str {
@@ -275,6 +276,7 @@ impl Section {
             Self::Appearance => "View",
             Self::Opening => "Opening",
             Self::Tools => "Colour",
+            Self::Sending => "Sending",
             Self::Files => "Files",
             Self::Programs => "Programs",
         }
@@ -1950,6 +1952,7 @@ fn settings_dialog(ui: &mut egui::Ui, config: &mut Config, section: &mut Section
                                 Section::Appearance => appearance_section(ui, &mut config.appearance),
                                 Section::Opening => opening_section(ui, &mut config.behaviour),
                                 Section::Tools => tools_section(ui, &mut config.tools),
+                                Section::Sending => sending_section(ui, &mut config.sending),
                             };
                         });
                 });
@@ -2192,6 +2195,32 @@ fn opening_section(ui: &mut egui::Ui, behaviour: &mut Behaviour) -> bool {
 }
 
 /// The colour tools.
+/// What `Ctrl+Alt+C` makes of a picture before it goes on the clipboard.
+fn sending_section(ui: &mut egui::Ui, sending: &mut crate::config::Sending) -> bool {
+    let mut edited = false;
+
+    ui.label(egui::RichText::new("Sending").strong());
+    ui.add_space(6.0);
+    ui.label(
+        egui::RichText::new("Ctrl+Alt+C puts a JPEG on the clipboard alongside the pixels, made to fit here. A size rather than a quality: what a quality weighs depends on the picture, and an attachment limit does not.")
+            .weak()
+            .small(),
+    );
+    ui.add_space(8.0);
+
+    ui.label("At most");
+    edited |= ui.add(egui::Slider::new(&mut sending.budget_kb, 50..=5000).suffix(" KB")).changed();
+
+    ui.add_space(8.0);
+    ui.label("Shrunk so its longest side is at most");
+    edited |= ui.add(egui::Slider::new(&mut sending.width, 0..=8000).suffix(" px")).changed();
+    if sending.width == 0 {
+        ui.label(egui::RichText::new("Zero leaves the size alone and lets the budget do the work.").weak().small());
+    }
+
+    edited
+}
+
 fn tools_section(ui: &mut egui::Ui, tools: &mut Tools) -> bool {
     let mut edited = false;
 
@@ -2299,6 +2328,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Ctrl+C", "copy the picture"),
     ("Ctrl+V", "show the picture on the clipboard"),
     ("Ctrl+Shift+C", "copy the path, quoted for a terminal"),
+    ("Ctrl+Alt+C", "copy it as a JPEG small enough to send"),
     ("Del", "send this file to the recycle bin"),
     ("F2", "rename this file"),
     ("Ctrl+1-9", "move this file to the folder set for that key"),

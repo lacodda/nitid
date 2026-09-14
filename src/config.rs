@@ -225,6 +225,28 @@ impl Units {
     }
 }
 
+/// What "copy as" makes of the picture before it goes on the clipboard.
+///
+/// A budget rather than a quality dial: nobody knows what quality 74 weighs,
+/// and everybody knows what an attachment limit is. See ADR 0026.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Sending {
+    /// The most a copied JPEG may weigh, in kilobytes.
+    pub budget_kb: u32,
+    /// The longest side a copied picture is shrunk to, in pixels. Zero leaves
+    /// the size alone and lets the budget do the work by itself.
+    pub width: u32,
+}
+
+impl Default for Sending {
+    fn default() -> Self {
+        // 500 KB and 2048 pixels: under every mail attachment limit and every
+        // chat's inline size, and still a picture somebody can look at rather
+        // than a thumbnail.
+        Self { budget_kb: 500, width: 2048 }
+    }
+}
+
 /// What a click in the eyedropper puts on the clipboard.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Copies {
@@ -450,6 +472,7 @@ pub struct Config {
     pub appearance: Appearance,
     pub behaviour: Behaviour,
     pub tools: Tools,
+    pub sending: Sending,
     pub sorting: Sorting,
     pub programs: Programs,
     /// Keys the file carried that this version does not know.
@@ -508,6 +531,16 @@ impl Config {
 
                 "wheel" => config.gestures.wheel = Wheel::parse(value).unwrap_or_default(),
                 "invert_wheel" => config.gestures.invert_wheel = value == "true",
+                "send_budget_kb" => {
+                    if let Ok(budget) = value.parse() {
+                        config.sending.budget_kb = budget;
+                    }
+                }
+                "send_width" => {
+                    if let Ok(width) = value.parse() {
+                        config.sending.width = width;
+                    }
+                }
                 "zoom_step" => {
                     if let Ok(step) = value.parse::<f32>()
                         && step.is_finite()
@@ -581,6 +614,9 @@ impl Config {
         out.push_str(&format!("invert_wheel = {}\n", self.gestures.invert_wheel));
         out.push_str(&format!("zoom_step = {}\n", self.gestures.zoom_step));
         out.push_str(&format!("middle_toggles = {}\n", self.gestures.middle_toggles));
+
+        out.push_str(&format!("send_budget_kb = {}\n", self.sending.budget_kb));
+        out.push_str(&format!("send_width = {}\n", self.sending.width));
 
         out.push_str(&format!("backdrop = {}\n", self.appearance.backdrop.keyword()));
         out.push_str(&format!("toolbar = {}\n", self.appearance.toolbar.render()));
@@ -760,6 +796,9 @@ mod tests {
                 wrap: false,
                 order: Order::Modified,
             },
+            // Neither is the default: a round trip that carried the default
+            // through would pass even if the key were never written at all.
+            sending: Sending { budget_kb: 250, width: 1600 },
             tools: Tools {
                 clip_high: 0.98,
                 clip_low: 0.02,

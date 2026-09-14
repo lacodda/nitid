@@ -1095,6 +1095,130 @@ impl App {
         }
     }
 
+    /// Answer a chord that needs both modifiers.
+    fn handle_double_chord(&mut self, chord: DoubleChord) {
+        match chord {
+            DoubleChord::CopyForSending => self.copy_for_sending(),
+        }
+    }
+
+    /// Copy the picture in a shape somebody can actually send.
+    ///
+    /// Two things go on the clipboard at once, the way a drag offers two
+    /// (ADR 0021): a JPEG file, shrunk and compressed to fit the budget in the
+    /// settings, and the pixels. A chat window or a mail client takes the file
+    /// and sends what it weighs; an editor that paints takes the pixels.
+    ///
+    /// The budget is why the file exists at all. `Ctrl+C` puts a bitmap on the
+    /// clipboard and a bitmap has no size to speak of — whoever receives it
+    /// compresses it their own way, at their own quality. Asking for "under
+    /// 500 KB" only means something if what travels is a file.
+    fn copy_for_sending(&mut self) {
+        let Some(shown) = self.shown.as_ref() else {
+            return;
+        };
+
+        let image = if shown.pasted {
+            self.pasted.clone()
+        } else {
+            let path = shown.path.clone();
+            match self.loader.request(&path) {
+                Request::Ready(image) => Some(image.image.clone()),
+                Request::Pending => None,
+            }
+        };
+        let Some(image) = image else {
+            self.interface.toast("still opening", Instant::now());
+            self.request_redraw();
+            return;
+        };
+
+        let sending = self.config.sending;
+        let profile = self.profile_on_screen();
+
+        // The colour is baked: what travels is a file going to somebody whose
+        // program will very likely ignore a profile, which is the case baking
+        // exists for.
+        let smaller = crate::export::shrink(&image, sending.width);
+        let request = crate::export::Request {
+            image: &smaller,
+            profile: profile.as_ref(),
+            target: crate::export::Target::Jpeg,
+            colour: crate::export::Colour::BakeToSrgb,
+            quality: 90,
+        };
+
+        let budget = sending.budget_kb as usize * 1024;
+        let found = match crate::export::within_budget(&request, budget) {
+            Ok(found) => found,
+            Err(error) => {
+                self.report(error);
+                self.request_redraw();
+                return;
+            }
+        };
+
+        let Some((bytes, quality)) = found else {
+            // Said rather than silently exceeded: a copy that broke the budget
+            // would be found out by the mail client, not here.
+            self.interface
+                .toast(format!("cannot fit {} KB — try a smaller width", sending.budget_kb), Instant::now());
+            self.request_redraw();
+            return;
+        };
+
+        match self.write_temporary(&bytes) {
+            Ok(path) => {
+                let hdrop = crate::drag::to_hdrop(&[&path]);
+                let dib = crate::clipboard::to_dib(&smaller);
+                let payloads: [(u32, &[u8]); 2] = [(crate::clipboard::HDROP_FORMAT, &hdrop), (crate::clipboard::DIB_FORMAT, &dib)];
+
+                match crate::clipboard::set_formats(&payloads) {
+                    Ok(()) => {
+                        let kb = bytes.len().div_ceil(1024);
+                        self.interface.toast(format!("copied as {kb} KB JPEG, quality {quality}"), Instant::now());
+                    }
+                    Err(error) => {
+                        eprintln!("nitid: {error:#}");
+                        self.interface.toast("could not reach the clipboard", Instant::now());
+                    }
+                }
+            }
+            Err(error) => self.report(error),
+        }
+        self.request_redraw();
+    }
+
+    /// Write bytes to a file in the temporary directory, for the clipboard to
+    /// point at.
+    ///
+    /// A viewer does not write to disk unasked (ADR 0020), and this is asked:
+    /// the whole point of the key is a file somebody can attach. It goes to
+    /// the temporary directory rather than beside the picture, so nothing
+    /// appears in the folder a person is looking at, and it is named after the
+    /// picture so what lands in a chat carries a name that means something.
+    fn write_temporary(&mut self, bytes: &[u8]) -> anyhow::Result<PathBuf> {
+        use anyhow::Context;
+
+        let stem = self
+            .shown
+            .as_ref()
+            .filter(|shown| !shown.pasted)
+            .and_then(|shown| shown.path.file_stem().map(|stem| stem.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| "picture".to_string());
+
+        // A folder of our own inside the temporary directory, named for the
+        // process: two viewers copying at once must not write the same path,
+        // and a name collision here would hand the clipboard the other one's
+        // picture.
+        let folder = std::env::temp_dir().join(format!("nitid-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).with_context(|| format!("making {}", folder.display()))?;
+
+        let path = folder.join(format!("{stem}.jpg"));
+        std::fs::write(&path, bytes).with_context(|| format!("writing {}", path.display()))?;
+        Ok(path)
+    }
+
     /// Write the turn on screen into the file, and stop calling it a turn.
     ///
     /// What is written is the orientation the picture *is*, not the turn that
@@ -2297,6 +2421,58 @@ enum Chord {
     SaveAs,
 }
 
+/// Which way a key press goes, given the modifiers held.
+///
+/// Its own function because the order of these tests is the whole of what
+/// keeps `Ctrl+Alt+C` from also being `Ctrl+C`: both modifiers are asked about
+/// before either alone. Written as a branch inside the event handler, that
+/// order could only be checked by a test that repeated it — and a test that
+/// repeats the thing it checks passes when the thing is deleted.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Route {
+    /// Ctrl and Alt together.
+    DoubleChord,
+    /// Alt alone: a program slot.
+    Program,
+    /// Ctrl alone: a chord or a sorting digit.
+    Chord,
+    /// No modifier that matters here.
+    Bare,
+}
+
+fn route_for(modifiers: winit::keyboard::ModifiersState) -> Route {
+    if modifiers.control_key() && modifiers.alt_key() {
+        Route::DoubleChord
+    } else if modifiers.alt_key() {
+        Route::Program
+    } else if modifiers.control_key() {
+        Route::Chord
+    } else {
+        Route::Bare
+    }
+}
+
+/// A chord that needs both modifiers.
+///
+/// Its own enum rather than a variant of `Chord`, so the dispatch above cannot
+/// answer `Ctrl+Alt+C` with something meant for `Ctrl+C`: the two are reached
+/// by different branches and the types keep them apart.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DoubleChord {
+    CopyForSending,
+}
+
+/// Which chord a key is, with Ctrl and Alt both known to be down.
+fn double_chord_for(key: &Key) -> Option<DoubleChord> {
+    let Key::Character(character) = key else {
+        return None;
+    };
+    match character.as_str() {
+        "c" | "C" => Some(DoubleChord::CopyForSending),
+        _ => None,
+    }
+}
+
 /// Which chord a key is, with Ctrl already known to be down.
 ///
 /// Its own function so the one thing that is easy to get wrong here can be
@@ -2886,25 +3062,33 @@ impl ApplicationHandler<Event> for App {
                 if self.interface.renaming() || self.interface.saving() {
                     return;
                 }
-                if self.modifiers.alt_key() {
+                match route_for(self.modifiers) {
+                    // Ctrl and Alt together, decided before either alone: the
+                    // copy-as key is the one chord with two modifiers, and a
+                    // branch that asked about Alt first would swallow it.
+                    Route::DoubleChord => {
+                        if let Some(chord) = double_chord_for(&event.logical_key) {
+                            self.handle_double_chord(chord);
+                        }
+                    }
                     // Alt and a digit hand the picture to a program. The
                     // digits belong to sorting under Ctrl, so the programs
                     // take a modifier of their own rather than a gesture
                     // that is already spoken for. Read from the physical key
                     // for the same reason sorting is.
-                    if let Some(digit) = digit_key(&event.physical_key) {
-                        self.open_in_program(Some(digit));
+                    Route::Program => {
+                        if let Some(digit) = digit_key(&event.physical_key) {
+                            self.open_in_program(Some(digit));
+                        }
                     }
-                } else if self.modifiers.control_key() {
                     // A digit sorts the file into a folder; Shift makes it a
                     // copy. Asked of the physical key, because Ctrl+Shift+1
                     // does not deliver the character "1" on any layout.
-                    match digit_key(&event.physical_key) {
+                    Route::Chord => match digit_key(&event.physical_key) {
                         Some(digit) => self.sort_current(digit, self.modifiers.shift_key()),
                         None => self.handle_chord(&event.logical_key),
-                    }
-                } else {
-                    self.handle_key(&event.logical_key, event_loop);
+                    },
+                    Route::Bare => self.handle_key(&event.logical_key, event_loop),
                 }
             }
 
@@ -3628,7 +3812,7 @@ mod tests {
             .map(|(key, _)| *key)
             .filter(|key| (key.starts_with("Ctrl+") || key.starts_with("Alt+")) && !key.contains("Drag") && !key.contains("Wheel"))
             .collect();
-        assert_eq!(advertised.len(), 8, "the sheet lists {advertised:?}, which is not the eight chords");
+        assert_eq!(advertised.len(), 9, "the sheet lists {advertised:?}, which is not the nine chords");
 
         // What each letter chord answers with, so two rows of the sheet
         // cannot quietly be the same key. Until v0.30.0 `chord_for` matched
@@ -3670,6 +3854,20 @@ mod tests {
             // The letter at the end of the chord, and whether Shift is in it.
             let shifted = key.contains("Shift");
             let character = if shifted { named.to_uppercase() } else { named.to_lowercase() };
+
+            // A chord with both modifiers is reached by a different branch of
+            // the dispatch and answered by a different function, so it is
+            // asked of that one. Asking `chord_for` would be asking the wrong
+            // question and getting a wrong yes: it answers on the letter
+            // alone and knows nothing about Alt.
+            if key.starts_with("Ctrl+") && key.contains("Alt+") {
+                assert!(
+                    double_chord_for(&Key::Character(character.as_str().into())).is_some(),
+                    "the key sheet lists {key}, which the viewer ignores",
+                );
+                continue;
+            }
+
             let answer = chord_for(&Key::Character(character.as_str().into()));
             let answer = answer.unwrap_or_else(|| panic!("the key sheet lists {key}, which the viewer ignores"));
 
@@ -3678,6 +3876,32 @@ mod tests {
             }
             answers.push((key, answer));
         }
+    }
+
+    /// `Ctrl+Alt+C` must not also be `Ctrl+C`.
+    ///
+    /// The dispatch, not the lookup, is where this can go wrong: `chord_for`
+    /// is asked about a letter and would happily answer `CopyPicture` for a
+    /// "c" that arrived with Alt held too. What keeps them apart is the order
+    /// of the branches — both modifiers are tested before either alone — and
+    /// that is what this holds down.
+    #[test]
+    fn holding_both_modifiers_does_not_also_copy_the_plain_way() {
+        use winit::keyboard::ModifiersState;
+
+        // `route_for` is the function the dispatch itself calls, not a copy of
+        // its condition: deleting the two-modifier branch changes this answer.
+        assert_eq!(route_for(ModifiersState::CONTROL | ModifiersState::ALT), Route::DoubleChord);
+        assert_eq!(double_chord_for(&Key::Character("c".into())), Some(DoubleChord::CopyForSending));
+
+        // And every other combination still goes where it went before, so the
+        // new branch did not take an old key with it.
+        assert_eq!(route_for(ModifiersState::CONTROL), Route::Chord);
+        assert_eq!(chord_for(&Key::Character("c".into())), Some(Chord::CopyPicture));
+        assert_eq!(route_for(ModifiersState::ALT), Route::Program);
+        assert_eq!(route_for(ModifiersState::empty()), Route::Bare);
+        // Shift is not a route of its own: Ctrl+Shift is still a chord.
+        assert_eq!(route_for(ModifiersState::CONTROL | ModifiersState::SHIFT), Route::Chord);
     }
 
     /// The number pad answers too — someone sorting with one hand is using it

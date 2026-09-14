@@ -21,6 +21,15 @@
 
 use crate::image_source::{DecodedImage, Depth};
 
+/// The clipboard format number for a bitmap, and for a list of files.
+///
+/// Stated here rather than taken from the `windows` crate at every call site,
+/// because a caller outside this module would otherwise need the Windows types
+/// to name a format — and these two numbers are fixed by the platform, not by
+/// a header. `CF_DIB` is 8 and `CF_HDROP` is 15.
+pub const DIB_FORMAT: u32 = 8;
+pub const HDROP_FORMAT: u32 = 15;
+
 /// The header of a `CF_DIB`, which is a `BITMAPINFOHEADER` followed by pixels.
 ///
 /// Written out rather than taken from the `windows` crate so the arithmetic
@@ -243,23 +252,39 @@ mod windows_clipboard {
 
     /// Put a `CF_DIB` payload on the clipboard.
     pub fn set_dib(payload: &[u8]) -> Result<()> {
+        set_formats(&[(CF_DIB.0.into(), payload)])
+    }
+
+    /// Put several formats of the same thing on the clipboard at once.
+    ///
+    /// This is how the clipboard is meant to be used, and it is what a drag
+    /// already does (ADR 0021): the source offers every shape it can, and the
+    /// receiving application takes the one it understands. A chat window or a
+    /// mail client takes the file; an editor that paints takes the pixels.
+    ///
+    /// The clipboard is emptied once, before any of them: emptying between
+    /// two formats would leave only the last.
+    pub fn set_formats(payloads: &[(u32, &[u8])]) -> Result<()> {
         let clipboard = Clipboard::open()?;
         unsafe { EmptyClipboard() }.context("emptying the clipboard")?;
 
-        // The clipboard takes ownership of this block, so it is deliberately
-        // not freed here: freeing it would leave the clipboard pointing at
-        // memory that no longer exists.
-        let handle = unsafe { GlobalAlloc(GHND, payload.len()) }.context("allocating for the clipboard")?;
-        let pointer = unsafe { GlobalLock(handle) };
-        if pointer.is_null() {
-            bail!("locking the clipboard's memory");
-        }
-        unsafe {
-            std::ptr::copy_nonoverlapping(payload.as_ptr(), pointer.cast::<u8>(), payload.len());
-            let _ = GlobalUnlock(handle);
+        for (format, payload) in payloads {
+            // The clipboard takes ownership of this block, so it is
+            // deliberately not freed here: freeing it would leave the
+            // clipboard pointing at memory that no longer exists.
+            let handle = unsafe { GlobalAlloc(GHND, payload.len()) }.context("allocating for the clipboard")?;
+            let pointer = unsafe { GlobalLock(handle) };
+            if pointer.is_null() {
+                bail!("locking the clipboard's memory");
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(payload.as_ptr(), pointer.cast::<u8>(), payload.len());
+                let _ = GlobalUnlock(handle);
+            }
+
+            unsafe { SetClipboardData(*format, Some(HANDLE(handle.0))) }.context("writing to the clipboard")?;
         }
 
-        unsafe { SetClipboardData(CF_DIB.0.into(), Some(HANDLE(handle.0))) }.context("writing to the clipboard")?;
         // Ownership passed to the clipboard; dropping the guard closes it.
         drop(clipboard);
         Ok(())
@@ -304,7 +329,7 @@ mod windows_clipboard {
 }
 
 #[cfg(windows)]
-pub use windows_clipboard::{get_dib, set_dib};
+pub use windows_clipboard::{get_dib, set_dib, set_formats};
 
 /// The same surface where there is no Windows clipboard to talk to.
 ///
@@ -321,13 +346,17 @@ mod elsewhere {
         bail!("the clipboard is a Windows feature")
     }
 
+    pub fn set_formats(_payloads: &[(u32, &[u8])]) -> Result<()> {
+        bail!("the clipboard is a Windows feature")
+    }
+
     pub fn get_dib() -> Result<Option<Vec<u8>>> {
         Ok(None)
     }
 }
 
 #[cfg(not(windows))]
-pub use elsewhere::{get_dib, set_dib};
+pub use elsewhere::{get_dib, set_dib, set_formats};
 
 #[cfg(test)]
 mod tests {

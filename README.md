@@ -310,6 +310,25 @@ something a viewer should paper over by quietly rewriting the pixels on the way
 out. Transparency is composited onto white, because `CF_DIB` carries no
 dependable alpha and a cut-out is nearly always going onto a white page.
 
+**`Ctrl+Alt+C` copies it as something sendable.** Two things go on the
+clipboard at once, the way a drag offers two: a JPEG file, and the pixels. A
+chat window or a mail client takes the file; an editor that paints takes the
+pixels, exactly as it does today.
+
+The file is made to a **budget in kilobytes**, not to a quality number. Nobody
+knows what quality 74 weighs — it depends entirely on the picture — and
+everybody knows what an attachment limit is, so the viewer searches for the
+best-looking JPEG that fits and says which quality it settled on. The picture
+is shrunk to a maximum width first, and its colour is baked into sRGB, because
+what is travelling is a file going to a program that will very likely ignore a
+profile. Both numbers are in the settings, at 500 KB and 2048 pixels to start
+with. A budget nothing can meet is said so rather than quietly broken.
+
+This is the one place the viewer writes a file without being asked for a file,
+and it is asked for this one: the JPEG goes to a folder of its own inside the
+temporary directory, named after the picture so what lands in a chat carries a
+name that means something. Nothing appears in the folder you are looking at.
+
 A pasted picture is **shown, not saved**. It has no file behind it: the title
 says `clipboard`, the arrow keys have nowhere to go, and nothing is written to
 disk. A viewer that quietly saved a temporary file on every paste would be
@@ -696,6 +715,7 @@ Opening a file opens its folder: the arrow keys walk the images beside it.
 | `Ctrl+C` | copy the picture |
 | `Ctrl+V` | show the picture on the clipboard |
 | `Ctrl+Shift+C` | copy the path, quoted for a terminal |
+| `Ctrl+Alt+C` | copy it as a JPEG small enough to send |
 | `Del` | send this file to the recycle bin |
 | `F2` | rename this file |
 | `Ctrl+1`-`9` | move this file to the folder set for that key |
@@ -725,6 +745,7 @@ dragged while watching what it marks. Four sections:
 | View | when the toolbar and the status line are on screen: on hover, always, or never; when the minimap is — zoomed, always or never; and what shows behind transparency when a picture opens |
 | Opening | fit or 100% for a picture that arrives, whether the framing is held across a step, whether the folder wraps at its ends, and the order it is walked in — name, date or size |
 | Colour | where the clipping zebra draws its two lines, the units the eyedropper reads in, what a click copies, and whether the eyedropper magnifies the pixels around the pointer |
+| Sending | the size budget and the maximum width `Ctrl+Alt+C` copies a picture to |
 | Files | the nine folders `Ctrl+1`-`9` sort a picture into |
 
 Ctrl+wheel always performs whichever gesture the bare wheel does not, so both

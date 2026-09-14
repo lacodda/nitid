@@ -202,6 +202,117 @@ pub fn encode(request: &Request<'_>) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Shrink a picture so its longest side is at most `width`, by averaging.
+///
+/// Averaging rather than picking nearest pixels: a photograph reduced by
+/// dropping pixels aliases into a mess of stair-steps, and the whole reason to
+/// send a smaller copy is that it still looks like the picture.
+///
+/// A picture already inside the bound is returned untouched — resizing it up
+/// would be inventing detail nobody asked for.
+pub fn shrink(image: &DecodedImage, width: u32) -> DecodedImage {
+    let longest = image.width.max(image.height);
+    if width == 0 || longest <= width {
+        return image.clone();
+    }
+
+    let scale = width as f64 / longest as f64;
+    let out_width = ((image.width as f64 * scale).round() as u32).max(1);
+    let out_height = ((image.height as f64 * scale).round() as u32).max(1);
+
+    // Eight bits: the copy is going into a chat window, and the box's own
+    // warning already says a sixteen-bit source loses its extra precision on
+    // the way to a JPEG.
+    let source = narrow(image);
+    let mut out = Vec::with_capacity((out_width * out_height * 4) as usize);
+
+    for row in 0..out_height {
+        // The box of source pixels this one is the average of. Taken from the
+        // edges rather than from a centre and a radius, so every source pixel
+        // belongs to exactly one box and none is counted twice or skipped.
+        let top = (row as u64 * image.height as u64 / out_height as u64) as u32;
+        let bottom = (((row + 1) as u64 * image.height as u64).div_ceil(out_height as u64) as u32)
+            .min(image.height)
+            .max(top + 1);
+
+        for column in 0..out_width {
+            let left = (column as u64 * image.width as u64 / out_width as u64) as u32;
+            let right = (((column + 1) as u64 * image.width as u64).div_ceil(out_width as u64) as u32)
+                .min(image.width)
+                .max(left + 1);
+
+            let mut totals = [0u64; 4];
+            let mut counted = 0u64;
+            for y in top..bottom {
+                for x in left..right {
+                    let base = ((y as usize * image.width as usize) + x as usize) * 4;
+                    for (total, sample) in totals.iter_mut().zip(&source[base..base + 4]) {
+                        *total += *sample as u64;
+                    }
+                    counted += 1;
+                }
+            }
+
+            for total in totals {
+                out.push((total / counted.max(1)) as u8);
+            }
+        }
+    }
+
+    DecodedImage {
+        width: out_width,
+        height: out_height,
+        pixels: out,
+        depth: Depth::Eight,
+    }
+}
+
+/// Encode as a JPEG that fits inside `budget` bytes, if one can be made.
+///
+/// Quality is searched rather than guessed: what a given quality costs depends
+/// entirely on the picture — a photograph of foliage and a screenshot of text
+/// at quality 80 differ by an order of magnitude — so asking the encoder is the
+/// only way to know. A binary search over the quality range answers in seven
+/// encodes at most.
+///
+/// Returns the best fit found, and the quality it used. `None` when even the
+/// lowest quality is too large, which the caller answers by shrinking the
+/// picture instead of lying about the size.
+pub fn within_budget(request: &Request<'_>, budget: usize) -> Result<Option<(Vec<u8>, u8)>> {
+    let mut low = 1u8;
+    let mut high = 100u8;
+    let mut best: Option<(Vec<u8>, u8)> = None;
+
+    while low <= high {
+        let quality = low + (high - low) / 2;
+        let attempt = encode(&Request { quality, ..copy_of(request) })?;
+
+        if attempt.len() <= budget {
+            // It fits: keep it and ask whether a better-looking one also does.
+            best = Some((attempt, quality));
+            low = quality + 1;
+        } else {
+            if quality == 1 {
+                break;
+            }
+            high = quality - 1;
+        }
+    }
+
+    Ok(best)
+}
+
+/// A `Request` with the same borrows, so the budget search can vary one field.
+fn copy_of<'a>(request: &Request<'a>) -> Request<'a> {
+    Request {
+        image: request.image,
+        profile: request.profile,
+        target: request.target,
+        colour: request.colour,
+        quality: request.quality,
+    }
+}
+
 /// Eight-bit RGBA, with the colour taken wherever the request asks for it.
 fn to_eight_bit(request: &Request<'_>) -> Vec<u8> {
     match request.colour {
@@ -572,6 +683,116 @@ mod tests {
             "a PQ mid-tone came out at {} rather than 180: something is shaping the curve, not clipping it",
             middle[0]
         );
+    }
+
+    /// Shrinking holds the shape of the picture, and stops at the bound
+    /// rather than near it.
+    #[test]
+    fn shrinking_lands_on_the_bound_and_keeps_the_proportions() {
+        let image = picture(800, 400, [10, 20, 30, 255]);
+        let small = shrink(&image, 200);
+        assert_eq!((small.width, small.height), (200, 100));
+        assert_eq!(small.pixels.len(), 200 * 100 * 4);
+    }
+
+    /// A picture already small enough is left alone. Enlarging it would be
+    /// inventing detail nobody asked for.
+    #[test]
+    fn a_picture_inside_the_bound_is_not_touched() {
+        let image = picture(120, 80, [1, 2, 3, 255]);
+        let same = shrink(&image, 400);
+        assert_eq!((same.width, same.height), (120, 80));
+        assert_eq!(same.pixels, image.pixels);
+    }
+
+    /// The averaging is the point: half black and half white must come back
+    /// grey, not as whichever pixel a nearest-neighbour walk happened to land
+    /// on. That is the difference between a readable small copy and a mess of
+    /// stair-steps, and it is what a nearest-neighbour shrink would fail.
+    #[test]
+    fn shrinking_averages_rather_than_picking_one_pixel() {
+        let mut image = picture(4, 1, [0, 0, 0, 255]);
+        for (index, pixel) in image.pixels.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let shade = if index % 2 == 0 { 0 } else { 255 };
+            pixel[0] = shade;
+            pixel[1] = shade;
+            pixel[2] = shade;
+        }
+
+        let small = shrink(&image, 2);
+        assert_eq!((small.width, small.height), (2, 1));
+        for pixel in small.pixels.as_chunks::<4>().0 {
+            assert!(
+                (100..=155).contains(&pixel[0]),
+                "black beside white averaged to {} rather than to grey",
+                pixel[0]
+            );
+        }
+    }
+
+    /// The budget search returns the best-looking file that fits, and says
+    /// what quality it settled on.
+    #[test]
+    fn a_budget_is_met_with_the_best_quality_that_fits() {
+        // Noise, so quality actually costs bytes: a flat colour compresses to
+        // almost nothing at every setting and would make any budget look met.
+        let mut image = picture(160, 160, [0, 0, 0, 255]);
+        let mut seed = 12345u32;
+        for pixel in image.pixels.as_chunks_mut::<4>().0.iter_mut() {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            pixel[0] = (seed >> 16) as u8;
+            pixel[1] = (seed >> 8) as u8;
+            pixel[2] = seed as u8;
+        }
+
+        let request = Request {
+            image: &image,
+            profile: None,
+            target: Target::Jpeg,
+            colour: Colour::KeepProfile,
+            quality: 90,
+        };
+
+        let budget = 6000;
+        let (bytes, quality) = within_budget(&request, budget).expect("searching").expect("some quality fits");
+        assert!(bytes.len() <= budget, "the search returned {} bytes for a budget of {budget}", bytes.len());
+
+        // And it is the best that fits: one step up must not.
+        if quality < 100 {
+            let bigger = encode(&Request {
+                quality: quality + 1,
+                ..copy_of(&request)
+            })
+            .expect("encoding one step up");
+            assert!(
+                bigger.len() > budget,
+                "quality {} fits in {budget} too, so the search settled too low",
+                quality + 1
+            );
+        }
+    }
+
+    /// A budget nothing can meet is said so rather than answered with a file
+    /// that breaks it.
+    #[test]
+    fn a_budget_too_small_for_any_quality_is_refused() {
+        let mut image = picture(200, 200, [0, 0, 0, 255]);
+        let mut seed = 999u32;
+        for pixel in image.pixels.as_chunks_mut::<4>().0.iter_mut() {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            pixel[0] = (seed >> 16) as u8;
+            pixel[1] = (seed >> 8) as u8;
+            pixel[2] = seed as u8;
+        }
+
+        let request = Request {
+            image: &image,
+            profile: None,
+            target: Target::Jpeg,
+            colour: Colour::KeepProfile,
+            quality: 90,
+        };
+        assert_eq!(within_budget(&request, 200).expect("searching"), None, "a 200-byte budget was somehow met");
     }
 
     /// The colour path here and the one in the shader must not drift apart.
