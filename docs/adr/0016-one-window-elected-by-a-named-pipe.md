@@ -94,8 +94,33 @@ talks to the viewer the developer has open.
 The pipe name carries the user, because a pipe is machine-wide while a viewer is
 not: two people signed into one machine each get their own window.
 
-Not addressed: a hand-over does not carry the window to the foreground on
-Windows' terms. `focus_window` is asked for, and Windows may refuse a process
-that does not own the foreground — the file still arrives and the window still
-updates. Doing better means `AllowSetForegroundWindow` in the messenger, which
-is worth it only if the current behaviour proves annoying in daily use.
+## The foreground, granted by the messenger (v0.30.0)
+
+This was left open above as "worth it only if the current behaviour proves
+annoying in daily use", and daily use said it was: a viewer set as the default
+for a format is opened by double-clicking a file, and a window that updates
+behind the file manager looks like nothing happened.
+
+Windows refuses `SetForegroundWindow` to a process the user is not working in,
+which the window — already running, not clicked on — is not. The process that
+*does* hold the right is the launch the shell just started, so the messenger
+grants it away with `AllowSetForegroundWindow` before writing the message, and
+the window's own `raise` then works. The right is given, never taken.
+
+The owner's pid is read off the connected pipe with
+`GetNamedPipeServerProcessId` rather than carried in the message. The protocol
+stays a list of paths, so a build still hands its files to a window running an
+older one, and there is no pid in the message for anything to lie about.
+
+Failure is silent by design: the owner exiting mid-hand-over, a policy refusing
+the grant, or the right already being held all leave the hand-over itself
+perfectly good. The file arrives either way; it may just arrive behind another
+window.
+
+`AllowSetForegroundWindow` answers the same way whether or not it changed
+anything, so the pid it was given is the only part a test can hold to account —
+and it is the part that decides who may come forward. The gate runs two real
+processes, because inside one the pipe's client and server pids are the same
+number and a messenger asking the wrong end would look exactly like one asking
+the right end. `NITID_HANDOVER_REPORT=1` makes the messenger say which pid it
+named.

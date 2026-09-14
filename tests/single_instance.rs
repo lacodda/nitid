@@ -143,6 +143,52 @@ fn a_second_launch_hands_its_file_over_instead_of_opening_a_window() {
     );
 }
 
+/// A file handed over must be able to bring the window forward.
+///
+/// Windows refuses `SetForegroundWindow` to a process the user is not working
+/// in, so the window can only come forward if the messenger — which *does*
+/// hold the foreground, the shell having just started it — hands that right
+/// over first, naming the window's pid. The call itself answers the same way
+/// whether or not it granted anything, so the pid it named is what this holds
+/// to account.
+///
+/// Two processes are the point. Inside one, the pipe's client pid and server
+/// pid are the same number, and a messenger asking the wrong end would look
+/// exactly like one asking the right end.
+#[test]
+fn a_messenger_offers_the_foreground_to_the_window_it_hands_the_file_to() {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let first = directory.path().join("first.png");
+    let second = directory.path().join("second.png");
+    picture(&first, 30);
+    picture(&second, 180);
+
+    let id = instance_id("foreground");
+    let window = Reaped(open_window(&id, &first));
+    let window_pid = window.0.id();
+
+    let handover = Command::new(viewer())
+        .arg(&second)
+        .env("NITID_INSTANCE_ID", &id)
+        .env("NITID_HANDOVER_REPORT", "1")
+        .output()
+        .expect("running the second viewer");
+
+    assert!(handover.status.success(), "the second launch failed: {:?}", handover.status);
+
+    let said = String::from_utf8_lossy(&handover.stderr);
+    let offered = said
+        .lines()
+        .find_map(|line| line.strip_prefix("foreground offered to "))
+        .unwrap_or_else(|| panic!("the messenger said nothing about the foreground: {said:?}"));
+
+    assert_eq!(
+        offered.trim(),
+        window_pid.to_string(),
+        "the foreground was offered to {offered:?}, but the window is {window_pid}"
+    );
+}
+
 /// Multi-select: the shell starts one process per file, and they must
 /// converge on one window rather than opening five.
 #[test]

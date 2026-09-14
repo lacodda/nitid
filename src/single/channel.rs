@@ -18,7 +18,10 @@ use windows::Win32::Foundation::{
     GetLastError, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows::Win32::Storage::FileSystem::{CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_MODE, OPEN_EXISTING, PIPE_ACCESS_INBOUND, ReadFile, WriteFile};
-use windows::Win32::System::Pipes::{ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT};
+use windows::Win32::System::Pipes::{
+    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeServerProcessId, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
+};
+use windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
 use windows::core::HSTRING;
 
 /// How much of a message the pipe buffers, and the ceiling on one read.
@@ -254,6 +257,20 @@ fn deliver(name: &str, paths: &[PathBuf], patience: std::time::Duration) -> Resu
 
     let pipe = open_waiting(name, patience)?;
 
+    // Hand the foreground right over before saying anything.
+    //
+    // Windows refuses `SetForegroundWindow` to a process the user is not
+    // working in, which is exactly what the window is: the user double-clicked
+    // a file, so the shell gave the foreground to *this* process, the
+    // messenger. Without this call the window's own `raise()` is allowed to
+    // flash its taskbar button and nothing more — the picture would change
+    // behind whatever the user is looking at.
+    //
+    // The owner's pid is read off the connected pipe rather than carried in
+    // the message: the protocol stays a list of paths, and a build that talks
+    // to an older one still hands its files over.
+    report_foreground(allow_foreground(&pipe));
+
     let mut written = 0;
     while written < message.len() {
         let mut count = 0u32;
@@ -267,6 +284,47 @@ fn deliver(name: &str, paths: &[PathBuf], patience: std::time::Duration) -> Resu
     }
 
     Ok(())
+}
+
+/// Give the process on the other end of `pipe` the right to take the
+/// foreground.
+///
+/// Silent on failure, and deliberately: every reason this can fail — the owner
+/// exited between connecting and here, the permission was already granted, a
+/// policy forbids it — leaves the hand-over itself perfectly good. The file
+/// still arrives; it just may arrive behind another window.
+///
+/// Returns the pid the right was offered to. `AllowSetForegroundWindow`
+/// answers the same way whether or not it changed anything, so the pid is the
+/// only part of this a test can hold to account — and it is the part that
+/// decides who is allowed to come forward.
+fn allow_foreground(pipe: &Pipe) -> Option<u32> {
+    let mut owner = 0u32;
+    // SAFETY: the handle is live for the duration of the call and `owner`
+    // receives the pid.
+    if unsafe { GetNamedPipeServerProcessId(pipe.0, &mut owner) }.is_err() {
+        return None;
+    }
+    // SAFETY: no pointers; the call only names a process id.
+    let _ = unsafe { AllowSetForegroundWindow(owner) };
+    Some(owner)
+}
+
+/// Say which pid the foreground was offered to, when asked to.
+///
+/// `NITID_HANDOVER_REPORT=1` prints one line to stderr, the same shape
+/// `NITID_STARTUP_REPORT` uses. It exists because the pid is what decides who
+/// may come forward, and the two processes involved are the only place where
+/// asking the wrong end of the pipe looks different from asking the right one:
+/// inside one process a client pid and a server pid are the same number.
+fn report_foreground(owner: Option<u32>) {
+    if std::env::var_os("NITID_HANDOVER_REPORT").is_none() {
+        return;
+    }
+    match owner {
+        Some(pid) => eprintln!("foreground offered to {pid}"),
+        None => eprintln!("foreground offered to nobody"),
+    }
 }
 
 /// Connect, waiting out a listener that is busy with someone else.

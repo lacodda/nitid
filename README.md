@@ -115,6 +115,12 @@ the five arrive as one list in one window. Arrow keys then walk that selection
 rather than the whole folder — the five you picked, not the hundreds beside
 them. Five files opened this way took 239 milliseconds altogether.
 
+The window also comes forward when it takes a file. Windows only lets the
+process the user is working in raise a window, and after a double-click that
+process is the launch, not the viewer already running — so the launch hands
+that right over as it connects, naming the window it found. Without it a
+default viewer would change its picture behind whatever you were looking at.
+
 The window that owns the channel is simply the first one to create it, which is
 a single atomic call, so two launches racing cannot both decide they are the
 window. Nothing polls: a hand-over wakes the event loop the same way a finished
@@ -715,6 +721,7 @@ build's settings survive a run of an older one — see
 | `NITID_TILE_LIMIT=<pixels>` | lower the texture side an image is cut into tiles at, so the tiled path can be exercised on a small file; never raises it past what the device accepts |
 | `NITID_NO_SINGLE_INSTANCE=1` | open a window of this launch's own instead of handing the file to one already open; used by the startup gate, which measures a cold start |
 | `NITID_INSTANCE_ID=<text>` | share a window only with launches carrying the same value, so a test never talks to the viewer you have open |
+| `NITID_HANDOVER_REPORT=1` | print which process the foreground was offered to when a file is handed over; used by the one-window gate |
 
 ## Design notes
 
