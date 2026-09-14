@@ -552,7 +552,7 @@ has no size limit to hide behind.
 
 ## Status
 
-Early development — v0.29.0 is out. Startup, colour and format coverage hold:
+Early development — v0.30.0 is out. Startup, colour and format coverage hold:
 every modern still format opens, a phone's photographs included, every one of
 them reaches the screen without a wait, and the ones that animate play. The
 process that decodes the heavy formats runs with no network in either
@@ -572,7 +572,10 @@ histogram of the file's own values, and holding `Z` puts 100% under the cursor
 for as long as the key is down. **And the colour can be interrogated now**: `C`
 marks what the file clipped, `P` reads the pixel under the pointer in the
 file's terms and the display's — with its neighbours magnified beside it — and
-`K` spells out the path between the two.
+`K` spells out the path between the two. **And a picture can leave now**:
+`Ctrl+Shift+S` saves it as a JPEG, PNG or WebP in the colour you are looking
+at, and `Ctrl+Alt+C` copies it as a JPEG made to fit a size budget, for a chat
+or a mail that will not take the original.
 **And it talks to the clipboard**: the picture out with `Ctrl+C`, whatever is
 on the clipboard in with `Ctrl+V`, and the path — quoted for a terminal — with
 `Ctrl+Shift+C`. **And pictures come and go by hand now**: files dropped on the
@@ -630,7 +633,8 @@ one theme; the road to 1.0 is fixed:
 | ✅ v0.27.2 | A panel opens on the first click, without waiting for the pointer to move |
 | ✅ v0.28.0 | An external editor: `E` opens the picture in the program that edits it |
 | ✅ v0.29.0 | Lossless rotation: a turn saved to the file, and mirroring |
-| v0.30.0 – v0.37.0 | The everyday viewer: export, culling, comparison, slideshow |
+| ✅ v0.30.0 | Export: save as another format, and copy one small enough to send |
+| v0.31.0 – v0.37.0 | The everyday viewer: cropping, culling, comparison, slideshow |
 | v0.39.0 – v0.42.0 | Windows integration: context menu, installer, auto-update, thumbnails |
 | v0.43.0 – v0.44.0 | Documentation site, stabilisation |
 | v1.0.0 | Public release — the default viewer, nothing missing |

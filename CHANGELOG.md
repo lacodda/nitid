@@ -2,6 +2,18 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.30.0] - 2026-09-14
+
+### Breaking Changes
+- `Ctrl+Shift+S` no longer writes the turn into the file. It used to be a
+  silent synonym for `Ctrl+S` — both arrived at the same handler — and now
+  opens "Save as…" instead. `Ctrl+S` is unchanged and still keeps a turn.
+
+### Features
+- Let the window come forward when it takes a file
+- Save the picture as another format, with the colour you see
+- Copy the picture as a JPEG small enough to send
+- Say when a HEIC states colour the decoder cannot honour
 ## [0.29.0] - 2026-09-10
 
 ### Documentation
