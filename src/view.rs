@@ -530,6 +530,51 @@ mod tests {
         View::new(image, window, 1.0)
     }
 
+    /// The crop box is stored in image coordinates and drawn in screen ones,
+    /// so the two mappings have to be exact inverses. If they are not, the box
+    /// drifts away from the pointer that is dragging it — by a little at fit,
+    /// and by a lot zoomed in, which is the case a person would actually hit.
+    ///
+    /// Checked across zoom, pan and a scaled display together, because each of
+    /// the three enters the arithmetic at a different place.
+    #[test]
+    fn a_point_of_the_picture_survives_the_trip_to_the_screen_and_back() {
+        for scale_factor in [1.0, 1.5, 2.0] {
+            let mut view = View::new((1600, 1200), (900, 700), scale_factor);
+            for (zoom, pan) in [(0.0, (0.0, 0.0)), (5.0, (30.0, -40.0)), (-4.0, (-120.0, 90.0))] {
+                if zoom != 0.0 {
+                    view.zoom_at(zoom, (450.0, 350.0));
+                }
+                view.pan(pan);
+
+                for point in [(0.0, 0.0), (1.0, 1.0), (800.0, 600.0), (1599.0, 1199.0), (1600.0, 1200.0)] {
+                    let there_and_back = view.point_in_image(view.point_on_screen(point));
+                    assert!(
+                        about(there_and_back.0, point.0) && about(there_and_back.1, point.1),
+                        "at {scale_factor}x, zoom {zoom}, pan {pan:?}: {point:?} came back as {there_and_back:?}",
+                    );
+                }
+            }
+        }
+    }
+
+    /// Off the picture is the nearest edge, not a refusal and not a wild
+    /// number: a crop drag that runs past the edge means "to the edge".
+    #[test]
+    fn a_point_outside_the_picture_is_held_at_its_edge() {
+        let view = view((1600, 1200), (900, 700));
+        let far = view.point_in_image((-5000.0, -5000.0));
+        assert_eq!(far, (0.0, 0.0), "a point above and left of the picture was not held at its corner");
+
+        let beyond = view.point_in_image((99999.0, 99999.0));
+        assert_eq!(beyond, (1600.0, 1200.0), "a point past the far corner was not held there");
+
+        // The far edge is the picture's size, not its last pixel: a crop of
+        // the whole picture has its corner there, and clamping to 1599 could
+        // never express it.
+        assert!(beyond.0 > 1599.0, "the far edge was clamped to the last pixel rather than to the edge");
+    }
+
     #[test]
     fn fit_shrinks_a_large_image_to_the_window() {
         let view = view((2000, 1000), (1000, 1000));

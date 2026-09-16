@@ -2513,7 +2513,10 @@ fn drop_invitation(ui: &mut egui::Ui) {
 /// and an outline on a full-brightness picture keeps the discarded parts
 /// competing for the eye with the kept one.
 fn crop_overlay(ui: &mut egui::Ui, crop: &CropView) -> Option<CropAction> {
-    let screen = ui.max_rect();
+    // The whole window, asked of the context rather than of this `Ui`: panels
+    // laid out before this one have already taken their strips out of
+    // `max_rect`, and the shade has to cover the picture, which is all of it.
+    let screen = ui.ctx().viewport_rect();
     let rect = crop.rect;
 
     area("crop-shade").interactable(false).order(egui::Order::Background).show(ui.ctx(), |ui| {
@@ -3891,6 +3894,192 @@ mod tests {
             shapes > quiet,
             "the settings were opened but the last frame drew no more than the closed viewer ({shapes} shapes against {quiet}), so the panel never made it onto the screen",
         );
+    }
+
+    /// A status with the crop box up, framing `rect` of the window.
+    fn status_cropping(rect: egui::Rect, lossless: Option<Lossless>) -> Status {
+        Status {
+            crop: Some(CropView {
+                rect,
+                size: (800, 600),
+                ratio: crate::crop::Ratio::Free,
+                lossless,
+            }),
+            ..status()
+        }
+    }
+
+    /// Lay out one frame over a window of a known size, and hand back what was
+    /// drawn.
+    fn layout_over(interface: &mut Interface, config: &mut Config, status: &Status, window: egui::Vec2) -> Vec<egui::ClippedPrimitive> {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, window)),
+            events: Vec::new(),
+            ..Default::default()
+        };
+        // Two frames, for the reason written on `owed_frame` above: egui has no
+        // size for an `Area` it has just been told to show, so the frame that
+        // introduces it measures it and the next one places it. The
+        // application asks for that second frame; a test has to as well, or it
+        // measures the frame where the overlay has not been positioned yet and
+        // concludes it was never drawn.
+        let (mut first, _, _) = interface.layout(raw.clone(), status, config, Instant::now());
+        first.textures_delta.clear();
+        drop(interface.context().tessellate(first.shapes, 1.0));
+
+        let (mut output, _, _) = interface.layout(raw, status, config, Instant::now());
+        // egui hands back a texture delta that a real frame would upload, and
+        // panics on drop if nobody did. Nothing here draws to a device.
+        output.textures_delta.clear();
+        interface.context().tessellate(output.shapes, 1.0)
+    }
+
+    /// The crop overlay draws, and draws where the box is.
+    ///
+    /// The box is worked out by the application in image coordinates and
+    /// handed over already mapped to the screen, so what this can check is the
+    /// half that lives here: that the overlay is actually painted, and that
+    /// moving the box moves what is painted. A layout that drew nothing — an
+    /// `Area` behind the picture, a shade with no positive rectangle — would
+    /// look exactly like a working one from the application's side.
+    #[test]
+    fn the_crop_overlay_is_drawn_where_the_box_is() {
+        let mut interface = Interface::new();
+        let mut config = Config::default();
+        let window = egui::vec2(900.0, 600.0);
+
+        let quiet = layout_over(&mut interface, &mut config, &status(), window)
+            .iter()
+            .map(|primitive| match &primitive.primitive {
+                egui::epaint::Primitive::Mesh(mesh) => mesh.vertices.len(),
+                _ => 0,
+            })
+            .sum::<usize>();
+
+        let cropping = layout_over(
+            &mut interface,
+            &mut config,
+            &status_cropping(egui::Rect::from_min_max(egui::pos2(200.0, 150.0), egui::pos2(700.0, 450.0)), None),
+            window,
+        );
+        let drawn: usize = cropping
+            .iter()
+            .map(|primitive| match &primitive.primitive {
+                egui::epaint::Primitive::Mesh(mesh) => mesh.vertices.len(),
+                _ => 0,
+            })
+            .sum();
+        assert!(drawn > quiet, "the crop overlay drew nothing: {drawn} vertices against {quiet} without it");
+
+        // Where it drew. The shade is four bands around the box, so the
+        // painted area reaches the edges of the window; the box itself is
+        // outlined, so there are vertices along its sides.
+        let mut leftmost = f32::MAX;
+        let mut rightmost = f32::MIN;
+        for primitive in &cropping {
+            if let egui::epaint::Primitive::Mesh(mesh) = &primitive.primitive {
+                for vertex in &mesh.vertices {
+                    leftmost = leftmost.min(vertex.pos.x);
+                    rightmost = rightmost.max(vertex.pos.x);
+                }
+            }
+        }
+        assert!(leftmost <= 0.5, "the shade does not reach the left of the window: {leftmost}");
+        assert!(rightmost >= window.x - 0.5, "the shade does not reach the right of the window: {rightmost}");
+    }
+
+    /// The bar says what the crop will cost, and says a different thing for
+    /// each of the three cases.
+    ///
+    /// Read out of the shapes before they are tessellated, where the text is
+    /// still text. The first version of this counted vertices, and two of the
+    /// three cases happened to tessellate to exactly 984 — a measure that
+    /// cannot tell "different words" from "words of the same length", and that
+    /// would have passed a bar which said the same thing twice.
+    #[test]
+    fn the_crop_bar_says_which_crop_this_would_be() {
+        let rect = egui::Rect::from_min_max(egui::pos2(200.0, 150.0), egui::pos2(700.0, 450.0));
+
+        let exact = words_on_screen(&status_cropping(
+            rect,
+            Some(Lossless {
+                snapped: (0, 0, 800, 600),
+                exact: true,
+            }),
+        ));
+        let snapping = words_on_screen(&status_cropping(
+            rect,
+            Some(Lossless {
+                snapped: (16, 16, 768, 576),
+                exact: false,
+            }),
+        ));
+        let re_encoding = words_on_screen(&status_cropping(rect, None));
+
+        // Each case says something, and says its own thing.
+        for (name, said) in [("exact", &exact), ("snapping", &snapping), ("re-encoding", &re_encoding)] {
+            assert!(
+                said.contains("crop") || said.contains("copy") || said.contains("encod"),
+                "the {name} case says nothing about the crop: {said:?}"
+            );
+        }
+        assert_ne!(exact, snapping, "the bar cannot tell an exact crop from a snapped one");
+        assert_ne!(snapping, re_encoding, "the bar cannot tell a snapped crop from a re-encoded one");
+        assert_ne!(exact, re_encoding, "the bar cannot tell a lossless crop from a re-encoded one");
+
+        // The snapped case names the size the edges would move to, which is
+        // the whole reason that case exists rather than being folded into the
+        // other two.
+        assert!(
+            snapping.contains("768") && snapping.contains("576"),
+            "the bar does not say where the edges would move: {snapping:?}"
+        );
+    }
+
+    /// Every word the interface laid out this frame, in order.
+    ///
+    /// Taken from the shapes rather than from the tessellated mesh, where the
+    /// text has already become triangles. This is what lets a test assert what
+    /// the interface *says* rather than how much it drew.
+    fn words_on_screen(status: &Status) -> String {
+        let mut interface = Interface::new();
+        let mut config = Config::default();
+        let mut said = String::new();
+
+        // Two frames, as `layout_over` explains: the first measures the areas
+        // and the second places them.
+        for frame in 0..2 {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 600.0))),
+                events: Vec::new(),
+                ..Default::default()
+            };
+            let (mut output, _, _) = interface.layout(raw, status, &mut config, Instant::now());
+            output.textures_delta.clear();
+            if frame == 1 {
+                for shape in &output.shapes {
+                    collect_text(&shape.shape, &mut said);
+                }
+            }
+            drop(interface.context().tessellate(output.shapes, 1.0));
+        }
+        said
+    }
+
+    /// Walk a shape and append the text in it.
+    fn collect_text(shape: &egui::Shape, into: &mut String) {
+        match shape {
+            egui::Shape::Text(text) => {
+                into.push_str(text.galley.text());
+                into.push(' ');
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_text(shape, into);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Lay out one frame with no input, and say how much was drawn.
