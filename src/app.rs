@@ -3621,6 +3621,43 @@ impl ApplicationHandler<Event> for App {
 mod tests {
     use super::*;
 
+    /// A crop never lands on a file that is already there.
+    ///
+    /// This is the one thing in the crop that can destroy something: a name
+    /// that already exists, written over without asking. The save box answers
+    /// a collision by refusing, because a person typed that name; nobody typed
+    /// this one, so it steps aside instead — and the stepping aside is what
+    /// this holds down.
+    #[test]
+    fn a_crop_never_takes_a_name_that_is_already_used() {
+        let folder = std::env::temp_dir().join("nitid-free-name-tests");
+        let _ = std::fs::remove_dir_all(&folder);
+        std::fs::create_dir_all(&folder).expect("a sandbox to write into");
+
+        // Nothing there yet: the plain name.
+        let first = free_name(&folder, "photo", "jpg").expect("a free name");
+        assert_eq!(first.file_name().unwrap(), "photo-crop.jpg");
+
+        // Occupy it, and the next one, and the one after.
+        for name in ["photo-crop.jpg", "photo-crop-2.jpg", "photo-crop-3.jpg"] {
+            std::fs::write(folder.join(name), b"taken").expect("a file to write");
+        }
+
+        let next = free_name(&folder, "photo", "jpg").expect("a free name");
+        assert_eq!(next.file_name().unwrap(), "photo-crop-4.jpg", "the crop would have overwritten a file");
+        assert!(!next.exists(), "the name handed back is already in use");
+
+        // Every name it can hand back is one nothing is using — the property
+        // itself, rather than the particular numbering above.
+        for stem in ["photo", "other"] {
+            if let Some(candidate) = free_name(&folder, stem, "jpg") {
+                assert!(!candidate.exists(), "{} is already in use", candidate.display());
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
     /// A picture arriving with nothing before it is framed for itself.
     #[test]
     fn the_first_image_is_framed_for_itself() {
