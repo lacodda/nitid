@@ -2,18 +2,35 @@
 
 All notable changes to this project are documented in this file.
 
-## [0.30.0] - 2026-09-14
+## [0.31.0] - 2026-09-16
 
-### Breaking Changes
-- `Ctrl+Shift+S` no longer writes the turn into the file. It used to be a
-  silent synonym for `Ctrl+S` — both arrived at the same handler — and now
-  opens "Save as…" instead. `Ctrl+S` is unchanged and still keeps a turn.
+### Bug Fixes
+- Draw the shade over the whole window
+- Close the crop when the picture changes
+
+### Documentation
+- Say what a lossless crop keeps, and what it does not
+
+### Features
+- Crop a JPEG without running an encoder
+- Frame a crop with the mouse
+- Take the crop as a copy beside the original
+- Say when a crop drops the extra precision
+
+### Testing
+- Hold the crop to a real subsampled JPEG
+- Hold the crop to a name nothing is using
+- Earn the warning about the extra precision
+## [0.30.0] - 2026-09-14
 
 ### Features
 - Let the window come forward when it takes a file
 - Save the picture as another format, with the colour you see
 - Copy the picture as a JPEG small enough to send
 - Say when a HEIC states colour the decoder cannot honour
+
+### Testing
+- Hold the export to a picture with detail in it
 ## [0.29.0] - 2026-09-10
 
 ### Documentation

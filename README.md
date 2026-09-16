@@ -594,7 +594,7 @@ has no size limit to hide behind.
 
 ## Status
 
-Early development — v0.30.0 is out. Startup, colour and format coverage hold:
+Early development — v0.31.0 is out. Startup, colour and format coverage hold:
 every modern still format opens, a phone's photographs included, every one of
 them reaches the screen without a wait, and the ones that animate play. The
 process that decodes the heavy formats runs with no network in either
@@ -676,7 +676,8 @@ one theme; the road to 1.0 is fixed:
 | ✅ v0.28.0 | An external editor: `E` opens the picture in the program that edits it |
 | ✅ v0.29.0 | Lossless rotation: a turn saved to the file, and mirroring |
 | ✅ v0.30.0 | Export: save as another format, and copy one small enough to send |
-| v0.31.0 – v0.37.0 | The everyday viewer: cropping, culling, comparison, slideshow |
+| ✅ v0.31.0 | Cropping, without an encoder where the JPEG's own grid allows it |
+| v0.32.0 – v0.37.0 | The everyday viewer: metadata stripping, culling, comparison, slideshow |
 | v0.39.0 – v0.42.0 | Windows integration: context menu, installer, auto-update, thumbnails |
 | v0.43.0 – v0.44.0 | Documentation site, stabilisation |
 | v1.0.0 | Public release — the default viewer, nothing missing |
