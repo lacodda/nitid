@@ -282,6 +282,13 @@ struct App {
     /// Only ever set by `NITID_EXIT_AFTER_FIRST_FRAME=idle:<ms>`, which is
     /// how the gate measures what a still picture costs.
     idle_deadline: Option<Instant>,
+    /// The crop being framed, while the crop mode is up.
+    ///
+    /// `None` is the ordinary state: cropping is a mode a person enters, does
+    /// one thing in, and leaves. Held here rather than in the interface for
+    /// the reason the framing is — it is a statement about the picture, and
+    /// the interface draws it rather than owning it.
+    cropping: Option<crate::crop::Crop>,
     /// Whether a frame with a picture in it has reached the screen yet.
     ///
     /// The interface waits for that frame. Laying it out and building its
@@ -328,6 +335,7 @@ impl App {
             painted: None,
             toast_deadline: None,
             wants_frame: false,
+            cropping: None,
             zoom_locked: hold_zoom,
             pasted: None,
             picking: false,
@@ -806,6 +814,16 @@ impl App {
             // With the settings up, Esc puts them away rather than ending
             // the program: one key that both closes a dialog and quits is a
             // key nobody presses with confidence.
+            // A crop in progress owns Esc and Enter, for the reason the
+            // settings dialog owns Esc: while a mode is up, the key that
+            // leaves it must leave *it* rather than the program. A viewer
+            // that quit on Esc mid-crop would lose the framing and the window
+            // together.
+            Key::Named(NamedKey::Escape) if self.cropping.is_some() => {
+                self.cropping = None;
+                self.request_redraw();
+            }
+            Key::Named(NamedKey::Enter) if self.cropping.is_some() => self.take_crop(),
             Key::Named(NamedKey::Escape) => {
                 if self.interface.settings_shown() {
                     self.interface.close_settings();
@@ -891,6 +909,14 @@ impl App {
                 // The colour under the cursor. A mode, so it can be pointed
                 // about the picture and clicked with one hand.
                 "p" | "P" => self.toggle_picking(),
+                // Frame a crop. A mode for the reason the eyedropper is one:
+                // it is dragged about with the mouse, and a gesture needing a
+                // key held down as well is a two-handed job.
+                //
+                // `X` rather than `C`, which is the clipping zebra, and rather
+                // than `Ctrl+C`, which copies the picture: the letter the
+                // feature is named after is taken twice over already.
+                "x" | "X" => self.toggle_crop(),
                 // The settings. A dialog rather than a panel: it is a place
                 // you go to and come back from, not something to look at a
                 // picture alongside.
@@ -1220,6 +1246,282 @@ impl App {
         let path = folder.join(format!("{stem}.jpg"));
         std::fs::write(&path, bytes).with_context(|| format!("writing {}", path.display()))?;
         Ok(path)
+    }
+
+    /// Take hold of the crop box under the pointer, if a crop is up.
+    ///
+    /// Answers whether the press belongs to the crop, so the caller can leave
+    /// the pan and the drag-out alone rather than asking again about state it
+    /// does not own.
+    fn begin_crop_drag(&mut self) -> bool {
+        let cursor = (self.cursor.x as f32, self.cursor.y as f32);
+        let Some(shown) = self.shown.as_ref() else {
+            return false;
+        };
+        // How much of the picture one screen pixel covers, which is what makes
+        // the handles the same size under the pointer at any zoom.
+        let per_screen_pixel = 1.0 / shown.view.scale().max(f32::MIN_POSITIVE);
+        let point = shown.view.point_in_image(cursor);
+
+        let Some(crop) = self.cropping.as_mut() else {
+            return false;
+        };
+        match crop.handle_at(point, per_screen_pixel) {
+            Some(handle) => crop.begin(handle, point),
+            // Away from the box: a person who pressed well clear of their crop
+            // has changed their mind about where it goes, so a new one is
+            // drawn from here rather than the old one dragged over.
+            None => crop.begin_fresh(point),
+        }
+        true
+    }
+
+    /// Carry a crop drag to where the pointer is now.
+    ///
+    /// Answers whether anything moved, so the caller asks for a frame only
+    /// when there is a new one to draw.
+    fn carry_crop_drag(&mut self) -> bool {
+        let cursor = (self.cursor.x as f32, self.cursor.y as f32);
+        let Some(shown) = self.shown.as_ref() else {
+            return false;
+        };
+        let point = shown.view.point_in_image(cursor);
+
+        let Some(crop) = self.cropping.as_mut() else {
+            return false;
+        };
+        if !crop.dragging() {
+            return false;
+        }
+        crop.drag_to(point);
+        true
+    }
+
+    /// Open or close the crop mode.
+    ///
+    /// A mode rather than a held key, for the reason the eyedropper is one:
+    /// its whole business is to be dragged about with the mouse, and a
+    /// gesture that also needs a key held down is a two-handed job.
+    fn toggle_crop(&mut self) {
+        if self.cropping.is_some() {
+            self.cropping = None;
+            self.request_redraw();
+            return;
+        }
+
+        let Some(shown) = self.shown.as_ref() else {
+            return;
+        };
+        // The oriented size, which is the picture as the person sees it. The
+        // crop is framed in those coordinates.
+        self.cropping = Some(crate::crop::Crop::new(shown.size));
+        self.request_redraw();
+    }
+
+    /// What the crop overlay should draw, in the window's own points.
+    ///
+    /// The mapping from image pixels to the screen is the view's
+    /// (`point_on_screen`), so the interface never works out where the picture
+    /// is: one rule, in the module whose business it is.
+    fn crop_view(&self) -> Option<crate::interface::CropView> {
+        let crop = self.cropping.as_ref()?;
+        let shown = self.shown.as_ref()?;
+        let scale = self.scale_factor().max(0.01);
+
+        let area = crop.area();
+        let top_left = shown.view.point_on_screen((area.left, area.top));
+        let bottom_right = shown.view.point_on_screen((area.right, area.bottom));
+        // The view answers in physical pixels; egui lays out in logical
+        // points. A window on a 200% display would otherwise draw the box at
+        // twice the size of the picture it sits over.
+        let rect = egui::Rect::from_min_max(
+            egui::pos2(top_left.0 / scale, top_left.1 / scale),
+            egui::pos2(bottom_right.0 / scale, bottom_right.1 / scale),
+        );
+
+        let (_, _, width, height) = area.to_pixels(crop.image());
+        Some(crate::interface::CropView {
+            rect,
+            size: (width, height),
+            ratio: crop.ratio,
+            lossless: self.lossless_offer(),
+        })
+    }
+
+    /// What a lossless crop of the file on screen would do with the box.
+    ///
+    /// `None` when the file cannot be cropped without an encoder at all,
+    /// which the bar says out loud: a person who chose this viewer for its
+    /// honesty is owed the reason rather than a silently different result.
+    fn lossless_offer(&self) -> Option<crate::interface::Lossless> {
+        let crop = self.cropping.as_ref()?;
+        let shown = self.shown.as_ref()?;
+        if shown.pasted {
+            return None;
+        }
+        // A turned picture is framed in the coordinates it is seen in, and the
+        // file's grid is in the coordinates it is stored in. Rather than
+        // mapping one onto the other — a second place for the orientation rule
+        // to live, and so to drift — the lossless path is offered only where
+        // the two agree.
+        if shown.orientation != Orientation::Normal || shown.turn != Orientation::Normal {
+            return None;
+        }
+
+        let grid = self.grid_on_screen()?;
+        let (x, y, width, height) = crop.area().to_pixels(crop.image());
+        let wanted = crate::jpeg_lossless::Rect::new(x, y, width, height);
+        let snapped = crate::jpeg_lossless::snap(wanted, crop.image(), grid)?;
+
+        Some(crate::interface::Lossless {
+            snapped: (snapped.x, snapped.y, snapped.width, snapped.height),
+            exact: snapped == wanted,
+        })
+    }
+
+    /// The compression grid of the file on screen, if it has one.
+    fn grid_on_screen(&self) -> Option<crate::jpeg_lossless::Grid> {
+        let shown = self.shown.as_ref()?;
+        if shown.format != Some(crate::format::Format::Jpeg) {
+            return None;
+        }
+        let bytes = std::fs::read(&shown.path).ok()?;
+        crate::jpeg_lossless::grid_of(&bytes)
+    }
+
+    /// Do what the crop bar asked for.
+    fn act_on_crop(&mut self, action: crate::interface::CropAction) {
+        match action {
+            crate::interface::CropAction::Cancel => self.cropping = None,
+            crate::interface::CropAction::Reset => {
+                if let Some(crop) = self.cropping.as_mut() {
+                    crop.reset();
+                }
+            }
+            crate::interface::CropAction::Ratio(ratio) => {
+                if let Some(crop) = self.cropping.as_mut() {
+                    crop.set_ratio(ratio);
+                }
+            }
+            crate::interface::CropAction::Take => self.take_crop(),
+        }
+        self.request_redraw();
+    }
+
+    /// Write the framed crop out, as a copy beside the original.
+    ///
+    /// A copy, never in place. Cropping throws pixels away, and a viewer that
+    /// did that to the file itself could destroy a photograph with one
+    /// keystroke and no undo. The turn saved by `Ctrl+S` is the opposite case,
+    /// and is why the two are different keys: that one changes a label and can
+    /// be turned back.
+    fn take_crop(&mut self) {
+        let Some(crop) = self.cropping else {
+            return;
+        };
+        let Some(path) = self.file_on_screen() else {
+            return;
+        };
+
+        let (x, y, width, height) = crop.area().to_pixels(crop.image());
+        let lossless = self.lossless_offer();
+
+        // Beside the original, under a name of its own. The name is not asked
+        // for: the crop bar is already a modal gesture, and a second box on
+        // top of it to type into would turn one action into a form.
+        let Some(folder) = path.parent().map(Path::to_path_buf) else {
+            self.interface.toast("nowhere to save it", Instant::now());
+            self.request_redraw();
+            return;
+        };
+        let stem = path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "picture".to_string());
+
+        let outcome = match lossless {
+            // The file can carry the crop without an encoder, so it does.
+            Some(offer) => {
+                let extension = path
+                    .extension()
+                    .map(|extension| extension.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "jpg".to_string());
+                match free_name(&folder, &stem, &extension) {
+                    Some(destination) => self.crop_losslessly(&path, offer, &destination),
+                    None => Err(anyhow::anyhow!("there is nowhere to put the crop")),
+                }
+            }
+            None => match free_name(&folder, &stem, "png") {
+                Some(destination) => self.crop_by_re_encoding((x, y, width, height), &destination),
+                None => Err(anyhow::anyhow!("there is nowhere to put the crop")),
+            },
+        };
+
+        match outcome {
+            Ok(name) => {
+                self.cropping = None;
+                self.interface.toast(format!("cropped to {name}"), Instant::now());
+            }
+            Err(error) => self.report(error),
+        }
+        self.request_redraw();
+    }
+
+    /// Write the crop by moving the file's own coefficients.
+    fn crop_losslessly(&mut self, path: &Path, offer: crate::interface::Lossless, destination: &Path) -> anyhow::Result<String> {
+        let bytes = std::fs::read(path)?;
+        let (x, y, width, height) = offer.snapped;
+        let rect = crate::jpeg_lossless::Rect::new(x, y, width, height);
+
+        match crate::jpeg_lossless::crop(&bytes, rect)? {
+            Ok(cropped) => {
+                std::fs::write(destination, cropped)?;
+                Ok(name_of(destination))
+            }
+            // The offer was worked out from this same file a moment ago, so
+            // this is not the ordinary path. It is reported rather than
+            // quietly re-encoded: the person was told the crop would not be.
+            Err(refusal) => anyhow::bail!("this crop cannot be done without re-encoding: {}", refusal.reason()),
+        }
+    }
+
+    /// Write the crop by decoding, cutting and encoding again.
+    ///
+    /// The path for everything that is not a baseline JPEG on the grid. PNG is
+    /// the format, because it is lossless: a crop that has to be re-encoded
+    /// should at least not lose anything a second time.
+    fn crop_by_re_encoding(&mut self, rect: (u32, u32, u32, u32), destination: &Path) -> anyhow::Result<String> {
+        let Some(shown) = self.shown.as_ref() else {
+            anyhow::bail!("there is no picture to crop");
+        };
+        let pasted = shown.pasted;
+        let source = shown.path.clone();
+        let orientation = shown.orientation.then(shown.turn);
+
+        let image = if pasted {
+            self.pasted.clone()
+        } else {
+            match self.loader.request(&source) {
+                Request::Ready(image) => Some(image.image.clone()),
+                Request::Pending => None,
+            }
+        };
+        let Some(image) = image else {
+            anyhow::bail!("the picture is still opening");
+        };
+
+        let profile = self.profile_on_screen();
+        let cut = crate::export::cut(&image, orientation, rect)?;
+        let request = crate::export::Request {
+            image: &cut,
+            profile: profile.as_ref(),
+            target: crate::export::Target::Png,
+            colour: crate::export::Colour::KeepProfile,
+            quality: 100,
+            caveat: None,
+        };
+        crate::export::save(&request, destination)?;
+        Ok(name_of(destination))
     }
 
     /// Write the turn on screen into the file, and stop calling it a turn.
@@ -2155,6 +2457,7 @@ impl App {
             // What the window is showing, for the frame drawn on the map. A
             // picture with nothing open is wholly visible, which is what stops
             // the minimap from appearing over an empty window.
+            crop: self.crop_view(),
             visible: self.shown.as_ref().map_or((0.0, 0.0, 1.0, 1.0), |shown| shown.view.visible_fraction()),
         }
     }
@@ -2229,6 +2532,12 @@ impl App {
         // interface, both borrowed above.
         if let Some(saved) = self.interface.take_save() {
             self.save_as(saved);
+        }
+        // What the crop bar asked for, collected here for the same reason:
+        // taking a crop writes a file and touches the interface, both of
+        // which are borrowed above.
+        if let Some(action) = self.interface.take_crop() {
+            self.act_on_crop(action);
         }
         // What the choice in the box would cost, refreshed while it is up: the
         // format can be changed in it, and a warning about the format chosen a
@@ -2389,6 +2698,7 @@ fn handled(key: &Key) -> bool {
     match key {
         Key::Named(
             NamedKey::Escape
+            | NamedKey::Enter
             | NamedKey::Space
             | NamedKey::ArrowRight
             | NamedKey::PageDown
@@ -2401,7 +2711,9 @@ fn handled(key: &Key) -> bool {
         ) => true,
         Key::Character(character) => matches!(
             character.as_str(),
-            "e" | "E"
+            "x" | "X"
+                | "e"
+                | "E"
                 | "f"
                 | "F"
                 | "+"
@@ -2519,6 +2831,26 @@ fn chord_for(key: &Key) -> Option<Chord> {
         "s" => Some(Chord::SaveTurn),
         _ => None,
     }
+}
+
+/// A path beside `folder` that nothing is using yet, built from `stem`.
+///
+/// A crop is a new picture, not a replacement, so it must never land on a name
+/// that is already taken — the save box answers a collision by refusing,
+/// because the name came from a person who typed it, but nobody typed this one
+/// and refusing would only leave them to work out why.
+///
+/// So a number is added until one is free: `photo-crop.jpg`, then
+/// `photo-crop-2.jpg`. The search is bounded because an unbounded one on a
+/// folder that cannot be written to would spin rather than report.
+fn free_name(folder: &Path, stem: &str, extension: &str) -> Option<PathBuf> {
+    let first = folder.join(format!("{stem}-crop.{extension}"));
+    if !first.exists() {
+        return Some(first);
+    }
+    (2..1000)
+        .map(|number| folder.join(format!("{stem}-crop-{number}.{extension}")))
+        .find(|candidate| !candidate.exists())
 }
 
 /// A file's name on its own, for a message. Falls back to the whole path,
@@ -3163,7 +3495,12 @@ impl ApplicationHandler<Event> for App {
 
             WindowEvent::MouseInput { state, button, .. } => match (button, state) {
                 (MouseButton::Left, ElementState::Pressed) => {
-                    if self.picking {
+                    if self.begin_crop_drag() {
+                        // A crop in progress owns the left button, the way the
+                        // eyedropper does: the box is dragged with it, and
+                        // panning the picture out from under a half-drawn
+                        // frame would move the crop off what it was aimed at.
+                    } else if self.picking {
                         // The eyedropper owns the left button while it is up:
                         // a click is what takes the colour, and panning the
                         // picture out from under the pointer mid-read would
@@ -3180,6 +3517,12 @@ impl ApplicationHandler<Event> for App {
                     }
                 }
                 (MouseButton::Left, ElementState::Released) => {
+                    if let Some(crop) = self.cropping.as_mut()
+                        && crop.dragging()
+                    {
+                        crop.finish();
+                        self.request_redraw();
+                    }
                     self.dragging = false;
                     self.pressed_at = None;
                 }
@@ -3204,6 +3547,9 @@ impl ApplicationHandler<Event> for App {
                     self.take_reading();
                     self.request_redraw();
                 }
+                if self.carry_crop_drag() {
+                    self.request_redraw();
+                }
                 if self.dragging
                     && let Some(shown) = self.shown.as_mut()
                 {
@@ -3226,6 +3572,14 @@ impl ApplicationHandler<Event> for App {
             }
 
             WindowEvent::CursorLeft { .. } => {
+                // A drag whose pointer has gone is a drag that is over. Left
+                // holding, the box would jump to wherever the pointer came
+                // back in.
+                if let Some(crop) = self.cropping.as_mut()
+                    && crop.dragging()
+                {
+                    crop.finish();
+                }
                 self.dragging = false;
                 self.pressed_at = None;
                 // A pointer that has left the window is not reaching for

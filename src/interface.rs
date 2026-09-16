@@ -51,6 +51,9 @@ const TOOLBAR_REVEAL: f32 = 64.0;
 /// pointer moving onto a button must not be the thing that hides it.
 const TOOLBAR_HEIGHT: f32 = 40.0;
 
+/// How far above the bottom of the window the crop bar sits.
+const CROP_BAR_HEIGHT: f32 = 78.0;
+
 /// What the status line says about the picture on screen.
 ///
 /// Gathered by the application rather than read from the renderer: everything
@@ -116,6 +119,40 @@ pub struct Status {
     /// Which part of the picture the window is showing: `(left, top, width,
     /// height)` as fractions of the whole. The rectangle drawn on the map.
     pub visible: (f32, f32, f32, f32),
+    /// The crop being framed, while the crop mode is up.
+    pub crop: Option<CropView>,
+}
+
+/// What the crop overlay draws, worked out by the application.
+///
+/// The corners arrive already in screen coordinates: mapping image pixels to
+/// the window is the view's job (`view::point_on_screen`), and an interface
+/// that did its own mapping would be a second copy of the rule that decides
+/// where the picture is drawn.
+#[derive(Clone, Debug)]
+pub struct CropView {
+    /// The box on screen, in logical points.
+    pub rect: egui::Rect,
+    /// The size the crop would come out, in image pixels.
+    pub size: (u32, u32),
+    /// The ratio the box is held to.
+    pub ratio: crate::crop::Ratio,
+    /// What a lossless crop of this file would give, if one is possible at
+    /// all: the size it would snap to, and whether the box is already there.
+    ///
+    /// `None` when the file cannot be cropped losslessly — a PNG, or a
+    /// progressive JPEG — which the bar says rather than leaving the person to
+    /// wonder why the option never appears.
+    pub lossless: Option<Lossless>,
+}
+
+/// What the lossless path would do with the box as it stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Lossless {
+    /// The rectangle the crop would snap to, in image pixels.
+    pub snapped: (u32, u32, u32, u32),
+    /// Whether the box is already on the grid, so nothing would move.
+    pub exact: bool,
 }
 
 /// What a toolbar button asks the viewer to do.
@@ -143,6 +180,26 @@ pub enum Action {
     FullScreen,
     Keys,
     Settings,
+}
+
+/// What the crop bar asks for.
+///
+/// Its own type rather than more variants of [`Action`], and the reason is a
+/// rule the toolbar keeps: every `Action` is a key the viewer answers, and no
+/// two name the same one — two tests hold it. The crop bar is a mode with
+/// buttons that have no key of their own, so folding it into `Action` would
+/// mean excepting those tests, and an invariant with exceptions stops catching
+/// the thing it was written for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CropAction {
+    /// Take the crop that is framed.
+    Take,
+    /// Put the box back over the whole picture.
+    Reset,
+    /// Leave the crop without taking it.
+    Cancel,
+    /// Hold the box to these proportions.
+    Ratio(crate::crop::Ratio),
 }
 
 /// A short-lived message: "path copied", "moved to the recycle bin".
@@ -190,6 +247,11 @@ pub struct Interface {
     /// Cleared by [`take_save`](Self::take_save), for the reason the rename is:
     /// laying out again before it is collected would write the file twice.
     saved: Option<Saved>,
+    /// What the crop bar asked for this frame, waiting to be collected.
+    ///
+    /// Held for the same reason the other two are: laying out again before it
+    /// is collected would take the crop twice.
+    cropped: Option<CropAction>,
     /// The name being typed, while the rename box is up.
     ///
     /// `None` means the box is not showing. The name lives here rather than in
@@ -317,6 +379,7 @@ impl Interface {
             histogram_shown: false,
             renamed: None,
             saved: None,
+            cropped: None,
             renaming: None,
             rename_focused: false,
             saving: None,
@@ -423,6 +486,11 @@ impl Interface {
     /// Take the save the box committed, if it did this frame.
     pub fn take_save(&mut self) -> Option<Saved> {
         self.saved.take()
+    }
+
+    /// Take what the crop bar asked for, if it asked this frame.
+    pub fn take_crop(&mut self) -> Option<CropAction> {
+        self.cropped.take()
     }
 
     /// Put the rename box away without renaming anything.
@@ -569,6 +637,7 @@ impl Interface {
         let mut renaming = self.renaming.take();
         let mut rename_focused = self.rename_focused;
         let mut rename_outcome = None;
+        let mut crop_action = None;
         let mut saving = self.saving.take();
         let mut save_focused = self.save_focused;
         let mut save_outcome = None;
@@ -609,6 +678,9 @@ impl Interface {
             if status.picking {
                 eyedropper_panel(ui, status, units, magnifier);
             }
+            if let Some(crop) = &status.crop {
+                crop_action = crop_overlay(ui, crop);
+            }
             if let Some(passport) = &status.passport {
                 passport_panel(ui, passport);
             }
@@ -630,6 +702,14 @@ impl Interface {
             toast_stack(ui, &toasts);
         });
         self.minimap_texture = minimap_texture;
+        self.cropped = crop_action;
+        // A press on the bar happened inside this layout, so the frame that
+        // carried it was drawn before the box moved. The frame that agrees
+        // with itself has to be asked for — the same rule the settings
+        // dialog's sections follow.
+        if crop_action.is_some() {
+            self.owed_frame = true;
+        }
         self.rename_focused = rename_focused;
         self.save_focused = save_focused;
         // A box that was committed or cancelled does not come back next frame.
@@ -739,6 +819,21 @@ impl Interface {
             + &format!("|{:?}", self.chrome.minimap)
             // The box itself, and every keystroke in it.
             + &format!("|{:?}", self.renaming)
+            // The crop box, rounded to a tenth of a point. This is what makes
+            // a crop drag ask for frames: nothing else in the digest moves
+            // while the box is dragged, so without it the box would be drawn
+            // where the drag started and stay there.
+            + &format!(
+                "|{:?}",
+                status.crop.as_ref().map(|crop| (
+                    (crop.rect.left() * 10.0) as i32,
+                    (crop.rect.top() * 10.0) as i32,
+                    (crop.rect.right() * 10.0) as i32,
+                    (crop.rect.bottom() * 10.0) as i32,
+                    crop.ratio,
+                    crop.lossless,
+                ))
+            )
     }
 
     /// Whether the interface would draw something different from last time.
@@ -2336,6 +2431,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("C", "mark what the file clipped"),
     ("P", "read the colour under the pointer; click to copy"),
     ("K", "what is happening to this image's colour"),
+    ("X", "frame a crop; Enter saves it as a copy, Esc leaves it"),
     ("Ctrl+Drag", "drag the picture into another window"),
     ("Ctrl+C", "copy the picture"),
     ("Ctrl+V", "show the picture on the clipboard"),
@@ -2409,6 +2505,124 @@ fn drop_invitation(ui: &mut egui::Ui) {
 /// part-transparent until the pointer moved. The owner found it on the settings
 /// window in v0.24.0; the test on the eyedropper's cells found it again here,
 /// on every `Area`, where the fix for the windows had not reached.
+/// The crop box, the dimmed surround, and the bar that names what would be
+/// taken.
+///
+/// Everything outside the box is dimmed rather than the box being outlined
+/// alone: the question a person is answering is "what will I be left with",
+/// and an outline on a full-brightness picture keeps the discarded parts
+/// competing for the eye with the kept one.
+fn crop_overlay(ui: &mut egui::Ui, crop: &CropView) -> Option<CropAction> {
+    let screen = ui.max_rect();
+    let rect = crop.rect;
+
+    area("crop-shade").interactable(false).order(egui::Order::Background).show(ui.ctx(), |ui| {
+        let painter = ui.painter();
+        let shade = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 132);
+        // Four bands around the box rather than one rectangle with a hole:
+        // egui paints convex shapes, and a hole is not one.
+        for band in [
+            egui::Rect::from_min_max(screen.left_top(), egui::pos2(screen.right(), rect.top())),
+            egui::Rect::from_min_max(egui::pos2(screen.left(), rect.bottom()), screen.right_bottom()),
+            egui::Rect::from_min_max(egui::pos2(screen.left(), rect.top()), egui::pos2(rect.left(), rect.bottom())),
+            egui::Rect::from_min_max(egui::pos2(rect.right(), rect.top()), egui::pos2(screen.right(), rect.bottom())),
+        ] {
+            if band.is_positive() {
+                painter.rect_filled(band, 0.0, shade);
+            }
+        }
+
+        // The thirds, which is what a person composing to them is looking for.
+        // Thin and half-transparent: guides, not furniture.
+        let guide = egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 90));
+        for step in 1..3 {
+            let fraction = step as f32 / 3.0;
+            let x = rect.left() + rect.width() * fraction;
+            let y = rect.top() + rect.height() * fraction;
+            painter.line_segment([egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())], guide);
+            painter.line_segment([egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)], guide);
+        }
+
+        painter.rect_stroke(
+            rect,
+            0.0,
+            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 220)),
+            egui::StrokeKind::Inside,
+        );
+
+        // The corners, drawn as brackets inside the box: a person has to see
+        // where to take hold, and a bracket says "corner" where a dot on the
+        // line would read as part of the frame.
+        let arm = (rect.width().min(rect.height()) / 5.0).clamp(6.0, 28.0);
+        let bracket = egui::Stroke::new(3.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 235));
+        for (corner, along_x, along_y) in [
+            (rect.left_top(), 1.0, 1.0),
+            (rect.right_top(), -1.0, 1.0),
+            (rect.left_bottom(), 1.0, -1.0),
+            (rect.right_bottom(), -1.0, -1.0),
+        ] {
+            painter.line_segment([corner, egui::pos2(corner.x + arm * along_x, corner.y)], bracket);
+            painter.line_segment([corner, egui::pos2(corner.x, corner.y + arm * along_y)], bracket);
+        }
+    });
+
+    let mut action = None;
+    area("crop-bar")
+        .fixed_pos(egui::pos2(screen.left() + 12.0, screen.bottom() - CROP_BAR_HEIGHT))
+        .show(ui.ctx(), |ui| {
+            egui::Frame::new()
+                .fill(egui::Color32::from_rgba_unmultiplied(14, 16, 20, 238))
+                .inner_margin(egui::Margin::symmetric(12, 8))
+                .corner_radius(6)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(format!("{} × {}", crop.size.0, crop.size.1)).strong().monospace());
+                        separator(ui);
+
+                        for ratio in crate::crop::Ratio::ALL {
+                            let chosen = *ratio == crop.ratio;
+                            if ui.selectable_label(chosen, ratio.label()).clicked() {
+                                action = Some(CropAction::Ratio(*ratio));
+                            }
+                        }
+
+                        separator(ui);
+                        if ui.button("Reset").clicked() {
+                            action = Some(CropAction::Reset);
+                        }
+                        if ui.button("Crop").clicked() {
+                            action = Some(CropAction::Take);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            action = Some(CropAction::Cancel);
+                        }
+                    });
+
+                    // What the crop will cost, said before it is taken rather
+                    // than reported after — the same rule the save box keeps.
+                    match &crop.lossless {
+                        Some(lossless) if lossless.exact => {
+                            ui.label(egui::RichText::new("Enter: saved as a copy, without re-encoding").weak());
+                        }
+                        Some(lossless) => {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "to avoid re-encoding, the edges move to {} × {}",
+                                    lossless.snapped.2, lossless.snapped.3
+                                ))
+                                .weak(),
+                            );
+                        }
+                        None => {
+                            ui.label(egui::RichText::new("saved as a copy; this file has to be re-encoded").weak());
+                        }
+                    }
+                });
+        });
+
+    action
+}
+
 fn area(name: &'static str) -> egui::Area {
     egui::Area::new(name.into()).fade_in(false)
 }
@@ -2519,6 +2733,7 @@ mod tests {
             scale: 0.5,
             fit: FitMode::Fit,
             frame: None,
+            crop: None,
             hdr: false,
             locked: false,
             backdrop: None,

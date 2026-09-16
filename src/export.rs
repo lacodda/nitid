@@ -216,6 +216,58 @@ pub fn encode(request: &Request<'_>) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Take a rectangle out of a picture, in the coordinates it is *shown* in.
+///
+/// Shown, not stored, and that is the whole reason this is not four lines of
+/// slicing: a photograph from a phone held sideways carries an orientation, so
+/// the rectangle a person dragged over their screen is not the rectangle of
+/// the same numbers in the file. The mapping is `eyedropper::sample`, which is
+/// the one place the viewer turns a shown pixel into a stored one — a second
+/// copy of that table here is exactly the drift ADR 0018 warns about.
+///
+/// The result is upright: the orientation has been applied by the reading, so
+/// the file that is written needs no tag to look right.
+pub fn cut(image: &DecodedImage, orientation: crate::image_source::Orientation, rect: (u32, u32, u32, u32)) -> Result<DecodedImage> {
+    let (x, y, width, height) = rect;
+    if width == 0 || height == 0 {
+        bail!("there is nothing to crop to");
+    }
+
+    let shown = crate::eyedropper::shown_size(image, orientation);
+    if x.saturating_add(width) > shown.0 || y.saturating_add(height) > shown.1 {
+        bail!("the crop reaches outside the picture");
+    }
+
+    // Eight bits out, whatever came in. The re-encoding path writes PNG, and a
+    // sixteen-bit source narrowed here loses precision the warning in the save
+    // box already names for every other export.
+    let mut pixels = Vec::with_capacity((width as usize) * (height as usize) * 4);
+    for row in 0..height {
+        for column in 0..width {
+            match crate::eyedropper::sample(image, orientation, shown, (x + column, y + row)) {
+                Some((raw, alpha)) => {
+                    let narrow = |channel: u16| match image.depth {
+                        Depth::Eight => channel as u8,
+                        Depth::Sixteen => (channel >> 8) as u8,
+                    };
+                    pixels.extend_from_slice(&[narrow(raw[0]), narrow(raw[1]), narrow(raw[2]), alpha]);
+                }
+                // Inside the bounds checked above, so this cannot happen; a
+                // transparent pixel rather than a panic if it ever does, since
+                // the length of the buffer is what says how big the crop is.
+                None => pixels.extend_from_slice(&[0, 0, 0, 0]),
+            }
+        }
+    }
+
+    Ok(DecodedImage {
+        width,
+        height,
+        pixels,
+        depth: Depth::Eight,
+    })
+}
+
 /// Shrink a picture so its longest side is at most `width`, by averaging.
 ///
 /// Averaging rather than picking nearest pixels: a photograph reduced by
