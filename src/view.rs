@@ -378,6 +378,48 @@ impl View {
         Some((point.0 as u32, point.1 as u32))
     }
 
+    /// Where a screen position falls in the picture, held inside it.
+    ///
+    /// Unlike [`pixel_under`](Self::pixel_under), a position outside the image
+    /// is not `None` but the nearest edge. The two answer different questions
+    /// and both are wanted: the eyedropper must refuse to name a colour for
+    /// the scene beside a fitted photograph, while a crop drag that runs past
+    /// the edge means "to the edge" and would be maddening if it stopped
+    /// responding there.
+    ///
+    /// The result may equal the image's width or height — it is a position
+    /// *between* pixels, which is what an edge of a rectangle is. A crop of
+    /// the whole picture has its far corner at `(width, height)`, and a
+    /// mapping that clamped to the last pixel could never express it.
+    pub fn point_in_image(&self, cursor: (f32, f32)) -> (f32, f32) {
+        let (width, height) = self.scaled_size();
+        if width <= 0.0 || height <= 0.0 || self.scale <= 0.0 {
+            return (0.0, 0.0);
+        }
+        let top_left = (
+            self.window.0 / 2.0 + self.offset.0 - width / 2.0,
+            self.window.1 / 2.0 + self.offset.1 - height / 2.0,
+        );
+        (
+            ((cursor.0 - top_left.0) / self.scale).clamp(0.0, self.image.0),
+            ((cursor.1 - top_left.1) / self.scale).clamp(0.0, self.image.1),
+        )
+    }
+
+    /// Where a point of the picture is drawn on screen.
+    ///
+    /// The inverse of [`point_in_image`](Self::point_in_image), so the crop
+    /// box can be kept in image coordinates — where the file is cropped — and
+    /// still be drawn in the right place after a zoom or a pan.
+    pub fn point_on_screen(&self, point: (f32, f32)) -> (f32, f32) {
+        let (width, height) = self.scaled_size();
+        let top_left = (
+            self.window.0 / 2.0 + self.offset.0 - width / 2.0,
+            self.window.1 / 2.0 + self.offset.1 - height / 2.0,
+        );
+        (top_left.0 + point.0 * self.scale, top_left.1 + point.1 * self.scale)
+    }
+
     /// Whether the loupe is up.
     pub fn loupe_held(&self) -> bool {
         self.held.is_some()
