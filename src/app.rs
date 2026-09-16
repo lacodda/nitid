@@ -1345,6 +1345,10 @@ impl App {
             size: (width, height),
             ratio: crop.ratio,
             lossless: self.lossless_offer(),
+            // Asked of the picture on screen rather than of the path: a
+            // sixteen-bit source narrows whenever it is re-encoded, and the
+            // bar says so beside whichever message it is showing.
+            narrows: shown.depth == crate::image_source::Depth::Sixteen,
         })
     }
 

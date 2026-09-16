@@ -472,7 +472,8 @@ the grid, or says the file has to be re-encoded and lets you decide. It never
 quietly does one when it said the other. A progressive JPEG, a PNG, a HEIC —
 anything that cannot take the coefficient path — is decoded, cut and written as
 a **PNG**, which is lossless, so a crop that must be re-encoded at least does
-not lose anything twice.
+not lose anything twice. A sixteen-bit source goes out at eight bits per
+channel on that path, and the bar says so before it happens.
 
 Turning and saving are separate on purpose: looking at a photograph from
 another angle leaves nothing on disk until you say so. The one thing to know is

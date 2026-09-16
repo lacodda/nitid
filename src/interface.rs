@@ -144,6 +144,13 @@ pub struct CropView {
     /// progressive JPEG — which the bar says rather than leaving the person to
     /// wonder why the option never appears.
     pub lossless: Option<Lossless>,
+    /// Whether the crop would drop the source's extra precision.
+    ///
+    /// A sixteen-bit picture — a HEIC, in practice — goes through the
+    /// re-encoding path as eight bits per channel. The save box already names
+    /// that loss on its own path; the crop has to name it on this one, or the
+    /// promise that a viewer says what a save costs holds everywhere but here.
+    pub narrows: bool,
 }
 
 /// What the lossless path would do with the box as it stands.
@@ -832,6 +839,7 @@ impl Interface {
                     (crop.rect.bottom() * 10.0) as i32,
                     crop.ratio,
                     crop.lossless,
+                    crop.narrows,
                 ))
             )
     }
@@ -2620,6 +2628,14 @@ fn crop_overlay(ui: &mut egui::Ui, crop: &CropView) -> Option<CropAction> {
                             ui.label(egui::RichText::new("saved as a copy; this file has to be re-encoded").weak());
                         }
                     }
+
+                    // Said whichever path the crop takes: the coefficient path
+                    // never narrows, so this only ever appears beside the
+                    // re-encoding message, but the condition belongs to the
+                    // picture rather than to the path.
+                    if crop.narrows {
+                        ui.label(egui::RichText::new("16 bits per channel become 8").weak());
+                    }
                 });
         });
 
@@ -3904,6 +3920,7 @@ mod tests {
                 size: (800, 600),
                 ratio: crate::crop::Ratio::Free,
                 lossless,
+                narrows: false,
             }),
             ..status()
         }
@@ -4033,6 +4050,31 @@ mod tests {
         assert!(
             snapping.contains("768") && snapping.contains("576"),
             "the bar does not say where the edges would move: {snapping:?}"
+        );
+    }
+
+    /// A sixteen-bit source is told it will lose its extra precision.
+    ///
+    /// The save box names this loss on its own path, and a crop that stayed
+    /// quiet about it would leave the "say what it costs" promise holding
+    /// everywhere but here.
+    #[test]
+    fn the_crop_bar_says_when_the_extra_precision_goes() {
+        let rect = egui::Rect::from_min_max(egui::pos2(200.0, 150.0), egui::pos2(700.0, 450.0));
+
+        let eight = words_on_screen(&status_cropping(rect, None));
+        let sixteen = words_on_screen(&Status {
+            crop: Some(CropView {
+                narrows: true,
+                ..status_cropping(rect, None).crop.expect("a crop")
+            }),
+            ..status_cropping(rect, None)
+        });
+
+        assert!(!eight.contains("16 bits"), "an eight-bit picture was warned about precision it does not have");
+        assert!(
+            sixteen.contains("16 bits"),
+            "a sixteen-bit picture was not told it loses its extra precision: {sixteen:?}"
         );
     }
 
