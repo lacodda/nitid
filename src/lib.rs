@@ -17,6 +17,7 @@ mod clipboard;
 mod color;
 mod config;
 mod console;
+mod crop;
 mod drag;
 mod editor;
 mod export;
@@ -33,6 +34,7 @@ mod image_source;
 mod install;
 mod interface;
 mod isobmff;
+mod jpeg_lossless;
 mod loader;
 mod metadata;
 mod minimap;
@@ -83,6 +85,17 @@ pub mod testing {
             caveat: loaded.caveat.as_deref(),
         })
     }
+
+    /// The lossless crop, for a gate that runs it over real files.
+    ///
+    /// Exposed rather than re-implemented in the test for the reason the
+    /// export is: a gate that rebuilt the path would be checking its own
+    /// rebuild.
+    pub use crate::jpeg_lossless::{Grid, Rect, Refusal, crop as crop_losslessly, grid_of, snap};
+
+    /// Cut a rectangle out of a decoded picture, the way the re-encoding
+    /// fallback does.
+    pub use crate::export::cut;
 
     /// Every key the key sheet advertises, for the test that holds the README
     /// to it. The two lists are written for different readers and drifted
