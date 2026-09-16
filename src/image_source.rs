@@ -1868,6 +1868,24 @@ mod tests {
         assert!(small_steps > 0, "every step is 8-bit sized, so the depth was narrowed somewhere: {row:?}");
     }
 
+    /// Cropping a sixteen-bit picture narrows it, which is exactly what the
+    /// crop bar promises before it happens.
+    ///
+    /// Here rather than in `export`, because this is the only place in the
+    /// crate with a real sixteen-bit picture to cut. A warning the code does
+    /// not actually earn would be worse than none: it would teach a person to
+    /// ignore the bar.
+    #[test]
+    fn cropping_a_sixteen_bit_picture_narrows_it_as_the_bar_says() {
+        let loaded = decode_here(&from_base64(HEIC_RAMP_10BIT)).unwrap();
+        assert_eq!(loaded.image.depth, Depth::Sixteen, "the fixture is meant to be sixteen bits");
+
+        let cut = crate::export::cut(&loaded.image, Orientation::Normal, (8, 8, 32, 32)).expect("the cut ran");
+        assert_eq!((cut.width, cut.height), (32, 32));
+        assert_eq!(cut.depth, Depth::Eight, "the crop kept sixteen bits, so the bar's warning is a lie");
+        assert_eq!(cut.pixels.len(), 32 * 32 * 4, "an eight-bit picture is four bytes a pixel");
+    }
+
     #[test]
     fn a_twelve_bit_heic_keeps_more_than_eight_bits() {
         let loaded = decode_here(&from_base64(HEIC_RAMP_12BIT)).unwrap();
