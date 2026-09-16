@@ -433,6 +433,47 @@ loss and it is stated plainly — those highlights are not coming back — but i
 is exactly what you were seeing, rather than a second rendering that would make
 the file disagree with its own preview.
 
+**`X` frames a crop.** The box opens over the whole picture; drag a corner or
+an edge to bring it in, drag inside it to slide it about, or press somewhere
+clear of it to draw a new one. The buttons along the bottom hold it to a shape
+— 1:1, 3:2, 4:3, 16:9 and their upright forms, or the picture's own — and the
+box reshapes as soon as you pick one rather than waiting for the next drag.
+`Enter` takes the crop, `Esc` leaves without taking it. The handles stay the
+same size under the pointer whatever the zoom, and the box is remembered in the
+picture's coordinates, so zooming or panning mid-crop moves the view and not
+the framing.
+
+**A crop is always a copy.** It lands beside the original as `photo-crop.jpg`,
+and a second one as `photo-crop-2.jpg`; the file you were looking at is never
+written to. That is the difference between this and `Ctrl+S`: a turn is a label
+and can be turned back, while a crop throws pixels away, and a viewer that did
+that in place could destroy a photograph with one keystroke and no undo.
+
+**A JPEG is cropped without being re-encoded, where it can be.** JPEG stores a
+picture as blocks, and a crop whose edges land on those blocks can be made by
+moving the compressed data itself — no decoding, no quantising, no encoder in
+the path at all. The surviving coefficients are the numbers the original file
+held and its quantisation tables travel with them, so the kept part of the
+picture is bit-for-bit what it was. Crop a photograph fifty times this way and
+the fiftieth is as clean as the first.
+
+One honest detail, since the point of the feature is honesty: on a subsampled
+JPEG — which most photographs are — a border one pixel wide along the cut can
+shift very slightly. The colour channels are stored at half resolution and the
+decoder interpolates them, so a pixel on the new edge no longer has the
+neighbour it was interpolated against. Nothing is re-quantised and the interior
+is identical to the byte; it is the boundary that had to be invented, and it is
+invented once rather than accumulating with every crop.
+
+The blocks are usually 16×16 pixels, so an arbitrary crop is up to fifteen
+pixels from one that can be done this way. The bar says which you are about to
+get: it names the size the edges would move to, or says the crop is already on
+the grid, or says the file has to be re-encoded and lets you decide. It never
+quietly does one when it said the other. A progressive JPEG, a PNG, a HEIC —
+anything that cannot take the coefficient path — is decoded, cut and written as
+a **PNG**, which is lossless, so a crop that must be re-encoded at least does
+not lose anything twice.
+
 Turning and saving are separate on purpose: looking at a photograph from
 another angle leaves nothing on disk until you say so. The one thing to know is
 that a program which ignores EXIF orientation — a few old tools do — will still
@@ -720,6 +761,7 @@ Opening a file opens its folder: the arrow keys walk the images beside it.
 | `C` | mark what the file clipped |
 | `P` | read the colour under the pointer, with the pixels around it magnified; click to copy |
 | `K` | what is happening to this image's colour |
+| `X` | frame a crop; Enter saves it as a copy, Esc leaves it |
 | `Ctrl+Drag` | drag the picture into another window |
 | `Ctrl+C` | copy the picture |
 | `Ctrl+V` | show the picture on the clipboard |
