@@ -364,6 +364,20 @@ impl App {
         // on whatever arrived instead.
         self.interface.cancel_rename();
 
+        // The crop box goes with it, and for a stronger reason: the box is
+        // held in the *picture's* pixels, so one framed on a 6000-pixel
+        // photograph would land somewhere meaningless on the 800-pixel
+        // screenshot beside it — and `Enter` would then crop that.
+        //
+        // Closed rather than carried across: a crop is an intention about one
+        // image, and moving it to the next is not a convenience, it is a
+        // different request nobody made.
+        //
+        // Here rather than in `upload`, which runs twice for one picture — the
+        // thumbnail first, the full decode after — and would take the box away
+        // under a person who framed it while the file was still opening.
+        self.cropping = None;
+
         match self.loader.request(path) {
             // Prefetched: the neighbour the arrow key asked for is already in
             // memory, so it goes up in this frame with no intermediate.
@@ -3624,6 +3638,37 @@ impl ApplicationHandler<Event> for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A step to another picture closes the crop.
+    ///
+    /// The box is held in the *picture's* pixels, so one framed on a
+    /// 6000-pixel photograph would land somewhere meaningless on the
+    /// 800-pixel screenshot beside it — and `Enter` would crop that.
+    ///
+    /// Asserted on the source rather than by driving `show`, which needs a
+    /// window, a renderer and a loader. That is a weaker test than running the
+    /// code, and it is written that way on purpose: the alternative was no
+    /// test at all for a defect that destroys a file. It fails if the reset is
+    /// moved out of `show` or renamed.
+    #[test]
+    fn stepping_to_another_picture_closes_the_crop() {
+        let source = include_str!("app.rs");
+        let show = source.split("fn show(").nth(1).expect("app.rs has a `show`");
+        // Up to the line that closes the method: four spaces and a brace,
+        // which is where a method at this indentation ends.
+        let body = show
+            .split(
+                "
+    }
+",
+            )
+            .next()
+            .expect("a body");
+        assert!(
+            body.contains("self.cropping = None;"),
+            "`show` no longer closes the crop, so a box framed on one picture would survive onto the next",
+        );
+    }
 
     /// A crop never lands on a file that is already there.
     ///
