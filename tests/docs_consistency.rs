@@ -1,23 +1,42 @@
-//! The gate that keeps the README honest about the product.
+//! The gate that keeps the documentation honest about the product.
 //!
 //! Two lists say what the keys are: `interface::KEYS`, which the key sheet
-//! draws, and the table in the README. Nothing held them together, and a
+//! draws, and the table a reader is given. Nothing held them together, and a
 //! version that adds a key touches one of them — v0.23.0 added `Ctrl+Drag`
 //! to both by hand and only noticed because the work happened to pass through
 //! both files. The next one would not be so lucky.
 //!
-//! The same for the formats: the table in the README and `Format::ALL`, which
-//! is what the installer registers and what the viewer opens.
+//! The same for the formats: the table and `Format::ALL`, which is what the
+//! installer registers and what the viewer opens.
+//!
+//! Those tables used to live in the README and now live on the documentation
+//! site, because a README is a shopfront rather than a reference. The gate
+//! followed them: pointing it at the README after the move would have left it
+//! passing on text that is no longer there to be wrong.
 //!
 //! This is a slice of the `release_consistency` test v0.40.0 is for, brought
 //! forward because the seam is open now.
 
 use std::collections::BTreeSet;
 
-/// The README, read from the source tree rather than embedded, so a failure
-/// names the file the author has to fix.
+/// One documentation page, read from the source tree rather than embedded, so
+/// a failure names the file the author has to fix.
+fn page(relative: &str) -> String {
+    let path = format!("{}/{relative}", env!("CARGO_MANIFEST_DIR"));
+    std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("{path}: {error}"))
+}
+
+/// The page listing every key, and the one listing every format.
+fn keys_page() -> String {
+    page("docs/src/content/docs/reference/keys.md")
+}
+
+fn formats_page() -> String {
+    page("docs/src/content/docs/reference/formats.md")
+}
+
 fn readme() -> String {
-    std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md")).expect("README.md is missing")
+    page("README.md")
 }
 
 /// Strip the markdown a table cell wraps a key in.
@@ -30,18 +49,18 @@ fn normalise(cell: &str) -> String {
     cell.replace('`', "").split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Every key the viewer answers is in the README, and every key the README
-/// promises is one the viewer answers.
+/// Every key the viewer answers is on the reference page, and every key that
+/// page promises is one the viewer answers.
 #[test]
-fn the_readme_lists_the_keys_the_viewer_answers() {
-    let readme = readme();
+fn the_reference_lists_the_keys_the_viewer_answers() {
+    let readme = keys_page();
     let sheet: BTreeSet<String> = nitid::testing::keys().iter().map(|(key, _)| normalise(key)).collect();
 
     // The keys table is the one whose header is "Key | Action".
     let table = readme
         .split("| Key | Action |")
         .nth(1)
-        .expect("the README has no keys table")
+        .expect("the keys reference page has no keys table")
         .lines()
         // `split` leaves the tail of the header line first, so the rows do not
         // start until the line after it — skipping by count got this wrong in
@@ -57,20 +76,23 @@ fn the_readme_lists_the_keys_the_viewer_answers() {
         .collect();
 
     let missing: Vec<&String> = sheet.difference(&documented).collect();
-    assert!(missing.is_empty(), "the key sheet answers these and the README does not list them: {missing:?}");
+    assert!(
+        missing.is_empty(),
+        "the key sheet answers these and the keys reference does not list them: {missing:?}"
+    );
 
     let invented: Vec<&String> = documented.difference(&sheet).collect();
     assert!(
         invented.is_empty(),
-        "the README promises these and the viewer does not answer them: {invented:?}"
+        "the keys reference promises these and the viewer does not answer them: {invented:?}"
     );
 }
 
-/// Every extension the installer registers appears in the README's format
+/// Every extension the installer registers appears in the reference's format
 /// table, so a format added to the code cannot arrive undocumented.
 #[test]
-fn the_readme_lists_the_formats_the_viewer_opens() {
-    let readme = readme();
+fn the_reference_lists_the_formats_the_viewer_opens() {
+    let readme = formats_page();
     let registered = nitid::testing::extensions();
 
     let undocumented: Vec<&str> = registered
@@ -81,20 +103,17 @@ fn the_readme_lists_the_formats_the_viewer_opens() {
 
     assert!(
         undocumented.is_empty(),
-        "these extensions open but the README does not mention them: {undocumented:?}"
+        "these extensions open but the formats reference does not mention them: {undocumented:?}"
     );
 }
 
 /// The version in the manifest is the one the README's status line names.
 ///
-/// The status paragraph opens with "vX.Y.Z is out", which is the first thing a
-/// visitor reads and the easiest thing to leave behind at release time.
+/// The status paragraph opens with the version, which is the first thing a
+/// visitor checks and the easiest thing to leave behind at release time.
 #[test]
 fn the_readme_names_the_version_in_the_manifest() {
     let version = env!("CARGO_PKG_VERSION");
     let readme = readme();
-    assert!(
-        readme.contains(&format!("v{version} is out")),
-        "the README's status line does not say v{version} is out",
-    );
+    assert!(readme.contains(&format!("v{version}")), "the README's status line does not name v{version}",);
 }

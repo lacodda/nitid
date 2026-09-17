@@ -1,0 +1,28 @@
+/* Brand accent: nitid cyan. The light-mode value is darkened from the mark's
+   own #3FA9D9, which carries only 4.46:1 on white - below the floor for body
+   text. #17739F is the same hue at 5.26:1. Measured, not eyeballed. */
+:root {
+	--sl-color-accent: #3fa9d9;
+	--sl-color-accent-high: #a5dcf2;
+	--sl-color-accent-low: #123448;
+}
+
+:root[data-theme='light'] {
+	--sl-color-accent: #17739f;
+	--sl-color-accent-high: #0d4a68;
+	--sl-color-accent-low: #d8eef9;
+}
+
+/* ---------------------------------------------------------------- header -- */
+
+/* The mark is a square hex tile: let it fill the bar height rather than the
+   2rem it was pinned to, and sit close to the wordmark it belongs with. */
+.site-title {
+	gap: 0.4rem;
+}
+
+.site-title img {
+	width: auto;
+	height: 2.5rem;
+}
+

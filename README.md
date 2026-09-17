@@ -1,710 +1,77 @@
 <p align="center"><img src="https://github.com/lacodda/nitid/raw/main/assets/banner.svg" alt="nitid - a fast image viewer with honest color" width="720"></p>
 
-# nitid
+> Double-click a file and the picture is already there - in the colours the photographer chose, with the headroom the display was bought for.
 
-**A fast image viewer for Windows that shows the picture as it actually is.**
+<p align="center">
+  <a href="https://github.com/lacodda/nitid/releases/latest"><img src="https://img.shields.io/github/v/release/lacodda/nitid?style=flat-square" alt="Release"></a>
+  <a href="https://github.com/lacodda/nitid/actions"><img src="https://img.shields.io/github/actions/workflow/status/lacodda/nitid/ci.yml?style=flat-square" alt="CI"></a>
+  <a href="https://github.com/lacodda/nitid/blob/main/LICENSE"><img src="https://img.shields.io/github/license/lacodda/nitid?style=flat-square" alt="License"></a>
+</p>
 
-Double-click a file and the image is already on screen — no white flash, no spinner. Colors are the ones the photographer chose, not an approximation. On an HDR display you see what the display was bought for.
+## Why
 
-`nitid` is Latin for *clear, bright, sharp* — the name describes the difference, not the function.
+Opening an image should not be an event. Most viewers make it one: a white
+flash, a spinner, a second of nothing while a 24-megapixel JPEG decodes. And
+when the picture finally lands, the colours are often not the ones in the file
+- the profile it carries was ignored, so the same photograph looks oversaturated
+here and correct in the editor it came from.
 
-## Why another viewer
+nitid closes both. The embedded thumbnail is on screen in single-digit
+milliseconds while the full image decodes behind it, and the file's colour
+profile is converted against the display's own profile in the shader, every
+frame, for free. On an HDR display the output is extended-range linear light,
+so highlights drive the headroom instead of clipping at white.
 
-| | Startup | Color management | HDR | Modern formats |
-| --- | --- | --- | --- | --- |
-| Windows Photos | 1–2 s | partial | partial | yes |
-| IrfanView / XnView | fast | formal | no | partial |
-| ImageGlass | fast | yes | no | yes |
-| qView / JPEGView | fast | no | no | no |
-| **nitid** | **target < 100 ms** | **ICC on the GPU** | **yes** | **yes** |
+`nitid` is Latin for *clear, bright, sharp* - the name describes the
+difference, not the function.
 
-Nothing on the market closes all four columns at once. That gap is the whole reason this exists.
+## What you get
 
-## How it gets fast
+- **The picture before the decode finishes.** Thumbnail first, full image
+  behind it, neighbours prefetched - arrow keys never wait.
+- **Colours that mean something.** ICC on the GPU; a file with no profile is
+  passed through untouched, exactly as every browser shows it.
+- **HDR that follows the display.** Turn it on or off in Windows and the
+  surface is reconfigured without a restart.
+- **Every modern still format**, decoded in pure Rust - JPEG, PNG, WebP, JPEG
+  XL, HEIC, AVIF, SVG, GIF, BMP, TIFF - and the animated ones play.
+- **Tools for reading a picture**, not just looking at it: histogram, loupe,
+  clipping warning, an eyedropper that reads in the file's terms and the
+  display's.
+- **One window.** Opening a second image hands it to the viewer already
+  running, so a multi-select does not scatter windows across the desktop.
+- **Nothing that phones home.** The process that decodes the heavy formats has
+  no network in either direction.
 
-Speed here is not a faster decoder — it is a different order of operations:
+## A day in the life
 
-1. The embedded EXIF thumbnail is decoded in single-digit milliseconds and drawn immediately.
-2. The full image decodes on a background thread and replaces it without a flicker.
-3. Neighbouring files in the folder are prefetched, so arrow keys never wait.
+```console
+$ nitid photo.heic
+```
 
-Measured on a 24-megapixel JPEG, from process start:
+The window is up in about 11 ms, the picture on screen at about 128 ms - from
+process start, on a 24-megapixel file. Run with `NITID_STARTUP_REPORT=1` and it
+says so for your own machine:
 
 ```
 window created at    11 ms
 gpu ready at        118 ms
 thumbnail up at     128 ms   <- the picture is on screen here
 first pixels in     146 ms
-```
-
-The full decode of that same image takes about 120 ms and lands afterwards,
-replacing the thumbnail in place. Most of what remains is the graphics driver
-starting up, not work nitid controls — which is why the order of operations
-matters more than decoder benchmarks.
-
-Run with `NITID_STARTUP_REPORT=1` to get that breakdown for your own machine.
-The numbers are held to a threshold by `tests/startup.rs`, so a change that
-puts a full decode back on the startup path fails the build rather than
-quietly costing a tenth of a second.
-
-## Honest color
-
-An image carries a colour profile saying what its numbers mean; a display has
-one saying what it can show. Most viewers ignore both and send the numbers
-straight to the screen, which is why the same photo looks oversaturated in one
-program and right in another.
-
-nitid reads the profile out of the file, asks Windows what the display is, and
-converts between them **in the shader** — the decoded pixels stay as the file
-stored them, the conversion costs nothing per frame, and changing your display
-profile costs a redraw rather than a reload.
-
-- A wide-gamut file (Display P3, Adobe RGB) is brought into what the display
-  can actually show, rather than clipped.
-- A file with **no** profile is shown exactly as it is, the way Windows, the
-  shell preview and every browser show it. It looks the same here as it does
-  everywhere else — including in whatever tool made it. Guessing sRGB and
-  converting from it would visibly wash the picture out on a wide-gamut
-  display; see [ADR 0005](docs/adr/0005-untagged-images-pass-through.md).
-- Arbitrary tone curves are handled by sampling them, so a scanner or camera
-  profile costs the same as a simple gamma.
-
-When the image and the display already agree, no conversion happens at all and
-the hardware does the sRGB decoding for free.
-
-## HDR
-
-On a display in HDR mode, nitid outputs extended-range linear light — scRGB,
-`ExtendedSrgbLinear` on an `Rgba16Float` surface — so highlights above SDR
-white drive the display's headroom instead of clipping at white. It is the
-same shader either way: the colour transform already ends in linear light, and
-an HDR surface simply takes it unencoded and unclamped. An SDR image therefore
-looks identical on both surfaces, which is asserted by drawing it twice and
-comparing the pixels rather than by eye.
-
-The choice follows the display rather than being made once. Turn HDR on in
-Windows with nitid open and the swapchain is reconfigured without a restart;
-turn it off and it goes back. Turning it *on* announces itself to the window,
-so that direction costs nothing; turning it *off* announces itself to nobody at
-all, so while — and only while — nitid is on an HDR surface it asks the display
-once a second, for the 140 microseconds that costs. On an SDR display nothing
-polls and the event loop sleeps until you act, exactly as before.
-
-`NITID_STARTUP_REPORT=1` states which surface is up and how much headroom the
-display reports:
-
-```
 nitid: surface Rgba16Float ExtendedSrgbLinear, display headroom 7.71x
 ```
 
-A screenshot of an HDR window is a standard-range image, so this line is the
-one way to check the answer rather than judge it. See
-[ADR 0013](docs/adr/0013-hdr-output-goes-through-scrgb.md).
+That figure is held by `tests/startup.rs`, so a change that puts a full decode
+back on the startup path fails the build rather than quietly costing a tenth of
+a second.
 
-## One window
+From there, arrow keys walk the folder, `?` shows every key, `I` says what the
+file says about itself, `H` draws a histogram of its own values, and `P` reads
+the pixel under the pointer in both the file's terms and the display's.
 
-Double-clicking a second image does not open a second viewer. The launch finds
-the one already running, hands its file over and exits, and the picture appears
-in the time it takes to decode — measured at 135 to 155 milliseconds against
-320 to 560 for a cold start, because the window and the graphics device are
-already there.
+## Install
 
-The same answers multi-select. Windows starts one process per selected file, so
-five files means five launches; four of them hand their file to the first, and
-the five arrive as one list in one window. Arrow keys then walk that selection
-rather than the whole folder — the five you picked, not the hundreds beside
-them. Five files opened this way took 239 milliseconds altogether.
-
-The window also comes forward when it takes a file. Windows only lets the
-process the user is working in raise a window, and after a double-click that
-process is the launch, not the viewer already running — so the launch hands
-that right over as it connects, naming the window it found. Without it a
-default viewer would change its picture behind whatever you were looking at.
-
-The window that owns the channel is simply the first one to create it, which is
-a single atomic call, so two launches racing cannot both decide they are the
-window. Nothing polls: a hand-over wakes the event loop the same way a finished
-decode does, and a still image still costs no wakeups at all. See
-[ADR 0016](docs/adr/0016-one-window-elected-by-a-named-pipe.md).
-
-## The interface
-
-The chrome is not there while you are looking at a photograph. There is a
-status line along the bottom saying what is on screen — the file, where it sits
-in the folder, its size, format, bit depth, what the colour transform is doing,
-and the zoom — and everything else appears when you reach for it.
-
-Move the pointer to the top of the window and a toolbar comes down: step
-through the folder, zoom, fit, actual size, turn, the zoom lock, the backdrop,
-the Info panel, the histogram, the clipping zebra, the eyedropper, full
-screen. It carries nothing the keyboard does not, and every button names its
-key. Press `?` for the full list.
-
-**It is not on the way to the picture.** Laying the interface out and building
-its place on the GPU costs around forty milliseconds, so the first frame is the
-photograph alone and the chrome arrives on the frame after — measured at 44 to
-86 milliseconds behind it, and held in that order by a test rather than by
-intent. The startup promise is unchanged: first pixels in 407 to 509
-milliseconds on the same file that took 489 to 528 before the interface
-existed.
-
-Drawing it correctly on an HDR surface took a detour worth knowing about. egui
-picks how to encode its output from whether the target is an sRGB format, and
-the extended-range surface is not one — drawn straight onto it, a mid grey came
-out 2.35 times too bright. So egui draws into an sRGB texture of its own and a
-shader of nitid's composites that onto the surface, asking the same question
-the image shader asks. The interface also stops at SDR white: a toolbar pushed
-into the display's headroom would compete with the photograph. See
-[ADR 0017](docs/adr/0017-the-interface-is-composited-through-our-own-shader.md).
-
-Nothing here polls. A frame is laid out only when it would look different from
-the last one, and the only thing that asks the loop to wake is a message while
-it is fading.
-
-## What the file says
-
-Press `I` and a panel comes down the right-hand edge with everything the file
-has to say: its size, format, bit depth and colour, its weight on disk and
-where it lives, and — for a photograph — what the camera wrote. Make and model,
-lens, shutter speed, aperture, ISO, focal length with its 35 mm equivalent, and
-when the picture was taken. A photograph carrying GPS gets its coordinates.
-
-It is an overlay, so the picture keeps its framing while the panel is up.
-
-**Every row copies its value when clicked.** A lens name, a shutter speed or a
-coordinate is nearly always wanted somewhere else — a caption, a search, a map
-— and reading it off the screen to type it back in is the part that wastes the
-panel.
-
-Values are shown the way a photographer reads them, not the way the standard
-stores them: `1/250 s` rather than 0.004, `f/2.8` rather than 28/10. A maker
-that repeats itself in the model is printed once.
-
-The coordinates stay on your machine. nitid does not open a map, or ask any
-service where a photograph was taken — a viewer that reached out to place your
-pictures would be telling somebody else where you have been.
-
-## Controlling the view
-
-Three things you can do to a picture without touching the file.
-
-**Hold the framing across a step** with `L`. By default every image is framed
-for itself, which is what a folder of unrelated pictures wants. Locked, the
-arrow keys become a way to compare a series: each frame arrives at the same
-magnification over the same part of the picture, so what moves between them is
-the only thing that moves. The place is held as a fraction rather than as
-pixels, so a neighbour of a different size shows the corresponding part of
-itself instead of drifting.
-
-**Turn the picture** with `R`, or the other way with `Shift+R`. It is a viewing
-transform: the file is untouched, and stepping to another image shows that one
-as its own metadata asks. Rotating the file itself is a later version. The turn
-combines with whatever the file already asks for by multiplying their matrices,
-in an order that was measured rather than chosen — the two candidate orders
-agree on every rotation and differ on every mirror, so a table written by
-looking at photographs would be wrong in exactly the cases photographs do not
-show. See [ADR 0018](docs/adr/0018-orientation-composes-by-matrix-multiplication.md).
-
-**Choose what shows through transparency** with `B`: the viewer's own dark
-scene, a checkerboard, black, or white. Judging a cut-out against one backdrop
-is judging it against one background — a logo bound for a white page has to be
-seen on white, and a checkerboard is how you tell "transparent" from "a flat
-grey that happens to match the scene". The checker is measured in screen
-pixels, so it stays the same size at any zoom rather than reading as part of
-the picture.
-
-**The minimap** appears once part of the picture is off screen: the whole
-image small in the bottom-right corner, with the part you are looking at framed
-and the rest dimmed. Zoomed in, a viewer answers "what is here" and stops
-answering "where is this"; the frame moves as you drag, so the photograph stays
-navigable at a zoom where nothing on screen says where in the frame you are. At
-a deep zoom the visible part is a hair, and the frame is held to something the
-eye can find rather than drawn to scale — the zoom in the status line is what
-states the measurement.
-
-It is drawn in **the display's colours**, unlike the histogram and the
-eyedropper's numbers. Those report facts about the file; a minimap is a picture
-of the picture, and one painted in the file's numbers would be a visibly
-different colour from the photograph it sits beside. It is built once per
-image, by sampling rather than averaging, so a sixty-megapixel file costs the
-same as a small one and nothing is spent inside a drag.
-
-By default it is there only when it has something to say. The View section of
-the settings has the other two answers: always, or never.
-
-## Reading the picture
-
-Two things that answer questions the picture on screen cannot.
-
-**The histogram**, with `H`: what tones the picture is actually made of, in the
-corner rather than across the frame. The three channels are drawn in their own
-colours and add where they overlap, so a colour cast shows as the curves
-pulling apart; luminance goes over the top as a line, because that is the curve
-an exposure is judged by. All four share one scale — drawn against their own
-maxima a flat channel and a peaked one would look alike.
-
-It counts **the values in the file**, before the colour transform. A
-photographer judging an exposure is judging what the camera recorded, not what
-this display can show: measured after the profile, the same photograph's
-histogram would move when the window was dragged to another monitor, and would
-report clipping belonging to the screen rather than to the picture. See
-[ADR 0019](docs/adr/0019-the-histogram-counts-the-file-not-the-display.md).
-
-The count is not on the way to the first pixel. A file nobody has asked to
-measure is never measured, and when you do ask, the counting runs on a worker
-thread over the pixels the loader is already holding — nothing is decoded
-twice. A large photograph is sampled rather than counted whole: the shape of a
-sixty-megapixel frame is settled long before the last pixel.
-
-**The loupe**, by holding `Z`: 100% under the cursor for as long as the key is
-down, and the framing you had back the moment you let go. It answers the one
-question a fitted photograph cannot — is this actually sharp — without the pan
-in, zoom, and pan back that asking it otherwise costs. Because it is held
-rather than toggled there is no mode to be left in: stepping to the next image
-while it is down carries the framing underneath it, not the loupe's, and a key
-let go while another window is in front drops it too.
-
-## Colour tools
-
-Three things that answer questions about colour rather than about the picture.
-
-**The clipping zebra**, with `C`: diagonal hatching over the pixels that hit
-the ends of the scale — red where a highlight is blown, blue where a shadow is
-blocked. It marks **what the file clipped**, not what this display cannot
-reproduce, which is the same decision the histogram is built on
-([ADR 0019](docs/adr/0019-the-histogram-counts-the-file-not-the-display.md)): a
-colour outside this monitor's gamut is not a colour the camera lost. The
-marking happens in the shader that was going to run anyway, so turning it on
-and off costs one uniform write and no re-decode.
-
-**The eyedropper**, with `P`: the colour under the pointer, in both the terms
-that matter — the numbers the file holds, and what they become on this display.
-They differ whenever the image carries a profile the display does not share,
-and a viewer reporting only one of them would be answering a question nobody
-asked. Clicking copies the file's value as hex, because that is the one that
-stays true when the window moves to another monitor. Above the numbers sit the
-nine-by-nine pixels around the one being read, magnified, with that one marked:
-a single pixel is a number, and its neighbours are what say whether the number
-is the colour of the thing or a speck on it — and, at a zoom where a pixel is
-smaller than the pointer, which pixel is being read at all. The plain swatch is
-still there as a setting, for anyone who wants the panel small.
-
-**The colour passport**, with `K` or by clicking the colour in the status line:
-what the file says its numbers mean, what the display says it can show, and
-what is being done between them — including anything the viewer could not
-honour. A HEIC that describes itself with wide primaries or an HDR transfer is
-resolved to sRGB inside the decoder before a pixel reaches the viewer, so the
-colour on screen is right for sRGB and wrong for the file; the passport says
-so, and so does the save box, because a colour that is quietly wrong is the one
-kind of wrong nobody can find by looking. Colour management is invisible when it works
-and inexplicable when it does not — a photograph that looks wrong here and
-right elsewhere is a question nobody can answer by looking harder at it.
-
-## The clipboard
-
-`Ctrl+C` puts the picture on the clipboard, `Ctrl+V` shows whatever picture is
-on it, and `Ctrl+Shift+C` copies the file's path — quoted, so a path with a
-space in it survives being pasted into a terminal.
-
-What is copied is **the file's own pixels**, unconverted, which is the same
-decision the histogram and the eyedropper follow: the numbers on the clipboard
-are the numbers those tools report. A `CF_DIB` has nowhere to say what its
-numbers mean, so a wide-gamut picture will look flatter in an application that
-assumes sRGB. That is a true thing about the Windows clipboard rather than
-something a viewer should paper over by quietly rewriting the pixels on the way
-out. Transparency is composited onto white, because `CF_DIB` carries no
-dependable alpha and a cut-out is nearly always going onto a white page.
-
-**`Ctrl+Alt+C` copies it as something sendable.** Two things go on the
-clipboard at once, the way a drag offers two: a JPEG file, and the pixels. A
-chat window or a mail client takes the file; an editor that paints takes the
-pixels, exactly as it does today.
-
-The file is made to a **budget in kilobytes**, not to a quality number. Nobody
-knows what quality 74 weighs — it depends entirely on the picture — and
-everybody knows what an attachment limit is, so the viewer searches for the
-best-looking JPEG that fits and says which quality it settled on. The picture
-is shrunk to a maximum width first, and its colour is baked into sRGB, because
-what is travelling is a file going to a program that will very likely ignore a
-profile. Both numbers are in the settings, at 500 KB and 2048 pixels to start
-with. A budget nothing can meet is said so rather than quietly broken.
-
-This is the one place the viewer writes a file without being asked for a file,
-and it is asked for this one: the JPEG goes to a folder of its own inside the
-temporary directory, named after the picture so what lands in a chat carries a
-name that means something. Nothing appears in the folder you are looking at.
-
-A pasted picture is **shown, not saved**. It has no file behind it: the title
-says `clipboard`, the arrow keys have nowhere to go, and nothing is written to
-disk. A viewer that quietly saved a temporary file on every paste would be
-writing without being asked and leaving the results behind. See
-[ADR 0020](docs/adr/0020-a-pasted-picture-is-shown-not-saved.md).
-
-## Drag and drop
-
-Files dropped on the window open. A selection of several arrives as the several
-it was, and the arrow keys then walk those files rather than the hundreds
-sitting beside them in the folder — the same thing multi-select does from the
-shell. While files are held over the window it says so, because a drag with no
-answer looks like a window that will not take it.
-
-**`Ctrl` and a drag hands the picture the other way**, into a chat, a mail, an
-editor. What travels is the file where there is one and the picture where there
-is not, offered together so the receiving application takes whichever it
-understands: a mail client gets the original file, with its format and its
-metadata intact, and an editor that paints gets the pixels. Only a copy is ever
-offered — a drag that could move the file would delete the photograph you are
-looking at. See
-[ADR 0021](docs/adr/0021-a-drag-offers-the-file-and-the-picture.md).
-
-The bare drag stays panning. A picture pasted from the clipboard has no file to
-hand over, so it travels as pixels only; nothing is written to disk to make it
-look otherwise.
-
-## Working through a folder
-
-A viewer that can only look is half a tool. Going through a shoot means
-throwing some frames away, naming the keepers, and putting them where they
-belong — and doing that in a file manager means leaving the picture to look at
-a list of names, which is the one view that cannot answer "is this the good
-one".
-
-**`Del` sends the file to the recycle bin** and moves to the next picture.
-Forwards, not back: culling a folder carries on the way you were going, and
-landing on the frame you just judged would mean judging it twice. Nothing is
-asked first — the bin is undoable, and Explorer's own `Ctrl+Z` takes the
-operation back — because a confirmation on every frame is what makes people
-stop culling in a viewer and go back to a file manager.
-
-**`F2` renames it.** The box opens with the whole name in it and the stem
-selected, so typing replaces the name and leaves `.jpg` alone, while renaming
-`shot.jpg` to `shot.png` is still one keystroke away. Enter commits, Escape
-cancels, and the box holds the keyboard while it is open — typing "gull" must
-not also step through the folder and turn the picture. A name carrying a path
-separator is refused rather than quietly moving the file somewhere else.
-
-**`Ctrl+1` through `Ctrl+9` sort it into folders you set**, and
-`Ctrl+Shift+1`-`9` copy it there instead of moving it. The folders are set in
-the Files section of the settings; a key with nothing set says so rather than
-doing something surprising. The digits carry `Ctrl` because bare `0` and `1`
-have fitted the picture to the window and shown it at 100% since v0.1.0, and a
-sorting key added later does not get to take a viewing gesture that has been
-there from the beginning.
-
-**`E` opens the picture in the program that edits it.** Not a copy, not an
-export — the file on screen, in whatever Windows already associates with that
-kind of image, which is the same program the context menu's own "Edit" would
-start. It works without being configured; naming an editor in the settings
-only overrides the choice. `Alt+1` through `Alt+9` open the file in programs
-you name yourself, for the ones the system would never pick: a raw converter,
-a batch stamper, an upload script.
-
-Nothing waits for the program to close, and the picture is not reloaded when
-it does — an edit takes as long as it takes, and `R` reloads when you want it.
-
-**`Ctrl+S` keeps a turn.** `R` and `Shift+R` turn the picture on screen and
-always have; pressing `Ctrl+S` writes that turn into the file, so it stays
-turned in every other program too. Nothing is re-encoded to do it — the file's
-orientation tag is rewritten and the compressed image data is left exactly as
-it was, byte for byte. A photograph turned this way a hundred times is the same
-photograph. `F` mirrors the picture left to right, `Shift+F` top to bottom, and
-those save the same way.
-
-**`Ctrl+Shift+S` saves the picture as something else.** JPEG, PNG or WebP,
-beside the file it came from, under a name you type — the original is never
-touched and an existing neighbour is never replaced.
-
-What comes out is what was on screen. The colour path is the one the shader
-draws with, step for step: the same curves, the same matrix, the same clamp,
-run over every pixel instead of the visible ones, and a gate reads the shader
-itself to keep the two from drifting apart. So a wide-gamut photograph can go
-out with its colour **baked into sRGB** — the numbers say what you were
-looking at, which is what a chat window or a forum will show, since neither
-reads a profile. Left unbaked, the file keeps its own numbers and its profile
-travels with them; that is the default for an ordinary picture, because it is
-the choice that can be undone.
-
-The box says what a save will cost before it writes anything. JPEG has no
-transparency, so a picture with any will be filled with white. Eight bits per
-channel is all JPEG and WebP store, so a sixteen-bit source loses the rest. And
-an HDR picture becomes SDR the way it already looks on an ordinary screen:
-reference white lands on white, and highlights above it clip. That is a real
-loss and it is stated plainly — those highlights are not coming back — but it
-is exactly what you were seeing, rather than a second rendering that would make
-the file disagree with its own preview.
-
-**`X` frames a crop.** The box opens over the whole picture; drag a corner or
-an edge to bring it in, drag inside it to slide it about, or press somewhere
-clear of it to draw a new one. The buttons along the bottom hold it to a shape
-— 1:1, 3:2, 4:3, 16:9 and their upright forms, or the picture's own — and the
-box reshapes as soon as you pick one rather than waiting for the next drag.
-`Enter` takes the crop, `Esc` leaves without taking it. The handles stay the
-same size under the pointer whatever the zoom, and the box is remembered in the
-picture's coordinates, so zooming or panning mid-crop moves the view and not
-the framing.
-
-**A crop is always a copy.** It lands beside the original as `photo-crop.jpg`,
-and a second one as `photo-crop-2.jpg`; the file you were looking at is never
-written to. That is the difference between this and `Ctrl+S`: a turn is a label
-and can be turned back, while a crop throws pixels away, and a viewer that did
-that in place could destroy a photograph with one keystroke and no undo.
-
-**A JPEG is cropped without being re-encoded, where it can be.** JPEG stores a
-picture as blocks, and a crop whose edges land on those blocks can be made by
-moving the compressed data itself — no decoding, no quantising, no encoder in
-the path at all. The surviving coefficients are the numbers the original file
-held and its quantisation tables travel with them, so the kept part of the
-picture is bit-for-bit what it was. Crop a photograph fifty times this way and
-the fiftieth is as clean as the first.
-
-One honest detail, since the point of the feature is honesty: on a subsampled
-JPEG — which most photographs are — a border one pixel wide along the cut can
-shift very slightly. The colour channels are stored at half resolution and the
-decoder interpolates them, so a pixel on the new edge no longer has the
-neighbour it was interpolated against. Nothing is re-quantised and the interior
-is identical to the byte; it is the boundary that had to be invented, and it is
-invented once rather than accumulating with every crop.
-
-The blocks are usually 16×16 pixels, so an arbitrary crop is up to fifteen
-pixels from one that can be done this way. The bar says which you are about to
-get: it names the size the edges would move to, or says the crop is already on
-the grid, or says the file has to be re-encoded and lets you decide. It never
-quietly does one when it said the other. A progressive JPEG, a PNG, a HEIC —
-anything that cannot take the coefficient path — is decoded, cut and written as
-a **PNG**, which is lossless, so a crop that must be re-encoded at least does
-not lose anything twice. A sixteen-bit source goes out at eight bits per
-channel on that path, and the bar says so before it happens.
-
-Turning and saving are separate on purpose: looking at a photograph from
-another angle leaves nothing on disk until you say so. The one thing to know is
-that a program which ignores EXIF orientation — a few old tools do — will still
-show the original; the trade is deliberate, and the reasoning is in ADR 0024.
-
-Everything here goes through **the shell's own file operations**, never a
-direct write. That is what makes a delete land in the recycle bin instead of
-being gone, puts the operation on the shell's undo stack, and resolves a name
-that is already taken the way the rest of Windows resolves it — a second frame
-of the same name lands beside the first rather than replacing it. A viewer
-that deleted with a plain filesystem call would be a viewer that loses
-photographs, whatever it said in a confirmation dialog.
-
-## Large images
-
-A GPU texture has a maximum side — 16384 on current integrated hardware, and
-as little as 2048 on the oldest cards nitid still runs on. A stitched panorama
-or a scanned map goes past it, and the way that failed is worth knowing: the
-graphics API has no way to return the rejection, so it reports it through a
-side channel and the default handling is a panic. Before this version such a
-file decoded all the way through and then took the viewer down at the moment
-it was about to appear.
-
-nitid cuts such an image into tiles the device will hold and draws them as one
-picture. Zoom and pan work as they do on any other image, and the joins are
-invisible: each tile carries one pixel of its neighbour so the filter has a
-real texel to interpolate towards, rather than the repeated edge that leaves a
-visible step under magnification. An image that fits in one texture is still
-one texture and one draw call — tiling costs it a single comparison.
-
-Still bounded by memory rather than by the texture limit: a tiled image holds
-every pixel at once. See
-[ADR 0015](docs/adr/0015-large-images-are-tiled.md).
-
-## Formats
-
-Everything below decodes in pure Rust: a malformed file costs an error, never
-code execution.
-
-| Format | Extensions | Embedded ICC profile |
-| --- | --- | --- |
-| JPEG | `.jpg` `.jpeg` `.jpe` `.jfif` | yes |
-| PNG | `.png` | yes |
-| WebP | `.webp` | yes |
-| JPEG XL | `.jxl` | yes |
-| HEIC | `.heic` `.heif` `.hif` | yes when embedded; code points converted at decode |
-| AVIF | `.avif` | yes, from the bitstream |
-| SVG | `.svg` | drawn in sRGB |
-| GIF | `.gif` | sRGB by definition |
-| BMP | `.bmp` | no |
-| TIFF | `.tif` `.tiff` | no |
-
-The format is decided by the bytes, not the extension: a `.png` that is really
-a JPEG opens rather than erroring.
-
-GIF, APNG and animated WebP **play**: every frame is decoded up front, the
-space bar pauses and resumes, and the title carries the frame counter. Frame
-delays of 10 ms and under are read as 100 ms — the convention browsers apply,
-which the files were written against. A still image costs no GPU time and no
-wakeups; a playing animation wakes the event loop for its next frame and for
-nothing else, so pausing restores the silence.
-
-HEIC — the format a modern phone photographs in — decodes in Rust like the
-rest, container and HEVC alike, and reaches the screen as fast as a JPEG: it
-carries a thumbnail as a second image inside its container, and nitid shows
-that first while the full picture decodes behind it. A 10- or 12-bit HEIC
-keeps its depth: the decoder hands over sixteen-bit samples and they reach the
-texture that wide.
-
-One limitation remains, and only for some files. A HEIC states its colour
-either as a set of standard code points or as an embedded ICC profile. With a
-profile, nitid reads it and applies it on the GPU like every other format.
-With code points — the more common case — the decoder resolves the colour
-itself before nitid sees the pixels, so a photograph tagged Display P3 is
-shown inside sRGB rather than across a wide-gamut display's full range. See
-[ADR 0007](docs/adr/0007-heic-decodes-in-rust.md).
-
-AVIF decodes through `rav1d` — dav1d translated to Rust by the ISRG — with the
-container read separately. It gets the full colour treatment: the file's
-primaries and transfer curve are read from the bitstream and applied on the GPU
-like every other tagged format, so a Display P3 AVIF is shown across the
-display's gamut rather than folded into sRGB. 10- and 12-bit AVIF decode at
-their own depth: the samples cross the whole pipeline — decoder, sandbox,
-texture — sixteen bits wide, never narrowed to eight. An HDR10 file (BT.2020
-with the PQ transfer) shows at a sensible brightness on both kinds of display:
-its reference white lands on SDR white, and on an HDR display the highlights
-above it drive the panel's headroom. See
-[ADR 0008](docs/adr/0008-avif-decodes-with-rav1d.md) and
-[ADR 0014](docs/adr/0014-pq-reference-white-lands-on-sdr-white.md).
-
-HEIC and AVIF decode in a **separate process** — not because they are unsafe
-any more, but because a process can be stopped and a thread cannot. Navigate
-away from a large image and the decode is abandoned rather than finished for
-nobody; hand the viewer a file that wedges a decoder and the child is killed on
-a timeout rather than taking a worker with it. The child is created suspended
-inside an **AppContainer with no capabilities**, held in a job object that caps
-its memory and kills it with the viewer, and handed the file's bytes on stdin
-and never its path; the pixels come home through shared memory. See
-[ADR 0009](docs/adr/0009-heavy-decodes-run-in-a-child.md) and
-[ADR 0011](docs/adr/0011-the-decoder-loses-the-network.md).
-
-The container is what closes the **network**, and closed is measured rather
-than assumed, in both directions: a decoder taught to try cannot reach a live
-listener waiting just outside the sandbox, and a listener it binds inside
-accepts nothing while the same test hammers the port from outside. The
-previous arrangement — a restricted token at low integrity — demonstrably
-does not close a socket, whatever the common belief; it remains only as the
-fallback for a machine that cannot register a container profile, and falling
-back is reported rather than silent.
-
-SVG is drawn for the size it is shown at, and drawn again when that changes, so
-zooming in sharpens the picture instead of enlarging pixels. A document that
-references another file does not get one: nitid refuses every href that is not
-embedded, because an image is untrusted input and must not choose what the
-viewer reads off the disk. Compressed `.svgz` is not opened — decompressing it
-has no size limit to hide behind.
-
-## Status
-
-Early development — v0.31.0 is out. Startup, colour and format coverage hold:
-every modern still format opens, a phone's photographs included, every one of
-them reaches the screen without a wait, and the ones that animate play. The
-process that decodes the heavy formats runs with no network in either
-direction. HDR output works end to end: the surface follows the display's own
-state while the viewer is open, and 10- and 12-bit sources cross the whole
-pipeline at their own depth. Size is no longer a limit either — an image
-past what a GPU texture can hold is drawn as tiles rather than crashing the
-viewer. **And it is one window now**: opening a second image hands it to the
-viewer already running instead of starting another, which is both faster and
-what multi-select should have done all along. **And it has an interface now**:
-a status line saying what is on screen, a toolbar that comes down when the
-pointer reaches for it, and a key sheet — none of it in front of the
-photograph. The framing can be held across a step for comparing a series, the
-picture turned, and the backdrop behind transparency chosen, and `I` says what
-the file says about itself. **And the picture can be read now**: `H` draws a
-histogram of the file's own values, and holding `Z` puts 100% under the cursor
-for as long as the key is down. **And the colour can be interrogated now**: `C`
-marks what the file clipped, `P` reads the pixel under the pointer in the
-file's terms and the display's — with its neighbours magnified beside it — and
-`K` spells out the path between the two. **And a picture can leave now**:
-`Ctrl+Shift+S` saves it as a JPEG, PNG or WebP in the colour you are looking
-at, and `Ctrl+Alt+C` copies it as a JPEG made to fit a size budget, for a chat
-or a mail that will not take the original.
-**And it talks to the clipboard**: the picture out with `Ctrl+C`, whatever is
-on the clipboard in with `Ctrl+V`, and the path — quoted for a terminal — with
-`Ctrl+Shift+C`. **And pictures come and go by hand now**: files dropped on the
-window open — a selection of several as the several it was — and `Ctrl` with a
-drag hands what is on screen to another window, as the file where there is one
-and as the picture where there is not. **And the choices are yours now**: `,`
-opens the settings — what the wheel does, when the chrome is on screen, how a
-picture is framed when it arrives, where the zebra draws its lines and what
-the eyedropper reads in — each taking effect as it is made. **And you can see
-where you are now**: zoom into a photograph and a minimap appears in the
-corner, the whole picture small with the part you are looking at framed, so a
-deep zoom stops being a view with no map. **And the folder is yours to work
-through**: `Del` sends a file to the recycle bin and moves on, `F2` renames it,
-and `Ctrl+1`-`9` sort it into folders you set — all through the shell's own
-operations, so a delete is undoable and a name that is taken never costs you
-the picture that was already there. **And it hands the file on**: `E` opens
-the picture in the program that edits it, with no trip through Explorer,
-and `Ctrl+S` keeps a turn in the file without re-encoding a single pixel. Development runs in small versions, each
-one theme; the road to 1.0 is fixed:
-
-| Version | What lands |
-| --- | --- |
-| ✅ v0.1.0 | Window, wgpu renderer, JPEG/PNG, zoom and pan, folder navigation |
-| ✅ v0.2.0 | Instant startup — EXIF thumbnail first, background decode, prefetch |
-| ✅ v0.3.0 | Color management: ICC via `moxcms`, sRGB and Display P3 |
-| ✅ v0.4.0 | WebP, and one place that names every format |
-| ✅ v0.4.1 | Untagged images pass through unconverted |
-| ✅ v0.4.2 | JPEG XL |
-| ✅ v0.5.0 | SVG, redrawn at the size it is shown |
-| ✅ v0.6.0 | Sandboxed decoder process |
-| ✅ v0.7.0 | HEIC, decoded in Rust |
-| ✅ v0.8.0 | AVIF, decoded with `rav1d` |
-| ✅ v0.9.0 | Decodes that can be stopped: cancelled on navigation, killed on a timeout |
-| ✅ v0.10.0 | HEIC from its thumbnail, and its ICC colour on the GPU |
-| ✅ v0.11.0 | The network closed to the decoder, and a cheaper bridge |
-| ✅ v0.12.0 | Animation: GIF, APNG and animated WebP play |
-| ✅ v0.13.0 | HDR output on Windows, following the display as it changes |
-| ✅ v0.14.0 | A wider buffer: 10- and 12-bit sources through to the screen |
-| ✅ v0.15.0 | Gigapixel images via tiled rendering |
-| ✅ v0.16.0 | One window: a second launch hands its file over; multi-select arrives as one list |
-| ✅ v0.17.0 | The interface: status line, a toolbar that appears on approach, key sheet, messages |
-| ✅ v0.18.0 | Controlling the view: zoom lock across a step, viewing rotation, backdrop for transparency |
-| ✅ v0.19.0 | The Info panel: EXIF, the place a photograph was taken, every row copyable |
-| ✅ v0.20.0 | Reading the picture: a live histogram of the file's own values, and a loupe held at 100% |
-| ✅ v0.20.1 | `nitid install` puts itself on the `PATH`, so the command works from a terminal |
-| ✅ v0.21.0 | Colour tools: the clipping zebra, the eyedropper, and the colour passport |
-| ✅ v0.22.0 | The clipboard: the picture out, a picture in, the path quoted for a terminal |
-| ✅ v0.23.0 | Drag and drop: files dropped on the window open, `Ctrl` and a drag hands the picture out |
-| ✅ v0.23.1 | The window's own icon, and a shortcut on the desktop |
-| ✅ v0.24.0 | Settings: gestures, chrome, how a picture opens, the colour tools |
-| ✅ v0.25.0 | The eyedropper's magnifier: the pixels around the pointer, with the one being read marked |
-| ✅ v0.26.0 | The minimap: where in the picture the window is, once part of it is off screen |
-| ✅ v0.27.0 | File operations: the recycle bin, renaming, and nine folders to sort into |
-| ✅ v0.27.1 | Messages draw their arrows |
-| ✅ v0.27.2 | A panel opens on the first click, without waiting for the pointer to move |
-| ✅ v0.28.0 | An external editor: `E` opens the picture in the program that edits it |
-| ✅ v0.29.0 | Lossless rotation: a turn saved to the file, and mirroring |
-| ✅ v0.30.0 | Export: save as another format, and copy one small enough to send |
-| ✅ v0.31.0 | Cropping, without an encoder where the JPEG's own grid allows it |
-| v0.32.0 – v0.37.0 | The everyday viewer: metadata stripping, culling, comparison, slideshow |
-| v0.39.0 – v0.42.0 | Windows integration: context menu, installer, auto-update, thumbnails |
-| v0.43.0 – v0.44.0 | Documentation site, stabilisation |
-| v1.0.0 | Public release — the default viewer, nothing missing |
-
-Beyond 1.0: **2.x** makes a separate screenshot tool unnecessary — capture a
-series, pick from it, hand it over in one action — with RAW at its tail. **3.x**
-is the gallery: grid, folders, filters, timeline, duplicates.
-
-## Building
-
-```
-cargo build --release
-cargo run --release
-cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
-```
-
-Requires Rust 1.95 or newer — the version `egui-wgpu` needs, and the first that
-builds against wgpu 30.
-
-One tool beyond cargo is required: **NASM**, which `rav1d` needs to assemble
-the AV1 decoder's kernels — without it the build fails rather than falling back
-to something slower. `winget install NASM.NASM`, `scoop install nasm`, or your
-platform's package manager.
-
-## Installing
-
-Download the zip from the [latest release](https://github.com/lacodda/nitid/releases),
+Download the zip from the [latest release](https://github.com/lacodda/nitid/releases/latest),
 unpack it anywhere, and run:
 
 ```
@@ -712,125 +79,29 @@ nitid install
 ```
 
 This copies nitid to `%LOCALAPPDATA%\Programs\nitid`, registers the file types
-it can open, puts that directory on your `PATH` so `nitid` works as a command,
-and leaves a shortcut on your desktop — no administrator, nothing outside your
-own user account. Re-running it upgrades an existing install, even while the
-viewer is open, and does not add the directory to the `PATH` a second time or
-put a second shortcut beside the first.
+it opens, puts that directory on your `PATH`, and leaves a desktop shortcut -
+no administrator, nothing outside your own user account. `nitid uninstall`
+removes all of it.
 
-A terminal that was already open keeps the environment it started with, so
-`nitid` becomes available there once it is restarted.
+Windows keeps the choice of default application to itself, so after installing,
+pick nitid under **Open with -> Choose another app** and tick *Always use this
+app*. Full instructions: [Getting Started](https://lacodda.github.io/nitid/getting-started/).
 
-The zip carries two executables and both are installed: `nitid.exe` is the one
-to run from a terminal, and `nitidw.exe` is what the shell opens files with.
-The second exists so that double-clicking an image never flashes a console
-window — see [ADR 0004](docs/adr/0004-two-binaries-console-and-windowed.md).
+## Status
 
-Windows keeps the choice of default application to itself: no program is
-allowed to seize a file type. After installing, nitid appears under **Open
-with** — right-click an image, choose *Open with* → *Choose another app*, pick
-nitid and tick *Always use this app*. It also shows up in *Settings → Apps →
-Default apps*.
+v0.31.0, in daily use on Windows. Startup, colour and HDR hold end to end;
+every modern still format opens and the animated ones play; images past what a
+GPU texture can hold are drawn as tiles. What landed in each version:
+[CHANGELOG](https://github.com/lacodda/nitid/blob/main/CHANGELOG.md).
 
-`nitid uninstall` removes the files, the registration, the `PATH` entry, and
-the desktop shortcut.
+## Documentation
 
-## Using it
+**[lacodda.github.io/nitid](https://lacodda.github.io/nitid/)** - keys, formats,
+colour and the decisions behind them. Architecture decision records are in
+[`docs/adr/`](https://github.com/lacodda/nitid/tree/main/docs/adr).
 
-```
-nitid photo.jpg
-```
-
-Opening a file opens its folder: the arrow keys walk the images beside it.
-
-| Key | Action |
-| --- | --- |
-| `←` `→` | previous / next image in the folder |
-| `Home` `End` | first / last image |
-| `Space` | pause / resume an animation; next image on a still |
-| Wheel | zoom around the cursor, or step through the folder |
-| Ctrl+Wheel | whichever of the two the bare wheel is not |
-| Drag | pan |
-| Middle click | toggle fit and 100% |
-| `+` `-` | zoom in / out |
-| `0` `1` | fit to window / actual size |
-| `Z` | hold for 100% under the cursor |
-| `L` | hold the framing across a step |
-| `R` | turn a quarter clockwise (`Shift+R` the other way) |
-| `B` | what shows through transparency |
-| `I` | what the file says about itself |
-| `H` | what tones the picture is made of |
-| `C` | mark what the file clipped |
-| `P` | read the colour under the pointer, with the pixels around it magnified; click to copy |
-| `K` | what is happening to this image's colour |
-| `X` | frame a crop; Enter saves it as a copy, Esc leaves it |
-| `Ctrl+Drag` | drag the picture into another window |
-| `Ctrl+C` | copy the picture |
-| `Ctrl+V` | show the picture on the clipboard |
-| `Ctrl+Shift+C` | copy the path, quoted for a terminal |
-| `Ctrl+Alt+C` | copy it as a JPEG small enough to send |
-| `Del` | send this file to the recycle bin |
-| `F2` | rename this file |
-| `Ctrl+1`-`9` | move this file to the folder set for that key |
-| `Ctrl+Shift+1`-`9` | copy it there instead |
-| `F` | mirror it left to right; `Shift+F` top to bottom |
-| `Ctrl+S` | write the turn into the file, without touching its pixels |
-| `Ctrl+Shift+S` | save as another format, with the colour you see |
-| `E` | open this file in the program that edits it |
-| `Alt+1`-`9` | open it in the program set for that key |
-| `F11` | fullscreen |
-| `,` | settings |
-| `?` | every key there is |
-| `Esc` | close the settings, or quit |
-
-"100%" means one image pixel per logical pixel, so a photo is the same size
-here as everywhere else on a scaled display.
-
-### Settings
-
-`,` opens the settings, or the gear on the toolbar; `Esc` closes them. There is
-no OK button — a change takes effect as it is made, so a threshold can be
-dragged while watching what it marks. Four sections:
-
-| Section | What it holds |
-| --- | --- |
-| Gestures | what the bare wheel does — zoom or step through the folder — how far one notch zooms, whether the wheel is reversed, whether the middle button toggles fit and 100% |
-| View | when the toolbar and the status line are on screen: on hover, always, or never; when the minimap is — zoomed, always or never; and what shows behind transparency when a picture opens |
-| Opening | fit or 100% for a picture that arrives, whether the framing is held across a step, whether the folder wraps at its ends, and the order it is walked in — name, date or size |
-| Colour | where the clipping zebra draws its two lines, the units the eyedropper reads in, what a click copies, and whether the eyedropper magnifies the pixels around the pointer |
-| Sending | the size budget and the maximum width `Ctrl+Alt+C` copies a picture to |
-| Files | the nine folders `Ctrl+1`-`9` sort a picture into |
-
-Ctrl+wheel always performs whichever gesture the bare wheel does not, so both
-are reachable whichever way round the setting is.
-
-Settings live in `%APPDATA%\lacodda\nitid\settings.conf`, one `key = value`
-per line, meant to be readable and repairable by hand. A key the running
-version does not recognise is left alone rather than dropped, so a newer
-build's settings survive a run of an older one — see
-[ADR 0022](docs/adr/0022-settings-are-plain-lines-that-survive-both-directions.md).
-
-### Environment
-
-| Variable | Effect |
-| --- | --- |
-| `NITID_STARTUP_REPORT=1` | print the startup breakdown to stderr, and state the surface each time it is configured |
-| `NITID_EXIT_AFTER_FIRST_FRAME=1` | close as soon as a picture is on screen; used by the startup test |
-| `NITID_TILE_LIMIT=<pixels>` | lower the texture side an image is cut into tiles at, so the tiled path can be exercised on a small file; never raises it past what the device accepts |
-| `NITID_NO_SINGLE_INSTANCE=1` | open a window of this launch's own instead of handing the file to one already open; used by the startup gate, which measures a cold start |
-| `NITID_INSTANCE_ID=<text>` | share a window only with launches carrying the same value, so a test never talks to the viewer you have open |
-| `NITID_HANDOVER_REPORT=1` | print which process the foreground was offered to when a file is handed over; used by the one-window gate |
-
-## Design notes
-
-Two decisions shape everything else:
-
-**nitid owns its swapchain.** HDR output needs a surface format and color space chosen deliberately — `ExtendedSrgbLinear` on `Rgba16Float`, and re-chosen while the viewer runs as the display changes. A GUI framework that configures the surface for you closes that door, so the window and renderer are ours; `egui` is used for widgets only.
-
-**Untrusted input is isolated, and slow input is interruptible.** An image decoder parses hostile data by definition — pictures arrive from the internet. Every decoder nitid ships is Rust, so a malformed file causes a panic or an error rather than code execution. The separate low-integrity process that was built for memory safety earns its keep for a different reason: a thread cannot be stopped and a process can, so a decode is abandoned when you navigate away and killed when it wedges.
-
-Architecture decisions are recorded in [`docs/adr/`](docs/adr/).
+Building it yourself: [CONTRIBUTING.md](https://github.com/lacodda/nitid/blob/main/CONTRIBUTING.md).
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT (c) [Kirill Lakhtachev](https://lacodda.com)

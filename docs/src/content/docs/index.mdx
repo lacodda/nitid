@@ -1,0 +1,49 @@
+---
+title: nitid
+description: A fast image viewer for Windows with honest color and HDR - first pixels in milliseconds, ICC on the GPU, modern formats.
+template: splash
+hero:
+  tagline: Double-click a file and the picture is already there - in the colours the photographer chose.
+  actions:
+    - text: Get started
+      link: /nitid/getting-started/
+      icon: right-arrow
+    - text: View on GitHub
+      link: https://github.com/lacodda/nitid
+      icon: external
+      variant: minimal
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+<CardGrid stagger>
+	<Card title="On screen before the decode finishes" icon="rocket">
+		The embedded thumbnail is drawn in single-digit milliseconds while the
+		full image decodes behind it, and the neighbours are prefetched. A
+		24-megapixel JPEG reaches the screen in about 128 ms from process start -
+		a figure a test holds to, so it cannot quietly slip.
+	</Card>
+	<Card title="The colours the file actually means" icon="approve-check">
+		nitid reads the profile out of the file, asks Windows what the display
+		is, and converts between them in the shader. A file with no profile is
+		passed through untouched, exactly as every browser shows it.
+	</Card>
+	<Card title="HDR that follows the display" icon="star">
+		On an HDR display the output is extended-range linear light, so
+		highlights drive the headroom instead of clipping at white. Turn HDR on
+		or off in Windows and the surface is reconfigured without a restart.
+	</Card>
+	<Card title="Every modern still format" icon="document">
+		JPEG, PNG, WebP, JPEG XL, HEIC, AVIF, SVG, GIF, BMP and TIFF - all
+		decoded in pure Rust, and the animated ones play. The format is decided
+		by the bytes rather than the extension, and the heavy decoders run in a
+		separate process with no network in either direction.
+	</Card>
+</CardGrid>
+
+## Where to go next
+
+- **[Getting Started](/nitid/getting-started/)** - install it and make it the default viewer.
+- **[Keys and commands](/nitid/reference/keys/)** - everything nitid answers to.
+- **[Formats](/nitid/reference/formats/)** - what opens, and what happens to each.
+- **[Honest color](/nitid/concepts/honest-color/)** - why the same photo looks different elsewhere.
