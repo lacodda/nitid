@@ -40,6 +40,7 @@ mod metadata;
 mod minimap;
 mod rotate;
 mod sandbox;
+mod scrub;
 // The whole mechanism is Windows shell behaviour: the pipe, the election, and
 // the multi-select it answers. There is nothing here for another platform to
 // compile.
@@ -92,6 +93,12 @@ pub mod testing {
     /// export is: a gate that rebuilt the path would be checking its own
     /// rebuild.
     pub use crate::jpeg_lossless::{Grid, Rect, Refusal, crop as crop_losslessly, grid_of, snap};
+
+    /// Baking a turn into a JPEG's coefficients, and taking a file's metadata
+    /// out of it. Exposed for the same reason the crop is: a gate that runs
+    /// over real files must run the viewer's own path, not a copy.
+    pub use crate::jpeg_lossless::{Turn, turn as turn_losslessly};
+    pub use crate::scrub::{Found, Keep, scrub, supported as can_scrub, survey};
 
     /// Cut a rectangle out of a decoded picture, the way the re-encoding
     /// fallback does.
