@@ -1131,6 +1131,7 @@ impl App {
             Some(Chord::Paste) => self.paste_picture(),
             Some(Chord::SaveTurn) => self.save_turn(),
             Some(Chord::SaveAs) => self.begin_save_as(),
+            Some(Chord::CleanCopy) => self.begin_clean(),
             None => {}
         }
     }
@@ -1582,6 +1583,161 @@ impl App {
         self.request_redraw();
     }
 
+    /// Offer a clean copy of the file on screen: put the box up, having read
+    /// what the file is actually carrying.
+    ///
+    /// Read first, then offered. A box that said "strip metadata" before knowing
+    /// whether there is any would be asking a person to authorise nothing, and a
+    /// file with nothing to strip is told so rather than copied for no reason.
+    fn begin_clean(&mut self) {
+        let Some(path) = self.file_on_screen() else {
+            return;
+        };
+
+        let Some(format) = self.format_on_screen() else {
+            self.interface.toast("this file's kind is not known", Instant::now());
+            self.request_redraw();
+            return;
+        };
+        if !crate::scrub::supported(format) {
+            self.interface.toast(
+                format!("{} cannot be cleaned: {}", name_of(&path), crate::scrub::Refusal::Unsupported.reason()),
+                Instant::now(),
+            );
+            self.request_redraw();
+            return;
+        }
+
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.report(anyhow::Error::new(error).context(format!("reading {}", name_of(&path))));
+                return;
+            }
+        };
+
+        let found = match crate::scrub::survey(&bytes, format) {
+            Ok(found) => found,
+            Err(refusal) => {
+                self.interface.toast(format!("{}: {}", name_of(&path), refusal.reason()), Instant::now());
+                self.request_redraw();
+                return;
+            }
+        };
+
+        // The orientation the file carries, which is the one field that is both
+        // metadata and load-bearing. `shown.orientation` is what the file says;
+        // the turn on screen is not part of this, because a clean copy is about
+        // the file rather than about how it is being looked at.
+        let orientation = self.shown.as_ref().map(|shown| shown.orientation).unwrap_or_default();
+        let turn = crate::jpeg_lossless::Turn::of(orientation);
+        let bakeable =
+            turn != crate::jpeg_lossless::Turn::None && format == crate::format::Format::Jpeg && matches!(crate::jpeg_lossless::turn(&bytes, turn), Ok(Ok(_)));
+
+        if !found.anything(crate::scrub::Keep::Profile) && turn == crate::jpeg_lossless::Turn::None {
+            self.interface.toast(format!("{} carries nothing to strip", name_of(&path)), Instant::now());
+            self.request_redraw();
+            return;
+        }
+
+        self.interface.begin_clean(&name_of(&path), found, describe_turn(orientation), bakeable);
+        self.request_redraw();
+    }
+
+    /// Write the clean copy the box asked for.
+    ///
+    /// Beside the original, never over it. A scrub is not an edit of the
+    /// photograph: it makes the version that goes to somebody else, and the one
+    /// that stays is the one with the camera and the date in it. Overwriting
+    /// would be a viewer deciding that the owner no longer wants their own
+    /// metadata, which is not a decision a viewer gets to make.
+    fn write_clean_copy(&mut self, keep: crate::scrub::Keep, bake_turn: bool) {
+        let Some(path) = self.file_on_screen() else {
+            return;
+        };
+        let Some(format) = self.format_on_screen() else {
+            return;
+        };
+
+        let outcome = self.clean_copy(&path, format, keep, bake_turn);
+        match outcome {
+            Ok((name, note)) => {
+                let message = match note {
+                    Some(note) => format!("{name} — {note}"),
+                    None => format!("{name} saved clean"),
+                };
+                self.interface.toast(message, Instant::now());
+            }
+            Err(error) => self.report(error),
+        }
+        self.request_redraw();
+    }
+
+    /// Build the clean copy and put it beside the original.
+    ///
+    /// Returns the new file's name, and a note when something the box offered
+    /// could not be done — a bake that the file's pixels would not take. The
+    /// note is not an error: everything else was still done, and saying so is
+    /// better than either failing the whole copy or staying quiet about it.
+    fn clean_copy(
+        &mut self,
+        path: &Path,
+        format: crate::format::Format,
+        keep: crate::scrub::Keep,
+        bake_turn: bool,
+    ) -> anyhow::Result<(String, Option<String>)> {
+        let bytes = std::fs::read(path).with_context(|| format!("reading {}", name_of(path)))?;
+
+        let orientation = self.shown.as_ref().map(|shown| shown.orientation).unwrap_or_default();
+        let turn = crate::jpeg_lossless::Turn::of(orientation);
+
+        // The turn goes in first, because baking it is what makes the
+        // orientation tag safe to remove. Out of order, the tag would be gone
+        // before the pixels were turned and the picture would be left sideways.
+        let mut note = None;
+        let mut carried = bytes;
+        if bake_turn && turn != crate::jpeg_lossless::Turn::None {
+            if format == crate::format::Format::Jpeg {
+                match crate::jpeg_lossless::turn(&carried, turn) {
+                    Ok(Ok(turned)) => carried = turned,
+                    Ok(Err(refusal)) => note = Some(format!("the turn was kept as a tag: {}", refusal.reason())),
+                    Err(error) => return Err(error),
+                }
+            } else {
+                note = Some("the turn was kept as a tag: only a JPEG's pixels can be turned without re-compressing them".to_string());
+            }
+        }
+
+        // The orientation survives the scrub when the pixels were not turned:
+        // stripping it from a photograph that still needs it is the one way a
+        // clean copy could make the picture wrong rather than anonymous.
+        let keep_orientation = note.is_some() || !bake_turn;
+        let cleaned = crate::scrub::scrub(&carried, format, keep).map_err(|refusal| anyhow::anyhow!("{}", refusal.reason()))?;
+        let cleaned = if keep_orientation && turn != crate::jpeg_lossless::Turn::None {
+            // Put the tag back, because the picture still needs it. Written into
+            // the scrubbed file rather than kept out of the scrub, so there is
+            // one rule about what a scrub removes and one exception applied
+            // afterwards where it can be seen.
+            restore_orientation(&cleaned, format, orientation)?
+        } else {
+            cleaned
+        };
+
+        let folder = path.parent().ok_or_else(|| anyhow::anyhow!("there is nowhere to put the copy"))?;
+        let stem = path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "picture".to_string());
+        let extension = path
+            .extension()
+            .map(|extension| extension.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "jpg".to_string());
+        let destination = free_name_tagged(folder, &stem, "clean", &extension).ok_or_else(|| anyhow::anyhow!("there is nowhere to put the copy"))?;
+
+        std::fs::write(&destination, cleaned).with_context(|| format!("writing {}", name_of(&destination)))?;
+        Ok((name_of(&destination), note))
+    }
+
     /// Send the file on screen to the recycle bin and move on.
     ///
     /// The bin, never oblivion — see the `files` module. Nothing is asked
@@ -1915,6 +2071,11 @@ impl App {
             return None;
         }
         Some(shown.path.clone())
+    }
+
+    /// What kind of file the picture on screen came from.
+    fn format_on_screen(&self) -> Option<crate::format::Format> {
+        self.shown.as_ref().and_then(|shown| shown.format)
     }
 
     /// Show something else, the file on screen having left the folder.
@@ -2557,6 +2718,11 @@ impl App {
         if let Some(action) = self.interface.take_crop() {
             self.act_on_crop(action);
         }
+        // And what the clean-copy box committed, collected here for the same
+        // reason: it writes a file beside the original.
+        if let Some(crate::interface::Cleaned::Copy { keep, bake_turn }) = self.interface.take_clean() {
+            self.write_clean_copy(keep, bake_turn);
+        }
         // What the choice in the box would cost, refreshed while it is up: the
         // format can be changed in it, and a warning about the format chosen a
         // moment ago is worse than none.
@@ -2773,6 +2939,8 @@ enum Chord {
     Paste,
     SaveTurn,
     SaveAs,
+    /// Save a copy with the metadata taken out.
+    CleanCopy,
 }
 
 /// Which way a key press goes, given the modifiers held.
@@ -2847,6 +3015,7 @@ fn chord_for(key: &Key) -> Option<Chord> {
         // doing one thing and no key for the other.
         "S" => Some(Chord::SaveAs),
         "s" => Some(Chord::SaveTurn),
+        "m" => Some(Chord::CleanCopy),
         _ => None,
     }
 }
@@ -2862,13 +3031,85 @@ fn chord_for(key: &Key) -> Option<Chord> {
 /// `photo-crop-2.jpg`. The search is bounded because an unbounded one on a
 /// folder that cannot be written to would spin rather than report.
 fn free_name(folder: &Path, stem: &str, extension: &str) -> Option<PathBuf> {
-    let first = folder.join(format!("{stem}-crop.{extension}"));
+    free_name_tagged(folder, stem, "crop", extension)
+}
+
+/// A path beside `folder` that nothing is using yet, built from `stem` and the
+/// word that says what made it.
+///
+/// The general form of [`free_name`]. `tag` is what distinguishes the new file
+/// from the one it came from — `photo-crop.jpg`, `photo-clean.jpg` — and it is
+/// part of the name rather than a suffix on the stem so that a folder full of
+/// them reads as what it is.
+fn free_name_tagged(folder: &Path, stem: &str, tag: &str, extension: &str) -> Option<PathBuf> {
+    let first = folder.join(format!("{stem}-{tag}.{extension}"));
     if !first.exists() {
         return Some(first);
     }
     (2..1000)
-        .map(|number| folder.join(format!("{stem}-crop-{number}.{extension}")))
+        .map(|number| folder.join(format!("{stem}-{tag}-{number}.{extension}")))
         .find(|candidate| !candidate.exists())
+}
+
+/// How a picture has to be turned for its orientation tag to become
+/// unnecessary, in the words a person reads on a checkbox.
+///
+/// `None` when the file is already upright, in which case there is nothing to
+/// bake and the box says so.
+fn describe_turn(orientation: Orientation) -> Option<String> {
+    let words = match orientation {
+        Orientation::Normal => return None,
+        Orientation::Rotate90 => "a quarter clockwise",
+        Orientation::Rotate180 => "half round",
+        Orientation::Rotate270 => "a quarter anticlockwise",
+        Orientation::FlipHorizontal => "left to right",
+        Orientation::FlipVertical => "top to bottom",
+        Orientation::Transpose => "across the diagonal",
+        Orientation::Transverse => "across the other diagonal",
+    };
+    Some(words.to_string())
+}
+
+/// Put an orientation tag back into a file a scrub has just emptied.
+///
+/// The one exception to "a clean copy states nothing about itself", and it earns
+/// it: a photograph taken sideways whose orientation is removed without its
+/// pixels being turned is shown sideways by everything, for ever. Losing the
+/// camera's name makes a file anonymous; losing this makes it wrong.
+///
+/// Written after the scrub rather than excluded from it so that there is one
+/// rule about what a scrub removes — everything — and one exception, applied
+/// where a reader can see it.
+fn restore_orientation(bytes: &[u8], format: crate::format::Format, orientation: Orientation) -> anyhow::Result<Vec<u8>> {
+    // `little_exif` writes to a file rather than to a buffer, so the copy goes
+    // through a temporary one. Written beside nothing the user can see, and
+    // removed either way.
+    let directory = std::env::temp_dir();
+    let name = format!("nitid-clean-{}-{}.{}", std::process::id(), nanos(), extension_for(format));
+    let scratch = directory.join(name);
+    std::fs::write(&scratch, bytes).with_context(|| "staging the clean copy")?;
+
+    let outcome = crate::rotate::save_orientation(&scratch, orientation).and_then(|()| std::fs::read(&scratch).map_err(anyhow::Error::new));
+    let _ = std::fs::remove_file(&scratch);
+    outcome
+}
+
+/// A count of nanoseconds, to keep two clean copies made in one second apart.
+fn nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_nanos())
+        .unwrap_or(0)
+}
+
+/// The extension a format's files are given, for a temporary file that has to
+/// look like one.
+fn extension_for(format: crate::format::Format) -> &'static str {
+    match format {
+        crate::format::Format::Png => "png",
+        crate::format::Format::WebP => "webp",
+        _ => "jpg",
+    }
 }
 
 /// A file's name on its own, for a message. Falls back to the whole path,
@@ -3433,7 +3674,7 @@ impl ApplicationHandler<Event> for App {
                 // this, typing "gull.jpg" would step to the next picture on
                 // the "g", turn it on the "r", and delete nothing only by
                 // luck. Escape is left to egui, which the box watches for.
-                if self.interface.renaming() || self.interface.saving() {
+                if self.interface.renaming() || self.interface.saving() || self.interface.cleaning() {
                     return;
                 }
                 match route_for(self.modifiers) {
@@ -4276,7 +4517,7 @@ mod tests {
             .map(|(key, _)| *key)
             .filter(|key| (key.starts_with("Ctrl+") || key.starts_with("Alt+")) && !key.contains("Drag") && !key.contains("Wheel"))
             .collect();
-        assert_eq!(advertised.len(), 9, "the sheet lists {advertised:?}, which is not the nine chords");
+        assert_eq!(advertised.len(), 10, "the sheet lists {advertised:?}, which is not the ten chords");
 
         // What each letter chord answers with, so two rows of the sheet
         // cannot quietly be the same key. Until v0.30.0 `chord_for` matched

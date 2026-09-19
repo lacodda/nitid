@@ -278,6 +278,13 @@ pub struct Interface {
     saving: Option<Saving>,
     /// Whether the save box has been given the keyboard yet.
     save_focused: bool,
+    /// The clean-copy box, when it is up.
+    cleaning: Option<Cleaning>,
+    /// What the clean-copy box committed this frame, waiting to be collected.
+    ///
+    /// Held for the reason the others are: laying out again before it is
+    /// collected would write the file twice.
+    cleaned: Option<Cleaned>,
     /// The minimap's picture, uploaded once per image rather than per frame.
     ///
     /// Keyed by the copy it was made from, so a step to another picture
@@ -390,6 +397,8 @@ impl Interface {
             renaming: None,
             rename_focused: false,
             saving: None,
+            cleaning: None,
+            cleaned: None,
             save_focused: false,
             minimap_texture: None,
             passport_shown: false,
@@ -477,6 +486,39 @@ impl Interface {
         if let Some(saving) = self.saving.as_mut() {
             saving.losses = losses;
         }
+    }
+
+    /// Put the clean-copy box up.
+    ///
+    /// `found` is what the file turns out to be carrying, and `turn` is the turn
+    /// that would be baked into the pixels — both worked out by the code that
+    /// does the work, so the box cannot promise something different from what
+    /// happens. `bakeable` says whether this file's pixels can take the turn
+    /// without an encoder; when they cannot, the box offers to drop the tag
+    /// instead and says what that costs.
+    pub fn begin_clean(&mut self, name: &str, found: crate::scrub::Found, turn: Option<String>, bakeable: bool) {
+        self.cleaning = Some(Cleaning {
+            name: name.to_string(),
+            found,
+            turn,
+            bakeable,
+            keep: crate::scrub::Keep::Profile,
+            // Baking the turn starts on when it can be done losslessly: a
+            // picture whose orientation is stripped without it becomes a
+            // picture shown sideways, which is a worse surprise than a file
+            // whose bytes moved.
+            bake_turn: bakeable,
+        });
+    }
+
+    /// Whether the clean-copy box is up.
+    pub fn cleaning(&self) -> bool {
+        self.cleaning.is_some()
+    }
+
+    /// Take what the clean-copy box committed, if it did this frame.
+    pub fn take_clean(&mut self) -> Option<Cleaned> {
+        self.cleaned.take()
     }
 
     /// Whether the rename box is up, which is what tells the application that
@@ -646,6 +688,8 @@ impl Interface {
         let mut rename_outcome = None;
         let mut crop_action = None;
         let mut saving = self.saving.take();
+        let mut cleaning = self.cleaning.take();
+        let mut clean_outcome = None;
         let mut save_focused = self.save_focused;
         let mut save_outcome = None;
         // Whether any sorting folder is set, for the sheet's note.
@@ -703,6 +747,9 @@ impl Interface {
             if let Some(save) = saving.as_mut() {
                 save_outcome = save_box(ui, save, &mut save_focused);
             }
+            if let Some(clean) = cleaning.as_mut() {
+                clean_outcome = clean_box(ui, clean);
+            }
             if status.hovering {
                 drop_invitation(ui);
             }
@@ -732,6 +779,19 @@ impl Interface {
             Some(Saved::As { name, target, bake, quality }) => Some(Saved::As { name, target, bake, quality }),
             Some(Saved::Cancelled) | None => None,
         };
+        self.cleaning = match clean_outcome {
+            Some(_) => None,
+            None => cleaning,
+        };
+        self.cleaned = match clean_outcome {
+            Some(Cleaned::Copy { keep, bake_turn }) => Some(Cleaned::Copy { keep, bake_turn }),
+            Some(Cleaned::Cancelled) | None => None,
+        };
+        // The box appearing and the box going away both have to be drawn, the
+        // same way the others are.
+        if clean_outcome.is_some() {
+            self.owed_frame = true;
+        }
         // Held for the application to collect rather than added to what
         // `layout` returns: a fourth element on that tuple would make every
         // call site say what it is ignoring. A frame is owed either way — the
@@ -1816,6 +1876,137 @@ impl Saving {
     }
 }
 
+/// A clean copy in the making: what the box is showing before anything is
+/// written.
+pub struct Cleaning {
+    /// The file's name, so the box can say what it is about.
+    name: String,
+    /// What the file was found to be carrying.
+    found: crate::scrub::Found,
+    /// How the picture would have to be turned for its orientation tag to
+    /// become unnecessary, in words, or `None` when it is already upright.
+    turn: Option<String>,
+    /// Whether that turn can be baked into the pixels without an encoder.
+    bakeable: bool,
+    keep: crate::scrub::Keep,
+    bake_turn: bool,
+}
+
+/// What the clean-copy box decided this frame.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Cleaned {
+    /// Write a clean copy this way.
+    Copy {
+        keep: crate::scrub::Keep,
+        /// Whether to turn the pixels so the orientation tag can go.
+        bake_turn: bool,
+    },
+    /// Put the box away and write nothing.
+    Cancelled,
+}
+
+/// The clean-copy box: say what the file is carrying, and what will be left.
+///
+/// Built around naming what goes rather than asking for trust. "Strip metadata"
+/// on its own is a promise a person cannot check; "EXIF, XMP (4.2 kB)" is a
+/// statement they can weigh, and it is the module that does the work which
+/// supplies it.
+///
+/// The orientation gets its own line because it is the one field that is both
+/// metadata and load-bearing: strip it from a photograph taken sideways and the
+/// picture is shown sideways ever after. So the box offers to put the turn into
+/// the pixels first, and when that cannot be done without an encoder it says so
+/// instead of silently doing one or the other.
+fn clean_box(ui: &mut egui::Ui, cleaning: &mut Cleaning) -> Option<Cleaned> {
+    let mut outcome = None;
+
+    egui::Window::new("Save a clean copy")
+        .collapsible(false)
+        .resizable(false)
+        // As the other boxes: a viewer that lays out only on demand cannot
+        // animate, so a faded window stalls half-drawn.
+        .fade_in(false)
+        .fade_out(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(ui.ctx(), |ui| {
+            ui.set_min_width(400.0);
+
+            ui.label(egui::RichText::new(&cleaning.name).strong());
+            ui.add_space(6.0);
+
+            // What is there, named. The one line a person reads to decide.
+            ui.label(format!("Carries: {}", cleaning.found.describe()));
+            ui.label(
+                egui::RichText::new("The picture itself is copied across untouched — no encoder runs, so nothing is re-compressed.")
+                    .weak()
+                    .small(),
+            );
+
+            ui.add_space(8.0);
+            ui.checkbox(
+                &mut cleaning.bake_turn,
+                match cleaning.turn.as_deref() {
+                    Some(turn) => format!("Turn the pixels {turn}, so the orientation can go"),
+                    None => "Turn the pixels (this one is already upright)".to_string(),
+                },
+            );
+            if cleaning.turn.is_some() {
+                ui.label(
+                    egui::RichText::new(if cleaning.bakeable {
+                        "Done by moving the compression's own coefficients: the picture is not decoded, and nothing is re-compressed."
+                    } else {
+                        "This file's pixels cannot be turned without re-compressing them, so the orientation tag is kept instead. Everything else still goes."
+                    })
+                    .weak()
+                    .small(),
+                );
+            }
+            ui.add_space(4.0);
+            let mut strip_profile = cleaning.keep == crate::scrub::Keep::Nothing;
+            ui.checkbox(&mut strip_profile, "Take the colour profile too");
+            cleaning.keep = if strip_profile {
+                crate::scrub::Keep::Nothing
+            } else {
+                crate::scrub::Keep::Profile
+            };
+            ui.label(
+                egui::RichText::new(if strip_profile {
+                    "The file will state nothing about its colour, and whoever opens it will read the numbers as sRGB.                      Right only if that is what they are."
+                } else {
+                    "Kept. A profile says nothing about you, the camera or the place — and a picture without one is not anonymous, it is wrong."
+                })
+                .weak()
+                .small(),
+            );
+
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.button("Save a copy").clicked() {
+                    outcome = Some(Cleaned::Copy {
+                        keep: cleaning.keep,
+                        bake_turn: cleaning.bake_turn,
+                    });
+                }
+                if ui.button("Cancel").clicked() {
+                    outcome = Some(Cleaned::Cancelled);
+                }
+                ui.label(egui::RichText::new("Enter to save, Esc to cancel").weak().small());
+            });
+
+            if ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                outcome = Some(Cleaned::Copy {
+                    keep: cleaning.keep,
+                    bake_turn: cleaning.bake_turn,
+                });
+            }
+            if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                outcome = Some(Cleaned::Cancelled);
+            }
+        });
+
+    outcome
+}
+
 /// What the rename box decided this frame.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Renamed {
@@ -2452,6 +2643,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("F", "mirror it left to right; Shift+F top to bottom"),
     ("Ctrl+S", "write the turn into the file, without touching its pixels"),
     ("Ctrl+Shift+S", "save as another format, with the colour you see"),
+    ("Ctrl+M", "save a copy with the camera, date and place taken out"),
     ("E", "open this file in the program that edits it"),
     ("Alt+1-9", "open it in the program set for that key"),
     ("+ -", "zoom in / out"),
@@ -3949,6 +4141,136 @@ mod tests {
         // panics on drop if nobody did. Nothing here draws to a device.
         output.textures_delta.clear();
         interface.context().tessellate(output.shapes, 1.0)
+    }
+
+    /// The clean-copy box says what the file carries, rather than asking for
+    /// trust.
+    ///
+    /// The one thing about this feature a person can actually check before they
+    /// press the button is what the box tells them, so it is checked here — by
+    /// laying the box out and reading the text off the shapes, which is as close
+    /// to looking at the screen as a test gets.
+    ///
+    /// Each case names something different, and the differences are the point:
+    /// a box that said the same thing whatever the file held would be a box that
+    /// had stopped answering.
+    #[test]
+    fn the_clean_box_names_what_the_file_carries() {
+        /// Lay the box out over `found` and read back every word on screen.
+        fn shown(found: crate::scrub::Found, turn: Option<&str>, bakeable: bool) -> String {
+            let mut interface = Interface::new();
+            let mut config = Config::default();
+            interface.begin_clean("photograph.jpg", found, turn.map(str::to_string), bakeable);
+
+            let mut said = String::new();
+            for frame in 0..2 {
+                let raw = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 600.0))),
+                    events: Vec::new(),
+                    ..Default::default()
+                };
+                let (mut output, _, _) = interface.layout(raw, &status(), &mut config, Instant::now());
+                output.textures_delta.clear();
+                if frame == 1 {
+                    for shape in &output.shapes {
+                        collect_text(&shape.shape, &mut said);
+                    }
+                }
+                drop(interface.context().tessellate(output.shapes, 1.0));
+            }
+            said
+        }
+
+        let carrying = crate::scrub::Found {
+            exif: true,
+            xmp: true,
+            iptc: false,
+            profile: true,
+            bytes: 4096,
+        };
+
+        // A photograph from a phone held sideways: the box names what is there,
+        // says which way the pixels would turn, and says the profile stays.
+        let said = shown(carrying, Some("a quarter clockwise"), true);
+        assert!(said.contains("photograph.jpg"), "the box does not say which file it is about: {said}");
+        assert!(said.contains("EXIF, XMP"), "the box does not name what is carried: {said}");
+        assert!(said.contains("4.0 kB"), "the box does not say how much: {said}");
+        assert!(said.contains("a quarter clockwise"), "the box does not say which way the pixels turn: {said}");
+        assert!(said.contains("Save a copy"), "the box has no way to say yes: {said}");
+        assert!(said.contains("Cancel"), "the box has no way out: {said}");
+        // The claim the whole feature rests on, said where the choice is made.
+        assert!(
+            said.contains("no encoder runs"),
+            "the box does not say the picture is not re-compressed: {said}"
+        );
+
+        // A file whose pixels cannot take the turn says so instead of quietly
+        // doing one thing or the other.
+        let refused = shown(carrying, Some("half round"), false);
+        assert!(
+            refused.contains("cannot be turned without re-compressing"),
+            "the box does not say the turn will be kept as a tag: {refused}"
+        );
+        assert!(
+            refused.contains("Everything else still goes"),
+            "the box does not say the rest is still removed: {refused}"
+        );
+
+        // And one that carries nothing says that, rather than an empty list.
+        let empty = shown(crate::scrub::Found::default(), None, false);
+        assert!(empty.contains("nothing to strip"), "an empty file is not described as empty: {empty}");
+    }
+
+    /// No sentence the viewer shows has a hole in the middle of it.
+    ///
+    /// A guard against a defect that is invisible to every other test here: a
+    /// Rust string broken across source lines with a trailing `\` keeps the
+    /// next line's indentation unless the continuation is written exactly
+    /// right, and `cargo fmt` will happily re-indent it into a run of twenty
+    /// spaces. The text still says the right words, so a test that asks whether
+    /// a phrase is present passes — and the box shows "a picture without one is
+    /// not                      anonymous".
+    ///
+    /// Found by reading the output of a failing assertion, which is the only
+    /// reason it was noticed at all.
+    #[test]
+    fn nothing_the_viewer_says_has_a_gap_in_it() {
+        let carrying = crate::scrub::Found {
+            exif: true,
+            xmp: true,
+            iptc: true,
+            profile: true,
+            bytes: 4096,
+        };
+
+        // Every box that shows prose, laid out and read back.
+        for (name, said) in [
+            ("the clean-copy box", {
+                let mut interface = Interface::new();
+                let mut config = Config::default();
+                interface.begin_clean("photograph.jpg", carrying, Some("half round".to_string()), false);
+                let mut said = String::new();
+                for frame in 0..2 {
+                    let raw = egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 600.0))),
+                        events: Vec::new(),
+                        ..Default::default()
+                    };
+                    let (mut output, _, _) = interface.layout(raw, &status(), &mut config, Instant::now());
+                    output.textures_delta.clear();
+                    if frame == 1 {
+                        for shape in &output.shapes {
+                            collect_text(&shape.shape, &mut said);
+                        }
+                    }
+                    drop(interface.context().tessellate(output.shapes, 1.0));
+                }
+                said
+            }),
+            ("the key sheet", KEYS.iter().map(|(_, what)| *what).collect::<Vec<_>>().join(" | ")),
+        ] {
+            assert!(!said.contains("  "), "{name} shows a run of spaces in the middle of a sentence: {said:?}");
+        }
     }
 
     /// The crop overlay draws, and draws where the box is.
