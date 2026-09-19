@@ -656,6 +656,72 @@ fn baking_shows_the_same_picture_the_tag_asked_for() {
     let _ = std::fs::remove_dir_all(&directory);
 }
 
+/// When the turn cannot be baked, the orientation must survive the scrub.
+///
+/// The branch a ragged picture takes, and the one where a mistake is worst: the
+/// bake is refused, so the pixels are still sideways, and a scrub that removed
+/// the orientation with the rest of the EXIF would leave a photograph shown on
+/// its side by every program for ever. Losing the camera's name makes a file
+/// anonymous; losing this makes it wrong.
+///
+/// Held end to end — scrub, then read the orientation back through the viewer's
+/// own front door — because the two halves live in different modules and the
+/// bug would be in the handover.
+#[test]
+fn a_refused_bake_leaves_the_orientation_where_the_picture_still_needs_it() {
+    // 100x60 at 4:2:0: neither dimension is a multiple of the 16-pixel grid, so
+    // a turn would bring a partial edge inside the picture.
+    let ragged = a_jpeg(100, 60, 90);
+    assert_eq!(
+        turn_losslessly(&ragged, Turn::Quarter).expect("ran").expect_err("a ragged file was turned"),
+        nitid::testing::Refusal::OffGrid,
+        "the fixture is not the ragged one this test is about"
+    );
+
+    let directory = std::env::temp_dir().join(format!("nitid-ragged-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).expect("a directory");
+    let path = directory.join("ragged.jpg");
+    std::fs::write(&path, &ragged).expect("written");
+    nitid::testing::save_orientation(&path, nitid::testing::Orientation::Rotate90).expect("EXIF written");
+    let sideways = std::fs::read(&path).expect("read back");
+
+    // A plain scrub takes the orientation with everything else — which is
+    // correct for the module, and is exactly why the application puts it back.
+    let bare = scrub(&sideways, Format::Jpeg, Keep::Profile).expect("a scrub");
+    assert_eq!(
+        decode_here(&bare).expect("decoded").orientation,
+        nitid::testing::Orientation::Normal,
+        "the scrub is supposed to remove the orientation; if it does not, the application's exception is dead code"
+    );
+
+    // Put it back the way the application does, and the picture is upright
+    // again while the camera is still gone.
+    std::fs::write(&path, &bare).expect("written");
+    nitid::testing::save_orientation(&path, nitid::testing::Orientation::Rotate90).expect("EXIF written");
+    let restored = std::fs::read(&path).expect("read back");
+
+    let after = decode_here(&restored).expect("decoded");
+    assert_eq!(
+        after.orientation,
+        nitid::testing::Orientation::Rotate90,
+        "the orientation did not survive being put back, so a sideways photograph would stay sideways"
+    );
+    let found = survey(&restored, Format::Jpeg).expect("a survey");
+    assert!(found.exif, "an orientation has to live in EXIF, so there must be some");
+
+    // And what is in that EXIF is the orientation and nothing else: the camera,
+    // the lens and the date do not come back with it.
+    let metadata = nitid::testing::read_metadata(&restored);
+    assert!(
+        metadata.camera.is_empty(),
+        "putting the orientation back brought the camera with it: {:?}",
+        metadata.camera
+    );
+    assert!(metadata.location.is_none(), "putting the orientation back brought the place with it");
+
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
 // ---------------------------------------------------------------------------
 // Scrubbing, over files a third party wrote
 // ---------------------------------------------------------------------------
