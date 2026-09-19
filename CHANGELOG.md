@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.32.0] - 2026-09-19
+
+### Documentation
+- Give nitid a documentation site and a shopfront readme
+- Say how a clean copy is made, and what it keeps
+
+### Features
+- Drop a file's metadata by not copying it
+- Turn a JPEG's pixels without running an encoder
+- Save a copy with the metadata taken out, on Ctrl+M
+
+### Testing
+- Hold the branch where the turn is refused
+
 ## [0.31.0] - 2026-09-16
 
 ### Bug Fixes
@@ -21,6 +35,7 @@ All notable changes to this project are documented in this file.
 - Hold the crop to a real subsampled JPEG
 - Hold the crop to a name nothing is using
 - Earn the warning about the extra precision
+
 ## [0.30.0] - 2026-09-14
 
 ### Features
@@ -31,6 +46,7 @@ All notable changes to this project are documented in this file.
 
 ### Testing
 - Hold the export to a picture with detail in it
+
 ## [0.29.0] - 2026-09-10
 
 ### Documentation
@@ -38,6 +54,7 @@ All notable changes to this project are documented in this file.
 
 ### Features
 - Keep a turn in the file, and mirror the picture
+
 ## [0.28.0] - 2026-09-10
 
 ### Documentation
@@ -48,15 +65,18 @@ All notable changes to this project are documented in this file.
 
 ### Testing
 - Build the path from the platform's separator
+
 ## [0.27.2] - 2026-09-10
 
 ### Bug Fixes
 - Let egui say how many frames a panel needs
+
 ## [0.27.1] - 2026-09-09
 
 ### Bug Fixes
 - Draw the arrow instead of a box
 - Open a panel on the first click, not on the next move
+
 ## [0.27.0] - 2026-09-09
 
 ### Bug Fixes
@@ -74,6 +94,7 @@ All notable changes to this project are documented in this file.
 
 ### Testing
 - Ask the bin whether the file reached it
+
 ## [0.26.0] - 2026-09-09
 
 ### Documentation
@@ -81,6 +102,7 @@ All notable changes to this project are documented in this file.
 
 ### Features
 - Where in the picture the window is
+
 ## [0.25.0] - 2026-09-07
 
 ### Documentation
@@ -88,6 +110,7 @@ All notable changes to this project are documented in this file.
 
 ### Features
 - The pixels around the pointer, magnified
+
 ## [0.24.0] - 2026-09-05
 
 ### Documentation
@@ -95,6 +118,7 @@ All notable changes to this project are documented in this file.
 
 ### Features
 - A place for the choices, and the first sixteen in it
+
 ## [0.23.1] - 2026-09-04
 
 ### Bug Fixes
@@ -105,6 +129,7 @@ All notable changes to this project are documented in this file.
 
 ### Documentation
 - Hold the README to the code, and say what install leaves behind
+
 ## [0.23.0] - 2026-09-03
 
 ### Bug Fixes
@@ -115,6 +140,7 @@ All notable changes to this project are documented in this file.
 
 ### Features
 - Files in by dropping, the picture out by dragging
+
 ## [0.22.0] - 2026-09-01
 
 ### Bug Fixes
@@ -125,6 +151,7 @@ All notable changes to this project are documented in this file.
 
 ### Features
 - The picture out, a picture in, and the path for a terminal
+
 ## [0.21.0] - 2026-09-01
 
 ### Documentation
@@ -132,10 +159,12 @@ All notable changes to this project are documented in this file.
 
 ### Features
 - A clipping zebra, an eyedropper, and a colour passport
+
 ## [0.20.1] - 2026-08-31
 
 ### Bug Fixes
 - Put the install directory on the PATH
+
 ## [0.20.0] - 2026-08-31
 
 ### Documentation
@@ -143,6 +172,7 @@ All notable changes to this project are documented in this file.
 
 ### Features
 - A histogram of the file's own values, and a loupe held at 100%
+
 ## [0.19.0] - 2026-08-28
 
 ### Documentation
@@ -150,6 +180,7 @@ All notable changes to this project are documented in this file.
 
 ### Features
 - A panel saying what the file says about itself
+
 ## [0.18.0] - 2026-08-28
 
 ### Documentation
@@ -157,6 +188,7 @@ All notable changes to this project are documented in this file.
 
 ### Features
 - A zoom lock, a viewing rotation, and a backdrop for transparency
+
 ## [0.17.0] - 2026-08-28
 
 ### Documentation
@@ -167,6 +199,7 @@ All notable changes to this project are documented in this file.
 
 ### Performance
 - Let the picture reach the screen before the chrome
+
 ## [0.16.0] - 2026-08-26
 
 ### Bug Fixes
@@ -175,30 +208,37 @@ All notable changes to this project are documented in this file.
 
 ### Features
 - Hand a file to the window already open
+
 ## [0.15.0] - 2026-08-26
 
 ### Features
 - Draw images past the texture limit as tiles
+
 ## [0.14.0] - 2026-08-25
 
 ### Features
 - Carry 10- and 12-bit sources through at sixteen bits
+
 ## [0.13.0] - 2026-08-25
 
 ### Features
 - Output high dynamic range, and follow the display
+
 ## [0.12.0] - 2026-08-23
 
 ### Features
 - Play GIF, APNG and animated WebP
+
 ## [0.11.0] - 2026-08-22
 
 ### Features
 - Close the network to the decoder and cheapen the bridge
+
 ## [0.10.0] - 2026-08-21
 
 ### Features
 - Show a HEIC from its thumbnail, and read the colour it states
+
 ## [0.9.0] - 2026-08-21
 
 ### Features
@@ -209,14 +249,17 @@ All notable changes to this project are documented in this file.
 
 ### style
 - Slice fixed-size chunks with as_chunks
+
 ## [0.8.0] - 2026-08-20
 
 ### Features
 - Open AVIF, with its colour applied on the GPU
+
 ## [0.7.0] - 2026-08-19
 
 ### Features
 - Open HEIC, the format a phone photographs in
+
 ## [0.6.0] - 2026-08-14
 
 ### Bug Fixes
@@ -225,6 +268,7 @@ All notable changes to this project are documented in this file.
 ### Features
 - Define the protocol between the viewer and a decoder process
 - Decode in a process that can do nothing else
+
 ## [0.5.0] - 2026-08-14
 
 ### Bug Fixes
@@ -235,6 +279,7 @@ All notable changes to this project are documented in this file.
 
 ### Testing
 - Do not require the machine to have fonts installed
+
 ## [0.4.2] - 2026-08-14
 
 ### Bug Fixes
@@ -245,10 +290,12 @@ All notable changes to this project are documented in this file.
 
 ### Features
 - Open JPEG XL
+
 ## [0.4.1] - 2026-08-12
 
 ### Bug Fixes
 - Show an untagged image as it is, without assuming sRGB
+
 ## [0.4.0] - 2026-08-12
 
 ### CI
@@ -256,15 +303,18 @@ All notable changes to this project are documented in this file.
 
 ### Features
 - Open WebP, and name every format in one place
+
 ## [0.3.1] - 2026-08-10
 
 ### Bug Fixes
 - Remove the application key left by v0.2.0
 - Keep Cargo.lock in step with the manifest
+
 ## [0.3.0] - 2026-08-10
 
 ### Features
 - Convert images to the display's colour profile on the GPU
+
 ## [0.2.0] - 2026-08-10
 
 ### Bug Fixes
@@ -273,6 +323,7 @@ All notable changes to this project are documented in this file.
 ### Features
 - Install nitid for the current user and register its file types
 - Show the embedded thumbnail first and decode off the event loop
+
 ## [0.1.0] - 2026-08-10
 
 ### CI
@@ -282,3 +333,4 @@ All notable changes to this project are documented in this file.
 - Scaffold the project
 - Add the lacodda line mark and derived assets
 - Show images in a window with zoom, pan, and folder navigation
+

@@ -28,7 +28,12 @@ body = """
 {% for commit in commits %}\
 - {{ commit.message | upper_first }}
 {% endfor %}\
-{% endfor %}\
+{% endfor %}
+{# A blank line after each version's last group, so the next `## [x.y.z]` is not
+   glued to it. Every release before 0.32.0 was written without one — Markdown
+   still renders the heading, so nothing complained, and the raw file read as
+   one run-on block. #}\
+
 """
 trim = true
 
