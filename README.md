@@ -38,6 +38,9 @@ difference, not the function.
 - **Tools for reading a picture**, not just looking at it: histogram, loupe,
   clipping warning, an eyedropper that reads in the file's terms and the
   display's.
+- **A copy without the camera, the date and the place.** `Ctrl+M` strips EXIF,
+  XMP and IPTC by not copying them - no encoder runs, so the photograph you send
+  is the photograph you took.
 - **One window.** Opening a second image hands it to the viewer already
   running, so a multi-select does not scatter windows across the desktop.
 - **Nothing that phones home.** The process that decodes the heavy formats has
@@ -89,10 +92,11 @@ app*. Full instructions: [Getting Started](https://lacodda.github.io/nitid/getti
 
 ## Status
 
-v0.31.0, in daily use on Windows. Startup, colour and HDR hold end to end;
+v0.32.0, in daily use on Windows. Startup, colour and HDR hold end to end;
 every modern still format opens and the animated ones play; images past what a
-GPU texture can hold are drawn as tiles. What landed in each version:
-[CHANGELOG](https://github.com/lacodda/nitid/blob/main/CHANGELOG.md).
+GPU texture can hold are drawn as tiles; a picture can be cropped, turned and
+stripped of its metadata without an encoder ever running. What landed in each
+version: [CHANGELOG](https://github.com/lacodda/nitid/blob/main/CHANGELOG.md).
 
 ## Documentation
 
