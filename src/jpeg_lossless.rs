@@ -200,6 +200,323 @@ pub fn crop(bytes: &[u8], rect: Rect) -> Result<std::result::Result<Vec<u8>, Ref
     Ok(Ok(write(bytes, &frame, &kept, rect)?))
 }
 
+/// Turn a JPEG's pixels, keeping every coefficient's value, with no encoder in
+/// the path.
+///
+/// The companion to [`crop`], and the same trick one step further. A crop moves
+/// whole blocks about; a turn moves the blocks *and* transposes the
+/// coefficients inside each one, which works because the discrete cosine
+/// transform of a transposed block is the transpose of its coefficients. A
+/// quarter turn is that transpose plus a sign flip on alternating rows or
+/// columns — the flip is what turns a mirror into a rotation.
+///
+/// Returns the new JPEG, or the reason it has to be done the other way.
+///
+/// # Why this needs the grid and a crop does not
+///
+/// The picture's dimensions need not be a multiple of the MCU size: the last
+/// block of a row is partial, and the pixels past the edge are padding the
+/// decoder throws away. That is harmless while the edge stays where it is. Turn
+/// the picture, and the padded edge becomes an interior one — the padding would
+/// appear as a seam of rubbish inside the picture. So a turn that would move a
+/// partial edge inwards is refused with [`Refusal::OffGrid`]: the honest answer
+/// is the encoder, not a seam nobody asked for.
+///
+/// A half turn is exempt from that on one axis at a time, and in practice on
+/// neither: it moves the right edge to the left and the bottom to the top, so
+/// both partial edges end up interior. Only a picture whose dimensions are a
+/// multiple of its grid can be turned at all, which is most photographs — a
+/// 4:2:0 sensor writes multiples of 16 — and the refusal names the case when it
+/// is not.
+pub fn turn(bytes: &[u8], turn: Turn) -> Result<std::result::Result<Vec<u8>, Refusal>> {
+    let frame = match Frame::read(bytes) {
+        Ok(frame) => frame,
+        Err(refusal) => return Ok(Err(refusal)),
+    };
+
+    if turn == Turn::None {
+        return Ok(Ok(bytes.to_vec()));
+    }
+
+    // Every component's blocks must tile its own plane exactly, or a turn
+    // brings padding inside the picture. Checked per component rather than on
+    // the MCU grid: a 4:2:0 chroma plane is half the size, and it is the
+    // chroma that is partial first.
+    let grid = frame.grid();
+    let width = u32::from(frame.width);
+    let height = u32::from(frame.height);
+    if !width.is_multiple_of(grid.width) || !height.is_multiple_of(grid.height) {
+        return Ok(Err(Refusal::OffGrid));
+    }
+
+    let coefficients = match decode_scan(bytes, &frame) {
+        Ok(coefficients) => coefficients,
+        Err(refusal) => return Ok(Err(refusal)),
+    };
+
+    // A turn that swaps the axes swaps the sampling factors with them, so the
+    // written frame header must describe the new shape. A component sampled
+    // 2x1 is 1x2 after a quarter turn, and a header left saying 2x1 would send
+    // the decoder looking for blocks in the wrong order.
+    let turned_frame = frame.turned(turn);
+    let turned = turn_blocks(&frame, &coefficients, turn);
+
+    // The new size is read off the turned frame rather than worked out again
+    // here. Two places that each decide what the turned picture measures are two
+    // places that can disagree, and the disagreement would be invisible: the
+    // header written from one and the scan written from the other still decode,
+    // into a picture that is the right size and the wrong shape.
+    let size = Rect::new(0, 0, u32::from(turned_frame.width), u32::from(turned_frame.height));
+    debug_assert_eq!(
+        (size.width, size.height),
+        if turn.swaps_axes() { (height, width) } else { (width, height) },
+        "the turned frame does not measure what turning this picture should"
+    );
+    Ok(Ok(write_turned(bytes, &frame, &turned_frame, &turned, size, turn)?))
+}
+
+/// Which way a picture is turned, in the four ways a JPEG can be turned without
+/// an encoder.
+///
+/// Deliberately not [`crate::image_source::Orientation`]: that has eight values
+/// because EXIF has eight, and the mirrored four are not what a person asks for
+/// here. [`Turn::of`] maps the eight onto these.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Turn {
+    #[default]
+    None,
+    Quarter,
+    Half,
+    ThreeQuarters,
+    /// Left to right.
+    FlipHorizontal,
+    /// Top to bottom.
+    FlipVertical,
+    /// Across the main diagonal.
+    Transpose,
+    /// Across the other diagonal.
+    Transverse,
+}
+
+impl Turn {
+    /// What has to be done to a file's pixels to make `orientation` unnecessary.
+    ///
+    /// The inverse, which is the part worth saying out loud: an orientation of
+    /// `Rotate90` means "the viewer must turn this a quarter clockwise to show
+    /// it upright", so baking it means turning the pixels that way and writing
+    /// `Normal`. For the four that are their own inverse it makes no difference;
+    /// for the two quarter turns it is the difference between upright and
+    /// upside-down-sideways.
+    pub fn of(orientation: crate::image_source::Orientation) -> Self {
+        use crate::image_source::Orientation;
+        match orientation {
+            Orientation::Normal => Turn::None,
+            Orientation::FlipHorizontal => Turn::FlipHorizontal,
+            Orientation::Rotate180 => Turn::Half,
+            Orientation::FlipVertical => Turn::FlipVertical,
+            Orientation::Transpose => Turn::Transpose,
+            Orientation::Rotate90 => Turn::Quarter,
+            Orientation::Transverse => Turn::Transverse,
+            Orientation::Rotate270 => Turn::ThreeQuarters,
+        }
+    }
+
+    /// Whether this turn makes the picture's width its height.
+    pub fn swaps_axes(self) -> bool {
+        matches!(self, Turn::Quarter | Turn::ThreeQuarters | Turn::Transpose | Turn::Transverse)
+    }
+
+    /// The turn as one transpose and two mirrors, in that order.
+    ///
+    /// The single description everything else here is derived from — the grid of
+    /// blocks in [`Turn::moves`] and the coefficients inside each block in
+    /// [`turn_block`]. Two hand-written tables would be two chances to write a
+    /// turn one way in one place and the other way in the other, which produces
+    /// a picture that is *nearly* right and survives every check that does not
+    /// compare against an ordinary rotation.
+    ///
+    /// The mirrors are read in the destination's frame, after the transpose.
+    fn parts(self) -> (bool, bool, bool) {
+        match self {
+            Turn::None => (false, false, false),
+            Turn::FlipHorizontal => (false, false, true),
+            Turn::FlipVertical => (false, true, false),
+            Turn::Half => (false, true, true),
+            Turn::Transpose => (true, false, false),
+            Turn::Transverse => (true, true, true),
+            // Clockwise: transpose, then mirror left to right.
+            Turn::Quarter => (true, false, true),
+            // Anticlockwise: transpose, then mirror top to bottom.
+            Turn::ThreeQuarters => (true, true, false),
+        }
+    }
+
+    /// Where the block at `(column, row)` of a `(columns, rows)` grid lands.
+    ///
+    /// The grid's own dimensions are after the turn when the axes swap, which
+    /// is why this returns a position rather than an index.
+    fn moves(self, column: usize, row: usize, columns: usize, rows: usize) -> (usize, usize) {
+        let (transpose, mirror_rows, mirror_columns) = self.parts();
+
+        // The transpose, which also swaps what the grid's extents mean.
+        let (mut to_column, mut to_row, width, height) = if transpose {
+            (row, column, rows, columns)
+        } else {
+            (column, row, columns, rows)
+        };
+
+        if mirror_columns {
+            to_column = width - 1 - to_column;
+        }
+        if mirror_rows {
+            to_row = height - 1 - to_row;
+        }
+
+        (to_column, to_row)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Turning the coefficients
+// ---------------------------------------------------------------------------
+
+/// Where each of the 64 coefficients sits, as a row and a column.
+///
+/// The blocks are held in the file's zig-zag order, which is the order the
+/// entropy coder wants and has nothing to do with frequency position. A turn
+/// is the first operation here that cares *where* a coefficient is, so the
+/// order has to be undone and redone around it.
+const ZIGZAG: [usize; 64] = [
+    0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29,
+    22, 15, 23, 30, 37, 44, 51, 58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
+];
+
+/// Transform one block's coefficients the way `turn` transforms its pixels.
+///
+/// # The identity, stated carefully
+///
+/// The two-dimensional DCT is separable, which gives exactly two primitive
+/// operations on a block, and every one of the eight symmetries is a
+/// composition of them:
+///
+/// - **Transpose.** The DCT of a transposed block is the transpose of its
+///   coefficients. Coefficient `(u, v)` moves to `(v, u)`. No sign changes.
+/// - **Mirror.** Mirroring a block along an axis *does not move any
+///   coefficient*: it negates the ones whose frequency index along that axis is
+///   odd, because those basis functions are odd about the block's centre and the
+///   even ones are not.
+///
+/// The second half is the part that is easy to get wrong, and getting it wrong
+/// is not subtle once it is measured: treating a mirror as a positional
+/// permutation of coefficients — sending `(u, v)` to `(7 - u, v)` — swaps the
+/// picture's lowest frequencies for its highest and decodes to a one-pixel
+/// checkerboard. It was written that way here first, and the pixel-for-pixel
+/// gate in `tests/live_bake.rs` is what said so.
+///
+/// So a turn is applied in that order: mirror the signs in the source's own
+/// frequency space, then transpose positions if the turn transposes. A quarter
+/// turn clockwise is "mirror vertically, then transpose"; three quarters is
+/// "mirror horizontally, then transpose".
+///
+/// No step changes a coefficient's magnitude, which is why this is lossless in
+/// the same strong sense the crop is.
+fn turn_block(block: &Block, turn: Turn) -> Block {
+    let mut natural = [0i16; 64];
+    for (zigzag_index, value) in block.iter().enumerate() {
+        natural[ZIGZAG[zigzag_index]] = *value;
+    }
+
+    // The same three parts the grid of blocks is permuted by, from the same
+    // description: a transpose that moves coefficients, then mirrors that only
+    // change signs. One source, so the two levels cannot drift apart.
+    let (transpose, mirror_rows, mirror_columns) = turn.parts();
+
+    let mut moved = [0i16; 64];
+    for row in 0..8usize {
+        for column in 0..8usize {
+            let value = natural[row * 8 + column];
+            let (to_row, to_column) = if transpose { (column, row) } else { (row, column) };
+            // A mirror negates the odd-indexed basis functions along the axis
+            // it mirrors, and moves nothing. The index that decides is the
+            // destination's, because the mirror happens after the transpose.
+            let mut sign = 1i16;
+            if mirror_rows && to_row % 2 == 1 {
+                sign = -sign;
+            }
+            if mirror_columns && to_column % 2 == 1 {
+                sign = -sign;
+            }
+            moved[to_row * 8 + to_column] = value * sign;
+        }
+    }
+
+    let mut out = [0i16; 64];
+    for (zigzag_index, slot) in out.iter_mut().enumerate() {
+        *slot = moved[ZIGZAG[zigzag_index]];
+    }
+    out
+}
+
+/// Every block, moved to where the turn puts it and transformed in place.
+///
+/// The blocks are stored MCU by MCU, and an MCU holds several blocks of several
+/// components. A turn is a permutation of each *component's own* plane of
+/// blocks, so the plane is unpacked from the MCU order, permuted, and packed
+/// back into the MCU order of the turned image.
+fn turn_blocks(frame: &Frame, coefficients: &Coefficients, turn: Turn) -> Coefficients {
+    let mcus_across = frame.mcus_across() as usize;
+    let mcus_down = frame.mcus_down() as usize;
+    let per_mcu = frame.blocks_per_mcu();
+
+    // Where each component's blocks start inside one MCU.
+    let mut offsets = Vec::with_capacity(frame.components.len());
+    let mut running = 0usize;
+    for component in &frame.components {
+        offsets.push(running);
+        running += usize::from(component.horizontal) * usize::from(component.vertical);
+    }
+
+    let turned_frame = frame.turned(turn);
+    let turned_across = if turn.swaps_axes() { mcus_down } else { mcus_across };
+    let turned_down = if turn.swaps_axes() { mcus_across } else { mcus_down };
+    let mut out = vec![[0i16; 64]; turned_across * turned_down * per_mcu];
+
+    for (index, component) in frame.components.iter().enumerate() {
+        let across = usize::from(component.horizontal);
+        let down = usize::from(component.vertical);
+        // This component's plane, in blocks.
+        let columns = mcus_across * across;
+        let rows = mcus_down * down;
+
+        let turned = &turned_frame.components[index];
+        let turned_across_blocks = usize::from(turned.horizontal);
+        let turned_down_blocks = usize::from(turned.vertical);
+        let turned_columns = turned_across * turned_across_blocks;
+
+        for row in 0..rows {
+            for column in 0..columns {
+                // Out of the MCU order: which MCU holds this block, and where
+                // inside it.
+                let source = (row / down * mcus_across + column / across) * per_mcu + offsets[index] + (row % down) * across + (column % across);
+
+                let (to_column, to_row) = turn.moves(column, row, columns, rows);
+                let destination = (to_row / turned_down_blocks * turned_across + to_column / turned_across_blocks) * per_mcu
+                    + offsets[index]
+                    + (to_row % turned_down_blocks) * turned_across_blocks
+                    + (to_column % turned_across_blocks);
+                let _ = turned_columns;
+
+                let block = coefficients.blocks.get(source).copied().unwrap_or([0i16; 64]);
+                if let Some(slot) = out.get_mut(destination) {
+                    *slot = turn_block(&block, turn);
+                }
+            }
+        }
+    }
+
+    Coefficients { blocks: out }
+}
+
 // ---------------------------------------------------------------------------
 // Reading the frame header
 // ---------------------------------------------------------------------------
@@ -263,6 +580,48 @@ impl Frame {
 
     fn mcus_down(&self) -> u32 {
         u32::from(self.height).div_ceil(self.grid().height)
+    }
+
+    /// The same frame as it is after `turn`: the dimensions swapped when the
+    /// turn swaps axes, and every component's sampling factors with them.
+    ///
+    /// The sampling factors are the part that is easy to forget and impossible
+    /// to see: a 4:2:2 photograph is sampled 2x1, and a quarter turn makes it
+    /// 1x2. A header left stating the old pair describes a block order the file
+    /// no longer has, and the picture comes out as coloured hash.
+    fn turned(&self, turn: Turn) -> Frame {
+        let mut frame = self.clone();
+        if !turn.swaps_axes() {
+            return frame;
+        }
+
+        std::mem::swap(&mut frame.width, &mut frame.height);
+        for component in &mut frame.components {
+            std::mem::swap(&mut component.horizontal, &mut component.vertical);
+        }
+        std::mem::swap(&mut frame.max_horizontal, &mut frame.max_vertical);
+
+        // The maxima must stay the maxima of the components they describe.
+        //
+        // Asserted rather than trusted because the alternative is a field that
+        // is wrong and unobservable: the writer reads the maxima only to count
+        // MCUs, and that count happens to be invariant under swapping them
+        // whenever the picture tiles its grid exactly — which `turn` already
+        // requires. So a mutation that dropped this swap left every test green.
+        // Rather than hunt for a fixture that could tell the difference, the
+        // invariant is stated here, where it is cheap and cannot drift.
+        debug_assert_eq!(
+            frame.max_horizontal,
+            frame.components.iter().map(|component| component.horizontal).max().unwrap_or(1),
+            "the turned frame's horizontal maximum is not its components'"
+        );
+        debug_assert_eq!(
+            frame.max_vertical,
+            frame.components.iter().map(|component| component.vertical).max().unwrap_or(1),
+            "the turned frame's vertical maximum is not its components'"
+        );
+
+        frame
     }
 
     /// How many 8x8 blocks one MCU holds, over every component.
@@ -870,6 +1229,200 @@ fn write(bytes: &[u8], frame: &Frame, kept: &Coefficients, rect: Rect) -> Result
     out.extend_from_slice(&encode_scan(frame, kept, rect)?);
     out.extend_from_slice(&[0xFF, 0xD9]);
     Ok(out)
+}
+
+/// Assemble the turned file.
+///
+/// Like [`write`], with two more things rewritten rather than copied, both of
+/// which are invisible until they are wrong:
+///
+/// - **Each component's sampling factors**, swapped when the axes swap. A
+///   4:2:2 file whose header still claims 2x1 after a quarter turn describes a
+///   block order the scan no longer has.
+/// - **The orientation tag**, set to `Normal`. The turn is now in the pixels,
+///   and a tag left saying `Rotate90` would have every viewer turn it a second
+///   time. This is the one field a bake *must* touch, and the reason baking and
+///   scrubbing belong in the same version.
+fn write_turned(bytes: &[u8], frame: &Frame, turned: &Frame, kept: &Coefficients, size: Rect, turn: Turn) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(bytes.len() + 1024);
+    out.extend_from_slice(&[0xFF, 0xD8]);
+
+    let mut at = 2usize;
+    while at + 3 < bytes.len() {
+        if bytes[at] != 0xFF {
+            at += 1;
+            continue;
+        }
+        let marker = bytes[at + 1];
+        if marker == 0xD8 || marker == 0x01 || (0xD0..=0xD7).contains(&marker) {
+            at += 2;
+            continue;
+        }
+        if marker == 0xD9 {
+            break;
+        }
+        let length = usize::from(u16::from_be_bytes([bytes[at + 2], bytes[at + 3]]));
+        if length < 2 || at + 2 + length > bytes.len() {
+            break;
+        }
+
+        if marker == 0xDA {
+            out.extend_from_slice(&bytes[at..at + 2 + length]);
+            break;
+        }
+
+        if at == frame.sof_start - 2 || marker == 0xC0 || marker == 0xC1 {
+            let mut segment = bytes[at..at + 2 + length].to_vec();
+            segment[5..7].copy_from_slice(&(size.height as u16).to_be_bytes());
+            segment[7..9].copy_from_slice(&(size.width as u16).to_be_bytes());
+
+            // Then each component's three bytes: id, the two sampling factors
+            // packed into one byte, and the quantisation table it uses.
+            let count = usize::from(segment.get(9).copied().unwrap_or(0));
+            for index in 0..count {
+                let Some(component) = turned.components.get(index) else {
+                    break;
+                };
+                let field = 10 + index * 3 + 1;
+                if let Some(byte) = segment.get_mut(field) {
+                    *byte = (component.horizontal << 4) | (component.vertical & 0x0F);
+                }
+            }
+            out.extend_from_slice(&segment);
+        } else if marker == 0xDB && turn.swaps_axes() {
+            // The quantisation tables, transposed with the coefficients.
+            //
+            // The step that is invisible until it is measured. A table is a
+            // quantiser *per frequency position*, and the tables encoders write
+            // are not symmetric about the diagonal — the one the `image` crate
+            // writes has 10 where its transpose has 12. Move coefficient (u, v)
+            // to (v, u) and leave the table alone, and every one of them is
+            // divided by its neighbour's quantiser: the picture decodes, the
+            // geometry is right, and every pixel is off by a little. Measured at
+            // up to 15 of 255 on a quality-92 file, which is precisely the range
+            // that reads as "close enough" to anything but a pixel-for-pixel
+            // comparison.
+            //
+            // A mirror needs none of this, because a mirror moves nothing.
+            let mut segment = bytes[at..at + 2 + length].to_vec();
+            transpose_quantisation_tables(&mut segment[4..]);
+            out.extend_from_slice(&segment);
+        } else if marker == 0xE1 && bytes[at + 4..at + 2 + length].starts_with(b"Exif\0\0") {
+            // The EXIF block, with its orientation set to upright. Rewritten in
+            // place rather than dropped: it also carries the camera, the lens
+            // and the date, and a bake is not a scrub. Someone who wants both
+            // asks for both.
+            let mut segment = bytes[at..at + 2 + length].to_vec();
+            set_orientation_upright(&mut segment[10..]);
+            out.extend_from_slice(&segment);
+        } else {
+            out.extend_from_slice(&bytes[at..at + 2 + length]);
+        }
+
+        at += 2 + length;
+    }
+
+    out.extend_from_slice(&encode_scan(turned, kept, size)?);
+    out.extend_from_slice(&[0xFF, 0xD9]);
+    Ok(out)
+}
+
+/// Transpose every quantisation table in a DQT segment's body, in place.
+///
+/// A DQT segment holds one or more tables, each a byte of precision-and-
+/// identifier followed by 64 or 128 values in the file's zig-zag order. The
+/// values are de-zigzagged to a square, transposed, and zigzagged back — the
+/// same round trip [`turn_block`] makes, for the same reason: the zig-zag order
+/// says nothing about position, and a transpose is entirely about position.
+fn transpose_quantisation_tables(body: &mut [u8]) {
+    let mut at = 0usize;
+    while at < body.len() {
+        let precision = body[at] >> 4;
+        let width = if precision == 0 { 1 } else { 2 };
+        let values = at + 1;
+        let end = values + 64 * width;
+        if end > body.len() {
+            return;
+        }
+
+        // Read the table into natural order, transpose, and write it back.
+        let mut natural = [0u16; 64];
+        for index in 0..64 {
+            let raw = if width == 1 {
+                u16::from(body[values + index])
+            } else {
+                u16::from_be_bytes([body[values + index * 2], body[values + index * 2 + 1]])
+            };
+            natural[ZIGZAG[index]] = raw;
+        }
+
+        let mut transposed = [0u16; 64];
+        for row in 0..8usize {
+            for column in 0..8usize {
+                transposed[column * 8 + row] = natural[row * 8 + column];
+            }
+        }
+
+        for index in 0..64 {
+            let value = transposed[ZIGZAG[index]];
+            if width == 1 {
+                body[values + index] = value as u8;
+            } else {
+                body[values + index * 2..values + index * 2 + 2].copy_from_slice(&value.to_be_bytes());
+            }
+        }
+
+        at = end;
+    }
+}
+
+/// Set the orientation tag in a TIFF block to 1, in place, if it has one.
+///
+/// Only the one field is touched: the value sits inside its own entry when it
+/// is a SHORT, which it always is, so nothing moves and no offset elsewhere in
+/// the block becomes wrong. A block with no orientation entry is left alone —
+/// absent already means upright.
+fn set_orientation_upright(tiff: &mut [u8]) {
+    let Some(header) = tiff.get(..8) else {
+        return;
+    };
+    let little = match &header[..2] {
+        b"II" => true,
+        b"MM" => false,
+        _ => return,
+    };
+    let read_u16 = |bytes: &[u8]| {
+        let pair = [bytes[0], bytes[1]];
+        if little { u16::from_le_bytes(pair) } else { u16::from_be_bytes(pair) }
+    };
+    let read_u32 = |bytes: &[u8]| {
+        let quad = [bytes[0], bytes[1], bytes[2], bytes[3]];
+        if little { u32::from_le_bytes(quad) } else { u32::from_be_bytes(quad) }
+    };
+
+    let first = read_u32(&header[4..8]) as usize;
+    let Some(count_at) = tiff.get(first..first + 2) else {
+        return;
+    };
+    let count = usize::from(read_u16(count_at));
+
+    for index in 0..count {
+        let entry = first + 2 + index * 12;
+        let Some(tag) = tiff.get(entry..entry + 2).map(&read_u16) else {
+            return;
+        };
+        if tag != 0x0112 {
+            continue;
+        }
+        // A SHORT sits in the first two bytes of the value field, in the
+        // block's own byte order.
+        let value_at = entry + 8;
+        if let Some(slot) = tiff.get_mut(value_at..value_at + 2) {
+            let upright = if little { 1u16.to_le_bytes() } else { 1u16.to_be_bytes() };
+            slot.copy_from_slice(&upright);
+        }
+        return;
+    }
 }
 
 fn encode_scan(frame: &Frame, kept: &Coefficients, rect: Rect) -> Result<Vec<u8>> {
