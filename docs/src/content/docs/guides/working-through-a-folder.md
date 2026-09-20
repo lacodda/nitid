@@ -38,8 +38,13 @@ time the photograph was copied somewhere.
 Only the metadata block is rewritten. A marked JPEG is identical to the one
 that went in from its start-of-scan marker onward — the same promise `Ctrl+S`
 makes for a turn, and for the same reason: nothing here runs an encoder over
-your pixels. A format with nowhere to put a rating says so rather than
-pretending the mark was taken.
+your pixels.
+
+**A format with nowhere to put the mark says so.** JPEG carries both marks.
+Some formats take a rating but have no room for a reject, and some take
+neither; in every case the viewer reads the file back before it calls the mark
+saved, and tells you when it did not take rather than reporting a success the
+file does not contain. The file is left exactly as it was.
 
 **`M` walks only the pictures that are marked.** The arrow keys then step
 between the frames you judged and skip everything you did not, and the count in

@@ -203,10 +203,39 @@ fn from_exif(stars: Option<u32>, percent: Option<u32>) -> Mark {
 /// that says the format has nowhere to put the mark. Same rule as the saved
 /// turn.
 ///
+/// **The write is read back before it is called a success**, and that is not
+/// belt-and-braces. `little_exif` will happily write 103 bytes into a PNG,
+/// report `Ok`, and produce a file whose EXIF no reader in this project can
+/// find — measured. A viewer trusting that return value would tell a person
+/// their shoot was culled and lose every mark in it. Asking the file is the
+/// only answer that cannot drift: it holds whatever the writers do next, and
+/// for whatever formats arrive later, without a table of which containers
+/// work needing to be kept true by hand.
+///
 /// Two halves, because one field cannot hold both answers. The stars go into
 /// EXIF, where Windows reads them; the reject goes into XMP, where Lightroom
 /// and Bridge read it and where Explorer correctly sees nothing.
 pub fn write(path: &Path, mark: Mark) -> Result<()> {
+    // What the file was, so a refusal can put it back. `little_exif` writes
+    // into the file rather than returning bytes, so by the time the read-back
+    // shows the mark did not take, the file has already been changed — and a
+    // viewer that refuses an operation must leave the photograph exactly as it
+    // found it, not a hundred bytes larger for nothing.
+    let original = std::fs::read(path).with_context(|| format!("reading {}", name_of(path)))?;
+
+    match written(path, mark) {
+        Ok(()) => Ok(()),
+        Err(refusal) => {
+            // Best effort: if putting it back fails too, the refusal is still
+            // the thing worth reporting — it is what the person asked about.
+            let _ = std::fs::write(path, &original);
+            Err(refusal)
+        }
+    }
+}
+
+/// The write itself, so [`write`] can undo it when it does not take.
+fn written(path: &Path, mark: Mark) -> Result<()> {
     // A file with no EXIF at all is the ordinary case for anything a phone did
     // not take, and `new_from_path` fails outright on one — an empty block is
     // the right starting point, and the write below puts it into the file.
@@ -222,6 +251,16 @@ pub fn write(path: &Path, mark: Mark) -> Result<()> {
     let rating = (mark == Mark::Reject).then_some(REJECTED_RATING);
     if let Some(updated) = xmp::with_rating(&bytes, rating) {
         std::fs::write(path, updated).with_context(|| format!("writing {}", name_of(path)))?;
+    }
+
+    let landed = read(path);
+    if landed != mark {
+        anyhow::bail!(
+            "{} cannot carry a {} mark: the file takes it and gives back {}",
+            name_of(path),
+            mark.name(),
+            landed.name(),
+        );
     }
     Ok(())
 }
@@ -666,6 +705,38 @@ mod tests {
         }
         let each = started.elapsed().as_secs_f64() * 1000.0 / f64::from(rounds);
         eprintln!("reading a mark: {each:.3} ms per file");
+    }
+
+    /// A format that cannot hold the mark says so, instead of reporting a
+    /// success the file does not contain.
+    ///
+    /// Found by running the thing rather than by reading it: `little_exif`
+    /// writes into a PNG, returns `Ok`, and leaves EXIF that no reader here
+    /// can find. Trusting that return value would have told a person their
+    /// shoot was culled while losing every mark in it — the exact failure the
+    /// saved turn refuses, arrived at by a different road.
+    #[test]
+    fn a_format_that_cannot_hold_a_mark_refuses_it() {
+        let directory = sandbox("refuses");
+        let path = directory.join("shot.png");
+        image::RgbImage::from_fn(64, 48, |x, y| image::Rgb([(x * 3) as u8, (y * 5) as u8, 70]))
+            .save(&path)
+            .expect("a png");
+
+        let before = std::fs::read(&path).expect("the file as it was");
+
+        for mark in [Mark::Keep, Mark::Reject] {
+            let refusal = write(&path, mark).expect_err("a PNG cannot carry a mark, and has to say so");
+            let said = format!("{refusal}");
+            assert!(said.contains("cannot carry"), "the refusal does not say what is wrong: {said}");
+            assert_eq!(read(&path), Mark::Unmarked, "a refused mark was left in the file anyway");
+            // And the refusal left the photograph alone. `little_exif` writes
+            // into the file before anything can tell that the mark will not
+            // read back, so without putting it back a refused press would
+            // still grow the file — a viewer that declines an operation must
+            // decline all of it.
+            assert_eq!(std::fs::read(&path).expect("the file back"), before, "a refused mark changed the file anyway");
+        }
     }
 
     /// Reading a file that is not there, and one that carries no EXIF, are
