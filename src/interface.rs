@@ -198,6 +198,12 @@ pub enum Action {
     FullScreen,
     Keys,
     Settings,
+    /// Keep this picture, or take the mark back off it.
+    Keep,
+    /// Reject it, or take the mark back off it.
+    Reject,
+    /// Walk only the marked pictures, or the whole folder again.
+    Filter,
 }
 
 /// What the crop bar asks for.
@@ -989,7 +995,7 @@ fn toolbar(ui: &mut egui::Ui, status: &Status, info_shown: bool, histogram_shown
                             .or(toggle(
                                 ui,
                                 "Clip",
-                                "Mark what the file clipped  (C)",
+                                "Mark what the file clipped  (G)",
                                 showing,
                                 status.clipping,
                                 Action::Clipping,
@@ -997,10 +1003,41 @@ fn toolbar(ui: &mut egui::Ui, status: &Status, info_shown: bool, histogram_shown
                             .or(toggle(
                                 ui,
                                 "Pick",
-                                "Read the colour under the pointer  (P)",
+                                "Read the colour under the pointer  (C)",
                                 showing,
                                 status.picking,
                                 Action::Pick,
+                            ))
+                            .or_else(|| {
+                                separator(ui);
+                                None
+                            })
+                            // The cull, in the order the hand meets it: judge
+                            // this one, judge it the other way, then look at
+                            // what the judging produced.
+                            .or(toggle(
+                                ui,
+                                "Keep",
+                                "Keep this one; again to take the mark off  (P)",
+                                showing,
+                                status.mark == crate::cull::Mark::Keep,
+                                Action::Keep,
+                            ))
+                            .or(toggle(
+                                ui,
+                                "Reject",
+                                "Reject this one; again to take the mark off  (X)",
+                                showing,
+                                status.mark == crate::cull::Mark::Reject,
+                                Action::Reject,
+                            ))
+                            .or(toggle(
+                                ui,
+                                "Marked",
+                                "Walk only the pictures that are marked  (M)",
+                                !alone,
+                                status.filtered,
+                                Action::Filter,
                             ))
                             .or_else(|| {
                                 separator(ui);

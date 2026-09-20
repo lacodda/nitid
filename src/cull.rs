@@ -644,6 +644,30 @@ mod tests {
         assert!(!Mark::Unmarked.is_marked());
     }
 
+    /// What reading the mark costs on the path to the first pixel.
+    ///
+    /// Not a threshold, a number: the startup gate measures the whole run and
+    /// would not notice a millisecond here, so if this ever stops being
+    /// negligible this is where it shows. Printed rather than asserted
+    /// because a timing assertion in a unit test is a flake waiting for a
+    /// busy machine.
+    #[test]
+    fn reading_a_mark_costs_next_to_nothing() {
+        let directory = sandbox("cost");
+        let path = directory.join("photo.jpg");
+        a_jpeg(&path);
+        write(&path, Mark::Keep).expect("a mark to find");
+        let bytes = std::fs::read(&path).expect("the file back");
+
+        let started = std::time::Instant::now();
+        let rounds = 200;
+        for _ in 0..rounds {
+            std::hint::black_box(from_bytes(std::hint::black_box(&bytes)));
+        }
+        let each = started.elapsed().as_secs_f64() * 1000.0 / f64::from(rounds);
+        eprintln!("reading a mark: {each:.3} ms per file");
+    }
+
     /// Reading a file that is not there, and one that carries no EXIF, are
     /// both "nothing said about it" rather than errors.
     #[test]

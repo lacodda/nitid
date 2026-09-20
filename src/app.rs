@@ -3393,6 +3393,9 @@ fn key_for(action: Action) -> Key {
         Action::FullScreen => Key::Named(NamedKey::F11),
         Action::Keys => Key::Character("?".into()),
         Action::Settings => Key::Character(",".into()),
+        Action::Keep => Key::Character("p".into()),
+        Action::Reject => Key::Character("x".into()),
+        Action::Filter => Key::Character("m".into()),
     }
 }
 
@@ -4367,7 +4370,7 @@ mod tests {
     /// trusted: a hand-kept list is one an added action is forgotten from, and
     /// the two tests over it would then pass while saying nothing about the
     /// new button. Adding a variant now fails to compile until it is listed.
-    const EVERY_ACTION: [Action; 18] = [
+    const EVERY_ACTION: [Action; 21] = [
         Action::Previous,
         Action::Next,
         Action::ZoomOut,
@@ -4386,6 +4389,9 @@ mod tests {
         Action::FullScreen,
         Action::Keys,
         Action::Settings,
+        Action::Keep,
+        Action::Reject,
+        Action::Filter,
     ];
 
     /// What makes `EVERY_ACTION` exhaustive: this match has no catch-all, so a
@@ -4414,6 +4420,9 @@ mod tests {
                 Action::FullScreen => 15,
                 Action::Keys => 16,
                 Action::Settings => 17,
+                Action::Keep => 18,
+                Action::Reject => 19,
+                Action::Filter => 20,
             };
         }
 
