@@ -26,10 +26,14 @@ Opening a file opens its folder: the arrow keys walk the images beside it.
 | `B` | what shows through transparency |
 | `I` | what the file says about itself |
 | `H` | what tones the picture is made of |
-| `C` | mark what the file clipped |
-| `P` | read the colour under the pointer, with the pixels around it magnified; click to copy |
+| `G` | mark what the file clipped |
+| `C` | read the colour under the pointer, with the pixels around it magnified; click to copy |
 | `K` | what is happening to this image's colour |
-| `X` | frame a crop; Enter saves it as a copy, Esc leaves it |
+| `P` | keep this one; again to take the mark off |
+| `X` | reject this one; again to take the mark off |
+| `U` | take the mark off |
+| `M` | walk only the pictures that are marked |
+| `Ctrl+X` | frame a crop; Enter saves it as a copy, Esc leaves it |
 | `Ctrl+Drag` | drag the picture into another window |
 | `Ctrl+C` | copy the picture |
 | `Ctrl+V` | show the picture on the clipboard |

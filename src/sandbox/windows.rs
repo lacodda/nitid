@@ -169,6 +169,10 @@ pub fn decode(bytes: &[u8], format: Format, timeout: Duration) -> Result<LoadedI
 
     Ok(LoadedImage {
         orientation: Orientation::from_exif(u16::from(image.orientation)),
+        // What the file says about itself is read on the trusted side, from
+        // the bytes, and set over this by the caller: the decoder is the
+        // untrusted half and does not get to state a fact about the file.
+        mark: crate::cull::Mark::Unmarked,
         // A profile the decoder sent that will not parse here is treated
         // as no profile, the same as anywhere else: broken colour metadata
         // is not a reason to refuse an image.

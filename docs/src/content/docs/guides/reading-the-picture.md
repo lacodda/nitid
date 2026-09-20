@@ -38,7 +38,7 @@ let go while another window is in front drops it too.
 
 Three things that answer questions about colour rather than about the picture.
 
-**The clipping zebra**, with `C`: diagonal hatching over the pixels that hit
+**The clipping zebra**, with `G`: diagonal hatching over the pixels that hit
 the ends of the scale — red where a highlight is blown, blue where a shadow is
 blocked. It marks **what the file clipped**, not what this display cannot
 reproduce, which is the same decision the histogram is built on
@@ -47,7 +47,7 @@ colour outside this monitor's gamut is not a colour the camera lost. The
 marking happens in the shader that was going to run anyway, so turning it on
 and off costs one uniform write and no re-decode.
 
-**The eyedropper**, with `P`: the colour under the pointer, in both the terms
+**The eyedropper**, with `C`: the colour under the pointer, in both the terms
 that matter — the numbers the file holds, and what they become on this display.
 They differ whenever the image carries a profile the display does not share,
 and a viewer reporting only one of them would be answering a question nobody

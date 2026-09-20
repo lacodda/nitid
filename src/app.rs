@@ -165,6 +165,12 @@ struct Shown {
     colour: String,
     /// What the file says about itself: camera, exposure, place.
     metadata: crate::metadata::Metadata,
+    /// What this picture was judged to be worth, if anything.
+    ///
+    /// Read from the same bytes the metadata comes from rather than from a
+    /// second trip to the disk, and kept here so the status line can say it
+    /// without one either.
+    mark: crate::cull::Mark,
     /// The file's size on disk. `None` when it cannot be asked for, which is
     /// a fact about the moment rather than about the file.
     file_size: Option<u64>,
@@ -549,6 +555,7 @@ impl App {
             depth: loaded.image.depth,
             colour: describe_colour(loaded.profile.as_ref(), &transform),
             metadata: loaded.metadata.clone(),
+            mark: loaded.mark,
             file_size: std::fs::metadata(path).ok().map(|entry| entry.len()),
             // A thumbnail is not the picture: its histogram would be the
             // shape of a few hundred pixels standing in for millions, and it
@@ -920,17 +927,27 @@ impl App {
                 // A look at the pixels, held rather than toggled. The release
                 // is answered in the event loop, not here.
                 "z" | "Z" => self.hold_loupe(),
+                // Going through a shoot: keep, reject, and take it back.
+                //
+                // `P` and `X` are the letters Lightroom uses, which is what
+                // the hands of anyone who has culled a shoot already know —
+                // and culling is the one job where the keys are pressed
+                // hundreds of times in a row, so meeting the habit matters
+                // more here than anywhere else in the viewer. `U` for
+                // unmarked follows them.
+                //
+                // Both letters were in use, which is why v0.33 moved three
+                // other keys to clear them: the eyedropper to `C`, the
+                // clipping zebra to `G`, the crop to `Ctrl+X`.
+                "p" | "P" => self.mark_current(crate::cull::Mark::Keep),
+                "x" | "X" => self.mark_current(crate::cull::Mark::Reject),
+                "u" | "U" => self.mark_current(crate::cull::Mark::Unmarked),
+                // Walk only the pictures that have been judged, or the whole
+                // folder again.
+                "m" | "M" => self.toggle_filter(),
                 // The colour under the cursor. A mode, so it can be pointed
                 // about the picture and clicked with one hand.
-                "p" | "P" => self.toggle_picking(),
-                // Frame a crop. A mode for the reason the eyedropper is one:
-                // it is dragged about with the mouse, and a gesture needing a
-                // key held down as well is a two-handed job.
-                //
-                // `X` rather than `C`, which is the clipping zebra, and rather
-                // than `Ctrl+C`, which copies the picture: the letter the
-                // feature is named after is taken twice over already.
-                "x" | "X" => self.toggle_crop(),
+                "c" | "C" => self.toggle_picking(),
                 // The settings. A dialog rather than a panel: it is a place
                 // you go to and come back from, not something to look at a
                 // picture alongside.
@@ -949,7 +966,11 @@ impl App {
                 // it belongs to the renderer rather than to the picture: it
                 // costs one uniform write and survives a step to the next
                 // image, which is what makes it usable for checking a series.
-                "c" | "C" => {
+                //
+                // `G` since v0.33 — "gamut", and the nearest free letter to
+                // the idea. `C` went to the eyedropper, which the owner asked
+                // for, and the eyedropper's `P` went to the keep mark.
+                "g" | "G" => {
                     if let Some(renderer) = self.renderer.as_mut() {
                         let next = !renderer.zebra();
                         renderer.set_zebra(next);
@@ -1132,6 +1153,7 @@ impl App {
             Some(Chord::SaveTurn) => self.save_turn(),
             Some(Chord::SaveAs) => self.begin_save_as(),
             Some(Chord::CleanCopy) => self.begin_clean(),
+            Some(Chord::Crop) => self.toggle_crop(),
             None => {}
         }
     }
@@ -1581,6 +1603,91 @@ impl App {
             Err(error) => self.report(error),
         }
         self.request_redraw();
+    }
+
+    /// Say what this picture is worth, and write it into the file.
+    ///
+    /// Written straight through rather than gathered up and saved at the end.
+    /// A cull is hundreds of presses and the answer has to survive the window
+    /// closing, the power going, and the folder being opened somewhere else —
+    /// a pass held in memory until a save key is pressed is a pass that gets
+    /// lost, and the person doing it has no way to tell that it has.
+    ///
+    /// Pressing the mark a picture already carries takes it off. That is what
+    /// makes the three keys enough: `P` on a kept frame is the same "no, not
+    /// that" as `U`, and reaching for a different key to undo the key just
+    /// pressed is a thing to remember rather than a thing to do.
+    fn mark_current(&mut self, mark: crate::cull::Mark) {
+        let Some(path) = self.file_on_screen() else {
+            return;
+        };
+        let name = name_of(&path);
+
+        // The same key twice is "take it back". Read from the file rather
+        // than from anything held here: another program may have written to
+        // it since, and the mark on screen is a claim about the file.
+        let current = crate::cull::read(&path);
+        let mark = if current == mark { crate::cull::Mark::Unmarked } else { mark };
+
+        match crate::cull::write(&path, mark) {
+            Ok(()) => {
+                if let Some(shown) = self.shown.as_mut() {
+                    shown.mark = mark;
+                }
+                // The loader is holding the bytes as they were before the tag
+                // went in; left alone, stepping away and back would show the
+                // mark undone. The same reason the saved turn forgets.
+                self.loader.forget(&path);
+                self.interface.toast(
+                    match mark {
+                        crate::cull::Mark::Unmarked => format!("{name}: mark taken off"),
+                        other => format!("{name}: {}", other.name()),
+                    },
+                    Instant::now(),
+                );
+                // A picture that has just stopped belonging in the filtered
+                // walk has to leave it, or the arrow keys keep landing on it
+                // and the filter reads as broken.
+                self.refilter();
+            }
+            Err(error) => self.report(error),
+        }
+        self.request_redraw();
+    }
+
+    /// Walk only the pictures that have been judged, or the whole folder.
+    fn toggle_filter(&mut self) {
+        let Some(folder) = self.folder.as_mut() else {
+            return;
+        };
+
+        if folder.is_filtered() {
+            folder.show_all();
+            let count = folder.len();
+            self.interface.toast(format!("the whole folder: {count}"), Instant::now());
+        } else {
+            let count = folder.show_only(|path| crate::cull::read(path).is_marked());
+            // Nothing marked is a real answer and it is said, rather than
+            // leaving a person with arrow keys that have quietly stopped
+            // working. The filter stays up: it is what they asked for, and
+            // one mark makes it useful without pressing anything else.
+            self.interface.toast(
+                match count {
+                    0 => "no picture here is marked yet".to_string(),
+                    1 => "1 marked picture".to_string(),
+                    many => format!("{many} marked pictures"),
+                },
+                Instant::now(),
+            );
+        }
+        self.request_redraw();
+    }
+
+    /// Re-run the filter, if one is up, against the marks as they stand now.
+    fn refilter(&mut self) {
+        if let Some(folder) = self.folder.as_mut() {
+            folder.refilter(|path| crate::cull::read(path).is_marked());
+        }
     }
 
     /// Offer a clean copy of the file on screen: put the box up, having read
@@ -2305,6 +2412,9 @@ impl App {
             depth: image.depth,
             colour: "from the clipboard".to_string(),
             metadata: crate::metadata::Metadata::default(),
+            // A pasted picture is not a file, so there is nothing that could
+            // carry a mark and nowhere to write one.
+            mark: crate::cull::Mark::Unmarked,
             file_size: None,
             histogram: None,
             counting: false,
@@ -2638,6 +2748,8 @@ impl App {
             // the minimap from appearing over an empty window.
             crop: self.crop_view(),
             visible: self.shown.as_ref().map_or((0.0, 0.0, 1.0, 1.0), |shown| shown.view.visible_fraction()),
+            mark: self.shown.as_ref().map(|shown| shown.mark).unwrap_or_default(),
+            filtered: self.folder.as_ref().is_some_and(crate::folder::Folder::is_filtered),
         }
     }
 
@@ -2926,6 +3038,12 @@ fn handled(key: &Key) -> bool {
                 | "P"
                 | "k"
                 | "K"
+                | "u"
+                | "U"
+                | "g"
+                | "G"
+                | "m"
+                | "M"
         ),
         _ => false,
     }
@@ -2941,6 +3059,15 @@ enum Chord {
     SaveAs,
     /// Save a copy with the metadata taken out.
     CleanCopy,
+    /// Frame a crop.
+    ///
+    /// On `Ctrl+X` since v0.33, when the bare `X` became the reject mark.
+    /// The modifier rather than another letter: `X` is the letter the crop
+    /// has been on since it shipped, and moving it to an unrelated free
+    /// letter would leave a key nobody can guess. Nothing is cut to the
+    /// clipboard anywhere in this viewer, so the usual meaning of `Ctrl+X` is
+    /// not being taken from anyone.
+    Crop,
 }
 
 /// Which way a key press goes, given the modifiers held.
@@ -3016,6 +3143,7 @@ fn chord_for(key: &Key) -> Option<Chord> {
         "S" => Some(Chord::SaveAs),
         "s" => Some(Chord::SaveTurn),
         "m" => Some(Chord::CleanCopy),
+        "x" | "X" => Some(Chord::Crop),
         _ => None,
     }
 }
@@ -3258,8 +3386,8 @@ fn key_for(action: Action) -> Key {
         Action::Backdrop => Key::Character("b".into()),
         Action::Info => Key::Character("i".into()),
         Action::Histogram => Key::Character("h".into()),
-        Action::Clipping => Key::Character("c".into()),
-        Action::Pick => Key::Character("p".into()),
+        Action::Clipping => Key::Character("g".into()),
+        Action::Pick => Key::Character("c".into()),
         Action::Passport => Key::Character("k".into()),
         Action::Lock => Key::Character("l".into()),
         Action::FullScreen => Key::Named(NamedKey::F11),
@@ -4517,7 +4645,7 @@ mod tests {
             .map(|(key, _)| *key)
             .filter(|key| (key.starts_with("Ctrl+") || key.starts_with("Alt+")) && !key.contains("Drag") && !key.contains("Wheel"))
             .collect();
-        assert_eq!(advertised.len(), 10, "the sheet lists {advertised:?}, which is not the ten chords");
+        assert_eq!(advertised.len(), 11, "the sheet lists {advertised:?}, which is not the eleven chords");
 
         // What each letter chord answers with, so two rows of the sheet
         // cannot quietly be the same key. Until v0.30.0 `chord_for` matched

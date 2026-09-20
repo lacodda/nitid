@@ -1,6 +1,6 @@
 ---
 title: Working through a folder
-description: Deleting, renaming and sorting files through the shell's own operations.
+description: Culling, deleting, renaming and sorting files through the shell's own operations.
 ---
 
 A viewer that can only look is half a tool. Going through a shoot means
@@ -15,6 +15,40 @@ landing on the frame you just judged would mean judging it twice. Nothing is
 asked first — the bin is undoable, and Explorer's own `Ctrl+Z` takes the
 operation back — because a confirmation on every frame is what makes people
 stop culling in a viewer and go back to a file manager.
+
+**`P` keeps this one, `X` rejects it, `U` takes the mark back off.** The
+letters are Lightroom's, because culling is the one job in a viewer where a key
+is pressed hundreds of times in a row and the hands that have done it before
+already know where to go. Pressing the mark a picture already carries takes it
+off, so the way back is the key you just pressed rather than a second one to
+remember.
+
+**A reject is a mark, not a delete.** The point of a pass is to get through the
+folder without stopping to decide anything irreversible, and then look at what
+came out. `Del` is still there for the frames you are sure about.
+
+**The mark goes into the file, where everything else can see it.** It is
+written as the EXIF rating Windows itself uses, so a picture you kept shows up
+with a star in Explorer's own Rating column, in its Properties, and in any
+program that reads a rating — this is the whole reason a viewer's selection is
+worth making. The alternative, a small file written beside the picture, would
+have been a mark only nitid could see, and it would be left behind the first
+time the photograph was copied somewhere.
+
+Only the metadata block is rewritten. A marked JPEG is identical to the one
+that went in from its start-of-scan marker onward — the same promise `Ctrl+S`
+makes for a turn, and for the same reason: nothing here runs an encoder over
+your pixels. A format with nowhere to put a rating says so rather than
+pretending the mark was taken.
+
+**`M` walks only the pictures that are marked.** The arrow keys then step
+between the frames you judged and skip everything you did not, and the count in
+the status line says `marked only` so the mode is never something you have to
+deduce. Switching it on does not move the picture you are looking at, even when
+that picture is one the filter leaves out: the frame you just judged is usually
+still on screen, and it is the next arrow key that takes you into the
+selection. `M` again gives the whole folder back. With nothing marked yet, the
+viewer says so instead of leaving the arrow keys quietly doing nothing.
 
 **`F2` renames it.** The box opens with the whole name in it and the stem
 selected, so typing replaces the name and leaves `.jpg` alone, while renaming
@@ -73,7 +107,7 @@ loss and it is stated plainly — those highlights are not coming back — but i
 is exactly what you were seeing, rather than a second rendering that would make
 the file disagree with its own preview.
 
-**`X` frames a crop.** The box opens over the whole picture; drag a corner or
+**`Ctrl+X` frames a crop.** The box opens over the whole picture; drag a corner or
 an edge to bring it in, drag inside it to slide it about, or press somewhere
 clear of it to draw a new one. The buttons along the bottom hold it to a shape
 — 1:1, 3:2, 4:3, 16:9 and their upright forms, or the picture's own — and the

@@ -121,6 +121,17 @@ pub struct Status {
     pub visible: (f32, f32, f32, f32),
     /// The crop being framed, while the crop mode is up.
     pub crop: Option<CropView>,
+    /// What this picture was judged to be worth. `Unmarked` is the ordinary
+    /// state and says nothing in the status line: a viewer that announced
+    /// "unmarked" on every photograph would be announcing nothing, loudly.
+    pub mark: crate::cull::Mark,
+    /// Whether the arrow keys are walking only the marked pictures.
+    ///
+    /// Shown, and not optional to show: a filter is a mode that changes what
+    /// the arrow keys do, and the count beside it already reads differently
+    /// while it is up. A mode with no sign of itself is a mode the user
+    /// fights rather than uses — the same rule the locked framing follows.
+    pub filtered: bool,
 }
 
 /// What the crop overlay draws, worked out by the application.
@@ -1044,7 +1055,26 @@ fn status_line(ui: &mut egui::Ui, status: &Status) -> Option<Action> {
 
                 if let Some((position, count)) = status.position {
                     separator(ui);
-                    ui.label(format!("{position} of {count}"));
+                    let counted = format!("{position} of {count}");
+                    // The filter says so beside the count it changed, rather
+                    // than somewhere else in the line: "2 of 5" reading
+                    // differently from the folder on disk is exactly the thing
+                    // that needs explaining, and the explanation belongs next
+                    // to it.
+                    if status.filtered {
+                        ui.label(counted).on_hover_text("Only the marked pictures are being walked  (M)");
+                        ui.label(egui::RichText::new("marked only").strong());
+                    } else {
+                        ui.label(counted);
+                    }
+                }
+
+                // What this picture was judged to be worth. Nothing at all
+                // when nothing has been said about it.
+                if status.mark.is_marked() {
+                    separator(ui);
+                    ui.label(egui::RichText::new(status.mark.name()).strong())
+                        .on_hover_text("What this picture was marked as  (P keep, X reject, U to take it off)");
                 }
 
                 if let Some((width, height)) = status.size {
@@ -2627,10 +2657,14 @@ pub const KEYS: &[(&str, &str)] = &[
     ("B", "what shows through transparency"),
     ("I", "what the file says about itself"),
     ("H", "what tones the picture is made of"),
-    ("C", "mark what the file clipped"),
-    ("P", "read the colour under the pointer; click to copy"),
+    ("G", "mark what the file clipped"),
+    ("C", "read the colour under the pointer; click to copy"),
     ("K", "what is happening to this image's colour"),
-    ("X", "frame a crop; Enter saves it as a copy, Esc leaves it"),
+    ("P", "keep this one; again to take the mark off"),
+    ("X", "reject this one; again to take the mark off"),
+    ("U", "take the mark off"),
+    ("M", "walk only the pictures that are marked"),
+    ("Ctrl+X", "frame a crop; Enter saves it as a copy, Esc leaves it"),
     ("Ctrl+Drag", "drag the picture into another window"),
     ("Ctrl+C", "copy the picture"),
     ("Ctrl+V", "show the picture on the clipboard"),
@@ -2959,6 +2993,8 @@ mod tests {
             hovering: false,
             thumbnail: None,
             visible: (0.0, 0.0, 1.0, 1.0),
+            mark: crate::cull::Mark::Unmarked,
+            filtered: false,
         }
     }
 

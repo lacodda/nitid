@@ -69,8 +69,10 @@ back on the startup path fails the build rather than quietly costing a tenth of
 a second.
 
 From there, arrow keys walk the folder, `?` shows every key, `I` says what the
-file says about itself, `H` draws a histogram of its own values, and `P` reads
+file says about itself, `H` draws a histogram of its own values, and `C` reads
 the pixel under the pointer in both the file's terms and the display's.
+`P` and `X` mark a picture as kept or rejected while you go through a shoot,
+and `M` then walks only the ones you marked.
 
 ## Install
 

@@ -227,6 +227,13 @@ pub struct LoadedImage {
     /// 0.03 to 1.7 ms measured, so it happens on every open rather than being
     /// deferred to the first time the panel is asked for.
     pub metadata: crate::metadata::Metadata,
+    /// What this picture was judged to be worth while going through a folder.
+    ///
+    /// Read here, from the same bytes as the metadata and for the same
+    /// reasons: it is something the file *says*, so it is settled on this
+    /// side of the sandbox, and reading it twice would mean opening the file
+    /// again for one tag.
+    pub mark: crate::cull::Mark,
     /// The ICC profile the file carries, if any.
     ///
     /// `None` means untagged, which by convention means sRGB — the assumption
@@ -323,6 +330,11 @@ fn decode_with(bytes: &[u8], confinement: Confinement) -> Result<LoadedImage> {
         // speaks — the decoder is the untrusted half.
         let mut loaded = crate::sandbox::decode(bytes, format).with_context(|| format!("decoding the {}", format.name()))?;
         loaded.metadata = crate::metadata::read(bytes);
+        // The mark for the same reason and from the same bytes. Easy to miss:
+        // this is the second way a file becomes a `LoadedImage`, and a fact
+        // added to the first one does not arrive here by itself — a sandboxed
+        // HEIC would simply have shown no mark, with nothing to say why.
+        loaded.mark = crate::cull::from_bytes(bytes);
         return Ok(loaded);
     }
 
@@ -342,6 +354,7 @@ fn decode_with(bytes: &[u8], confinement: Confinement) -> Result<LoadedImage> {
             // practice, and their decoders deliver the canvas as shown.
             orientation: Orientation::Normal,
             metadata: crate::metadata::read(bytes),
+            mark: crate::cull::from_bytes(bytes),
             caveat: colour_caveat(bytes, format),
             fidelity: Fidelity::Full,
             format,
@@ -366,6 +379,7 @@ fn decode_with(bytes: &[u8], confinement: Confinement) -> Result<LoadedImage> {
             fidelity: Fidelity::Full,
             format,
             metadata: crate::metadata::read(bytes),
+            mark: crate::cull::from_bytes(bytes),
             caveat: colour_caveat(bytes, format),
             profile: None,
             vector: Some(vector),
@@ -412,6 +426,7 @@ fn decode_with(bytes: &[u8], confinement: Confinement) -> Result<LoadedImage> {
         fidelity: Fidelity::Full,
         format,
         metadata: crate::metadata::read(bytes),
+        mark: crate::cull::from_bytes(bytes),
         caveat: colour_caveat(bytes, format),
         profile,
         // A raster format is its pixels; there is nothing to redraw from.
@@ -465,6 +480,7 @@ pub fn decode_thumbnail(bytes: &[u8]) -> Option<LoadedImage> {
         // The same file, so the same metadata: the quick frame is what the
         // panel describes until the full image replaces it.
         metadata: crate::metadata::read(bytes),
+        mark: crate::cull::from_bytes(bytes),
         caveat: colour_caveat(bytes, format),
         // The orientation tag lives in the primary IFD and applies to both the
         // full image and its thumbnail, so the quick frame is not shown
@@ -515,6 +531,7 @@ fn decode_heic_thumbnail(bytes: &[u8]) -> Option<LoadedImage> {
     Some(LoadedImage {
         image,
         metadata: crate::metadata::read(bytes),
+        mark: crate::cull::from_bytes(bytes),
         caveat: colour_caveat(bytes, Format::Heic),
         // HEIC states its rotation in the container and the decoder applies
         // it — to the thumbnail as much as to the full image, since both are
@@ -1832,6 +1849,7 @@ mod tests {
             // Irrelevant to this test; any variant would do.
             format: Format::Png,
             metadata: Default::default(),
+            mark: Default::default(),
             profile: None,
             vector: None,
             animation: None,
