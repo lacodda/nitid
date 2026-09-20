@@ -105,6 +105,27 @@ pub mod testing {
     /// fallback does.
     pub use crate::export::cut;
 
+    /// Marking a picture, for the gate that asks Windows whether it can see
+    /// the mark. Named after what they mean rather than exposing the enum,
+    /// so the gate reads as the promise it holds: a kept picture shows a star
+    /// in Explorer, a cleared one does not, and a rejected one is not mistaken
+    /// for a rating.
+    pub fn mark_kept(path: &std::path::Path) -> anyhow::Result<()> {
+        crate::cull::write(path, crate::cull::Mark::Keep)
+    }
+
+    pub fn mark_rejected(path: &std::path::Path) -> anyhow::Result<()> {
+        crate::cull::write(path, crate::cull::Mark::Reject)
+    }
+
+    pub fn mark_cleared(path: &std::path::Path) -> anyhow::Result<()> {
+        crate::cull::write(path, crate::cull::Mark::Unmarked)
+    }
+
+    pub fn is_rejected(path: &std::path::Path) -> bool {
+        crate::cull::read(path) == crate::cull::Mark::Reject
+    }
+
     /// Every key the key sheet advertises, for the test that holds the README
     /// to it. The two lists are written for different readers and drifted
     /// apart silently until v0.23.1 tied them together.
