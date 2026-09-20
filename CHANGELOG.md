@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.33.0] - 2026-09-20
+
+### Bug Fixes
+- Stop a rejected frame showing as a favourite
+- Read a mark back before calling it saved
+
+### Features
+- Mark a picture where Explorer can see it
+- Walk only the pictures a filter admits
+- Keep, reject and walk only what was marked
+- Put keep, reject and the filter on the toolbar
+
+### Testing
+- Hold a hint to the key its own button asks for
+
 ## [0.32.0] - 2026-09-19
 
 ### Documentation
