@@ -4042,6 +4042,147 @@ mod tests {
         );
     }
 
+    /// Every key a toolbar hint names is the key that button actually asks
+    /// for.
+    ///
+    /// Not merely "a key the viewer answers" — that was this gate's first
+    /// shape and it was useless, which mutation showed straight away: putting
+    /// the eyedropper's hint back to `(P)` left it green, because `P` is a key
+    /// the viewer answers perfectly well. It just belongs to something else
+    /// now. The property worth holding is that a button's text and a button's
+    /// behaviour name the same key.
+    ///
+    /// That is what went wrong in v0.33: the eyedropper moved from `P` to `C`
+    /// and the clipping zebra from `C` to `G`, both buttons went on printing
+    /// the old letter, and all 616 tests stayed green. The action-to-key tests
+    /// hold the wiring and never read the words.
+    ///
+    /// Asserted on the source text because the hints are literals handed to
+    /// `egui` with nothing to read them back from — the same trade the crop
+    /// gate below makes: a weaker test than driving the interface, against no
+    /// test at all for something the user reads.
+    #[test]
+    fn every_toolbar_hint_names_the_key_its_own_button_asks_for() {
+        let source = include_str!("interface.rs");
+        let toolbar = source.split("fn toolbar(").nth(1).expect("interface.rs has a `toolbar`");
+        let body = toolbar.split("\n/// One toolbar button").next().expect("a body");
+
+        // Each button pairs a hint with the action it asks for, in that order:
+        // `button(ui, "Fit", "Fit to window  (0)", showing, Action::Fit)`, or
+        // the same across several lines for a `toggle`. So the hint is the
+        // last string literal before an `Action::…`, and the pair is what this
+        // reads.
+        let mut checked = 0;
+        let mut literal = None;
+        let pattern = regex_lite_strings(body);
+        for token in pattern {
+            match token {
+                Token::Text(text) => literal = Some(text),
+                Token::Action(name) => {
+                    let Some(hint) = literal.take() else { continue };
+                    let Some(named) = key_named_in(&hint) else { continue };
+                    let Some(action) = action_named(&name) else { continue };
+
+                    let wanted = key_for(action);
+                    let Key::Character(asks) = &wanted else {
+                        // A named key: the hint spells it out ("F11") and this
+                        // gate does not rebuild that mapping from text.
+                        continue;
+                    };
+
+                    // Case is compared only where it carries meaning. A bare
+                    // letter is answered in both cases — the hints write `(R)`
+                    // for a key `key_for` states as "r" — but `Shift+R` and
+                    // `R` are different keys, and the shifted form arrives as
+                    // the capital, so a hint saying `Shift+` has to match one.
+                    let shifted = named.chars().next().is_some_and(char::is_uppercase) && asks.chars().next().is_some_and(char::is_uppercase);
+                    let agrees = if named.chars().any(char::is_alphabetic) && !shifted {
+                        named.eq_ignore_ascii_case(asks.as_str())
+                    } else {
+                        named.as_str() == asks.as_str()
+                    };
+                    assert!(agrees, "the toolbar hint {hint:?} tells the user {named:?}, but its button asks for {asks:?}",);
+                    checked += 1;
+                }
+            }
+        }
+
+        // A gate that found nothing to check has quietly stopped working: the
+        // hints could all have been rewritten into a shape it no longer reads.
+        assert!(
+            checked >= 8,
+            "only {checked} toolbar hints were checked, so this gate is no longer reading them"
+        );
+    }
+
+    enum Token {
+        Text(String),
+        Action(String),
+    }
+
+    /// The string literals and `Action::…` names of a block of source, in the
+    /// order they appear.
+    fn regex_lite_strings(body: &str) -> Vec<Token> {
+        let mut out = Vec::new();
+        let bytes: Vec<char> = body.chars().collect();
+        let mut at = 0;
+        while at < bytes.len() {
+            if bytes[at] == '"' {
+                let mut text = String::new();
+                at += 1;
+                while at < bytes.len() && bytes[at] != '"' {
+                    text.push(bytes[at]);
+                    at += 1;
+                }
+                at += 1;
+                out.push(Token::Text(text));
+                continue;
+            }
+            if bytes[at..].starts_with(&['A', 'c', 't', 'i', 'o', 'n', ':', ':']) {
+                let mut name = String::new();
+                at += "Action::".len();
+                while at < bytes.len() && (bytes[at].is_alphanumeric() || bytes[at] == '_') {
+                    name.push(bytes[at]);
+                    at += 1;
+                }
+                out.push(Token::Action(name));
+                continue;
+            }
+            at += 1;
+        }
+        out
+    }
+
+    /// The bare key a hint names in its parenthesised tail, if it names one
+    /// this gate can compare: a single character, optionally with `Shift`.
+    ///
+    /// Chords and named keys (`F11`, `Ctrl+C`) are skipped rather than
+    /// guessed at — `key_for` answers them with `Key::Named`, and a gate that
+    /// tried to rebuild those from text would be a second copy of the mapping.
+    fn key_named_in(hint: &str) -> Option<String> {
+        let open = hint.rfind('(')?;
+        let close = hint.rfind(')')?;
+        if close < open || !hint[close + 1..].trim().is_empty() {
+            return None;
+        }
+        let named = &hint[open + 1..close];
+        let bare = named.strip_prefix("Shift+").unwrap_or(named);
+        // One ASCII character. The arrow glyphs are a single character too and
+        // stand for named keys, which `key_for` answers with `Key::Named` —
+        // comparing those here would mean rebuilding that mapping from text.
+        if bare.chars().count() != 1 || !bare.is_ascii() {
+            return None;
+        }
+        // Shift arrives as the capital letter, which is how the viewer reads
+        // it and how `key_for` states it.
+        Some(if named.starts_with("Shift+") { bare.to_uppercase() } else { bare.to_string() })
+    }
+
+    /// The `Action` a name stands for, for the ones this gate compares.
+    fn action_named(name: &str) -> Option<Action> {
+        EVERY_ACTION.into_iter().find(|action| format!("{action:?}") == name)
+    }
+
     /// A crop never lands on a file that is already there.
     ///
     /// This is the one thing in the crop that can destroy something: a name
