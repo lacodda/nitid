@@ -27,13 +27,18 @@ remember.
 folder without stopping to decide anything irreversible, and then look at what
 came out. `Del` is still there for the frames you are sure about.
 
-**The mark goes into the file, where everything else can see it.** It is
-written as the EXIF rating Windows itself uses, so a picture you kept shows up
-with a star in Explorer's own Rating column, in its Properties, and in any
-program that reads a rating — this is the whole reason a viewer's selection is
-worth making. The alternative, a small file written beside the picture, would
-have been a mark only nitid could see, and it would be left behind the first
-time the photograph was copied somewhere.
+**The mark goes into the file, where everything else can see it.** A picture
+you kept is written as the EXIF rating Windows itself uses, so it shows up with
+a star in Explorer's own Rating column, in its Properties, and in any program
+that reads a rating — this is the whole reason a viewer's selection is worth
+making. A rejected one is written as the XMP rating Lightroom and Bridge use
+for their reject flag, which Explorer honestly reports as unrated: Windows has
+no "rejected" to show, and a reject dressed up as one star would turn a folder
+of discards into a folder of favourites.
+
+The alternative, a small file written beside the picture, would have been a
+mark only nitid could see, and it would be left behind the first time the
+photograph was copied somewhere.
 
 Only the metadata block is rewritten. A marked JPEG is identical to the one
 that went in from its start-of-scan marker onward — the same promise `Ctrl+S`
