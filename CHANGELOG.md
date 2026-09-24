@@ -2,6 +2,17 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.34.0] - 2026-09-24
+
+### Build
+- Generate the dowel tokens into constants
+
+### Documentation
+- Say where the chrome's colours come from
+
+### Features
+- Draw the chrome in the line's colours and top bar
+
 ## [0.33.0] - 2026-09-20
 
 ### Bug Fixes

@@ -94,11 +94,12 @@ app*. Full instructions: [Getting Started](https://lacodda.github.io/nitid/getti
 
 ## Status
 
-v0.33.0, in daily use on Windows. Startup, colour and HDR hold end to end;
+v0.34.0, in daily use on Windows. Startup, colour and HDR hold end to end;
 every modern still format opens and the animated ones play; images past what a
 GPU texture can hold are drawn as tiles; a picture can be cropped, turned and
 stripped of its metadata without an encoder ever running, and a shoot can be
-culled into a selection Explorer itself can see. What landed in each
+culled into a selection Explorer itself can see. The chrome wears the lacodda
+line's colours in light and dark, straight from its design tokens. What landed in each
 version: [CHANGELOG](https://github.com/lacodda/nitid/blob/main/CHANGELOG.md).
 
 ## Documentation
