@@ -88,3 +88,23 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build on the declared MSRV
         run: cargo check --all-targets
+
+  # assets/dowel/ is a copy of a published dowel-ui release, and the build
+  # turns it into the interface's colours. A copy that was edited by hand, or
+  # taken from a local dowel build that never shipped, would still compile —
+  # so fetch the release the palette names and compare both files byte for
+  # byte.
+  tokens:
+    name: dowel tokens
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Compare assets/dowel with the release it names
+        run: |
+          version=$(jq -r '."$extensions"."com.lacodda.dowel".version' assets/dowel/palette.json)
+          echo "assets/dowel names dowel-ui $version"
+          cd "$RUNNER_TEMP"
+          npm pack "dowel-ui@$version" --silent
+          tar xzf "dowel-ui-$version.tgz"
+          cmp package/dist/palettes/nitid.json "$GITHUB_WORKSPACE/assets/dowel/palette.json"
+          cmp package/dist/tokens.json "$GITHUB_WORKSPACE/assets/dowel/tokens.json"

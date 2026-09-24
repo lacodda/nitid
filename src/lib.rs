@@ -48,6 +48,7 @@ mod scrub;
 #[cfg(windows)]
 mod single;
 mod startup;
+mod theme;
 mod tiles;
 mod vector;
 mod view;

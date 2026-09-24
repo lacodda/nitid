@@ -1,0 +1,349 @@
+{
+  "$description": "nitid - every colour of the dowel theme on the cyan accent #3FA9D9, resolved by a browser, in both themes. For a consumer that cannot evaluate CSS; the formulas live in theme.css.",
+  "$extensions": {
+    "com.lacodda.dowel": {
+      "package": "dowel-ui",
+      "version": "0.31.0",
+      "product": "nitid",
+      "code": "nd",
+      "accent": "#3FA9D9"
+    }
+  },
+  "color": {
+    "$type": "color",
+    "dark": {
+      "bg": {
+        "$value": "#171b20"
+      },
+      "raise": {
+        "$value": "#1f232a"
+      },
+      "soft": {
+        "$value": "#ffffff0b"
+      },
+      "softer": {
+        "$value": "#ffffff06"
+      },
+      "line": {
+        "$value": "#ffffff14"
+      },
+      "line-2": {
+        "$value": "#ffffff26"
+      },
+      "text": {
+        "$value": "#e3e5ee"
+      },
+      "dim": {
+        "$value": "#a0a3b1"
+      },
+      "faint": {
+        "$value": "#6c707f"
+      },
+      "accent": {
+        "$value": "#3fa9d9"
+      },
+      "accent-2": {
+        "$value": "#72bce2"
+      },
+      "accent-soft": {
+        "$value": "#3fa9d929"
+      },
+      "good": {
+        "$value": "#45d18f"
+      },
+      "warn": {
+        "$value": "#e8b13f"
+      },
+      "bad": {
+        "$value": "#ef6a6a"
+      },
+      "info": {
+        "$value": "#4cc4e0"
+      },
+      "good-soft": {
+        "$value": "#45d18f24"
+      },
+      "warn-soft": {
+        "$value": "#e8b13f24"
+      },
+      "bad-soft": {
+        "$value": "#ef6a6a24"
+      },
+      "info-soft": {
+        "$value": "#4cc4e026"
+      },
+      "series-1": {
+        "$value": "#3987e5"
+      },
+      "series-2": {
+        "$value": "#d95926"
+      },
+      "series-3": {
+        "$value": "#199e70"
+      },
+      "series-4": {
+        "$value": "#c98500"
+      },
+      "series-5": {
+        "$value": "#d55181"
+      },
+      "series-6": {
+        "$value": "#008300"
+      },
+      "series-7": {
+        "$value": "#9085e9"
+      },
+      "series-8": {
+        "$value": "#a3215a"
+      },
+      "scale-100": {
+        "$value": "#0d366b"
+      },
+      "scale-200": {
+        "$value": "#184f95"
+      },
+      "scale-300": {
+        "$value": "#256abf"
+      },
+      "scale-400": {
+        "$value": "#2a78d6"
+      },
+      "scale-500": {
+        "$value": "#3987e5"
+      },
+      "scale-600": {
+        "$value": "#5598e7"
+      },
+      "scale-700": {
+        "$value": "#86b6ef"
+      },
+      "chart-grid": {
+        "$value": "#ffffff0f"
+      },
+      "chart-axis": {
+        "$value": "#ffffff24"
+      },
+      "heat-1": {
+        "$value": "#28528e"
+      },
+      "heat-2": {
+        "$value": "#3a65a3"
+      },
+      "heat-3": {
+        "$value": "#4d78b7"
+      },
+      "heat-4": {
+        "$value": "#608ccd"
+      },
+      "heat-5": {
+        "$value": "#73a0e2"
+      },
+      "syntax-keyword": {
+        "$value": "#c792ea"
+      },
+      "syntax-string": {
+        "$value": "#9ccc65"
+      },
+      "syntax-number": {
+        "$value": "#f78c6c"
+      },
+      "syntax-comment": {
+        "$value": "#9e99a6"
+      },
+      "syntax-name": {
+        "$value": "#82aaff"
+      },
+      "syntax-type": {
+        "$value": "#4dd0b1"
+      },
+      "syntax-punctuation": {
+        "$value": "#c4bfcb"
+      },
+      "syntax-meta": {
+        "$value": "#f0a868"
+      },
+      "on-accent": {
+        "$value": "#000000"
+      },
+      "on-good": {
+        "$value": "#000000"
+      },
+      "on-warn": {
+        "$value": "#000000"
+      },
+      "on-bad": {
+        "$value": "#000000"
+      },
+      "on-info": {
+        "$value": "#000000"
+      }
+    },
+    "light": {
+      "bg": {
+        "$value": "#ecf1f5"
+      },
+      "raise": {
+        "$value": "#ffffff"
+      },
+      "soft": {
+        "$value": "#30526c0d"
+      },
+      "softer": {
+        "$value": "#30526c08"
+      },
+      "line": {
+        "$value": "#293c511c"
+      },
+      "line-2": {
+        "$value": "#293c5133"
+      },
+      "text": {
+        "$value": "#262730"
+      },
+      "dim": {
+        "$value": "#626774"
+      },
+      "faint": {
+        "$value": "#868998"
+      },
+      "accent": {
+        "$value": "#006d9a"
+      },
+      "accent-2": {
+        "$value": "#00507b"
+      },
+      "accent-soft": {
+        "$value": "#3fa9d91f"
+      },
+      "good": {
+        "$value": "#0c8554"
+      },
+      "warn": {
+        "$value": "#9a6b0c"
+      },
+      "bad": {
+        "$value": "#c93b3b"
+      },
+      "info": {
+        "$value": "#0d7f9c"
+      },
+      "good-soft": {
+        "$value": "#0c85541f"
+      },
+      "warn-soft": {
+        "$value": "#9a6b0c24"
+      },
+      "bad-soft": {
+        "$value": "#c93b3b1f"
+      },
+      "info-soft": {
+        "$value": "#0d7f9c1c"
+      },
+      "series-1": {
+        "$value": "#2a78d6"
+      },
+      "series-2": {
+        "$value": "#eb6834"
+      },
+      "series-3": {
+        "$value": "#1baf7a"
+      },
+      "series-4": {
+        "$value": "#eda100"
+      },
+      "series-5": {
+        "$value": "#e87ba4"
+      },
+      "series-6": {
+        "$value": "#008300"
+      },
+      "series-7": {
+        "$value": "#4a3aa7"
+      },
+      "series-8": {
+        "$value": "#85284d"
+      },
+      "scale-100": {
+        "$value": "#cde2fb"
+      },
+      "scale-200": {
+        "$value": "#9ec5f4"
+      },
+      "scale-300": {
+        "$value": "#6da7ec"
+      },
+      "scale-400": {
+        "$value": "#3987e5"
+      },
+      "scale-500": {
+        "$value": "#2a78d6"
+      },
+      "scale-600": {
+        "$value": "#1c5cab"
+      },
+      "scale-700": {
+        "$value": "#104281"
+      },
+      "chart-grid": {
+        "$value": "#293c5114"
+      },
+      "chart-axis": {
+        "$value": "#293c512e"
+      },
+      "heat-1": {
+        "$value": "#84a8fd"
+      },
+      "heat-2": {
+        "$value": "#7193e7"
+      },
+      "heat-3": {
+        "$value": "#5e7fd1"
+      },
+      "heat-4": {
+        "$value": "#4c6cbb"
+      },
+      "heat-5": {
+        "$value": "#3b58a6"
+      },
+      "syntax-keyword": {
+        "$value": "#7c3aad"
+      },
+      "syntax-string": {
+        "$value": "#276c2b"
+      },
+      "syntax-number": {
+        "$value": "#b5451b"
+      },
+      "syntax-comment": {
+        "$value": "#6f6b78"
+      },
+      "syntax-name": {
+        "$value": "#1a5fb4"
+      },
+      "syntax-type": {
+        "$value": "#00695c"
+      },
+      "syntax-punctuation": {
+        "$value": "#4a4753"
+      },
+      "syntax-meta": {
+        "$value": "#9c4a00"
+      },
+      "on-accent": {
+        "$value": "#ffffff"
+      },
+      "on-good": {
+        "$value": "#ffffff"
+      },
+      "on-warn": {
+        "$value": "#ffffff"
+      },
+      "on-bad": {
+        "$value": "#ffffff"
+      },
+      "on-info": {
+        "$value": "#ffffff"
+      }
+    }
+  }
+}
