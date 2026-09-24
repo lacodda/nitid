@@ -8,7 +8,11 @@ status line along the bottom saying what is on screen — the file, where it sit
 in the folder, its size, format, bit depth, what the colour transform is doing,
 and the zoom — and everything else appears when you reach for it.
 
-Move the pointer to the top of the window and a toolbar comes down: step
+Move the pointer to the top of the window and a toolbar comes down. It is the
+top bar every product of the lacodda line opens with: the mark and the name on
+the left, then where the file lives as a trail of folders — the ones nearest
+the file stay when the window is narrow, and the full path is in its tooltip —
+and the actions on the right: step
 through the folder, zoom, fit, actual size, turn, the zoom lock, the backdrop,
 the Info panel, the histogram, the clipping zebra, the eyedropper, full
 screen. It carries nothing the keyboard does not, and every button names its
@@ -21,6 +25,23 @@ photograph alone and the chrome arrives on the frame after — measured at 44 to
 intent. The startup promise is unchanged: first pixels in 407 to 509
 milliseconds on the same file that took 489 to 528 before the interface
 existed.
+
+## Light, dark and the line's colours
+
+The chrome follows Windows: a light theme when apps are set to light, a dark
+one otherwise, switching the moment the setting changes. Both are the colours
+of [dowel](https://github.com/lacodda/dowel), the design system the line's
+products share, resolved for nitid's cyan — the same surfaces, lines, text
+greys and control radius as the rest of the line.
+
+Two things are deliberately not themed. The grey behind the photograph stays
+neutral in both themes, because a tinted backdrop shifts how the picture's own
+colours are judged. And marks drawn on the photograph — the crop frame, the
+eyedropper — stay black and white, the way a camera's focus frame is, so they
+read on any picture.
+
+There is still no splash screen: the window stays hidden until the first frame
+of the photograph is ready.
 
 Drawing it correctly on an HDR surface took a detour worth knowing about. egui
 picks how to encode its output from whether the target is an sRGB format, and
