@@ -91,14 +91,23 @@ pub fn image_near(ico: &[u8], wanted: u32) -> Option<&[u8]> {
     ico.get(best.offset..best.offset + best.length)
 }
 
-/// Decode one of the embedded images into an icon `winit` can take.
-fn icon_at(wanted: u32) -> Option<winit::window::Icon> {
+/// One of the embedded images, decoded: its pixels as RGBA and its size.
+///
+/// The toolbar draws the mark from here too, so the mark in the bar is the
+/// mark on the taskbar by construction rather than by a second copy agreeing.
+pub fn rgba(wanted: u32) -> Option<(Vec<u8>, u32, u32)> {
     let payload = image_near(ICO, wanted)?;
     // The payloads are PNG, which this build already decodes for pictures.
     let decoded = image::load_from_memory_with_format(payload, image::ImageFormat::Png).ok()?;
     let rgba = decoded.to_rgba8();
     let (width, height) = rgba.dimensions();
-    winit::window::Icon::from_rgba(rgba.into_raw(), width, height).ok()
+    Some((rgba.into_raw(), width, height))
+}
+
+/// Decode one of the embedded images into an icon `winit` can take.
+fn icon_at(wanted: u32) -> Option<winit::window::Icon> {
+    let (pixels, width, height) = rgba(wanted)?;
+    winit::window::Icon::from_rgba(pixels, width, height).ok()
 }
 
 /// The icon for the titlebar and the Alt+Tab list.

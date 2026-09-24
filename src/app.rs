@@ -3711,7 +3711,10 @@ impl ApplicationHandler<Event> for App {
             egui::ViewportId::ROOT,
             &window,
             Some(window.scale_factor() as f32),
-            None,
+            // The system's theme from the first frame, so the chrome does not
+            // open dark and turn light a moment later. Changes after this
+            // arrive as `ThemeChanged`, which egui-winit already answers.
+            window.theme(),
             None,
         ));
         self.renderer = Some(renderer);

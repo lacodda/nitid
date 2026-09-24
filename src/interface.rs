@@ -307,6 +307,10 @@ pub struct Interface {
     /// Keyed by the copy it was made from, so a step to another picture
     /// replaces it and a redraw of the same one does not.
     minimap_texture: Option<(egui::TextureHandle, usize)>,
+    /// The mark at the left of the toolbar, uploaded the first time the bar
+    /// is shown. Not before: the bar starts hidden, and nothing that is not
+    /// on the first frame is allowed to cost the first frame anything.
+    mark_texture: Option<egui::TextureHandle>,
     /// Whether the colour passport is showing.
     passport_shown: bool,
     /// Whether the toolbar is showing, decided by where the pointer is.
@@ -394,15 +398,10 @@ impl Interface {
     pub fn new() -> Self {
         let context = egui::Context::default();
         context.set_fonts(fonts());
-        // The viewer is dark by decision, not by system theme: the scene
-        // behind a photograph stays dark so the photograph is what is lit.
-        let mut visuals = egui::Visuals::dark();
-        // The interface is chrome over a photograph, so it has no backdrop of
-        // its own: each panel paints the strip it occupies and the rest stays
-        // the picture. egui's root fill is only ever drawn where a panel is
-        // not, which is exactly where the photograph should be showing.
-        visuals.panel_fill = egui::Color32::TRANSPARENT;
-        context.set_visuals(visuals);
+        // The chrome is the line's, in whichever theme the system is in. The
+        // scene behind the photograph is not chrome and does not follow: it
+        // is the renderer's neutral grey in both, see `theme`.
+        crate::theme::apply(&context);
         Self {
             context,
             keys_shown: false,
@@ -418,6 +417,7 @@ impl Interface {
             cleaned: None,
             save_focused: false,
             minimap_texture: None,
+            mark_texture: None,
             passport_shown: false,
             toolbar_shown: false,
             settings_shown: false,
@@ -698,6 +698,7 @@ impl Interface {
         // of the picture on every frame would put a texture upload inside a
         // drag, which is exactly where the viewer must not spend anything.
         let mut minimap_texture = self.minimap_texture.take();
+        let mut mark_texture = self.mark_texture.take();
         // Taken out for the frame and put back after, the way the texture is:
         // the closure cannot hold a borrow of `self`.
         let mut renaming = self.renaming.take();
@@ -729,7 +730,7 @@ impl Interface {
         // 0.36 panels are shown inside a `Ui`, and this is the one they sit in.
         let output = self.context.clone().run_ui(raw, |ui| {
             if toolbar_shown {
-                action = toolbar(ui, status, info_shown, histogram_shown);
+                action = toolbar(ui, status, info_shown, histogram_shown, &mut mark_texture);
             }
             if status_shown {
                 action = action.or(status_line(ui, status));
@@ -773,6 +774,7 @@ impl Interface {
             toast_stack(ui, &toasts);
         });
         self.minimap_texture = minimap_texture;
+        self.mark_texture = mark_texture;
         self.cropped = crop_action;
         // A press on the bar happened inside this layout, so the frame that
         // carried it was drawn before the box moved. The frame that agrees
@@ -936,7 +938,14 @@ impl Interface {
     }
 }
 
-/// The strip along the top: the things you would reach for with a mouse.
+/// The strip along the top: which product and which file on the left, the
+/// things you would reach for with a mouse on the right.
+///
+/// The shape is the line's top bar — kilna and scheda open with the same one:
+/// the mark and the name, then where you are as a trail, then the actions.
+/// What stays nitid's own is that the bar is not always there: it comes down
+/// when the pointer goes to the top of the window and leaves with it, because
+/// in a viewer the photograph has the window, not the chrome.
 ///
 /// It carries nothing that is not also a key, and every button says its key in
 /// its tooltip — the toolbar is a way in for a hand on the mouse, not a second
@@ -945,120 +954,216 @@ impl Interface {
 /// A button is disabled rather than hidden when it would do nothing: a strip
 /// whose contents move about as folders change is harder to aim at than one
 /// that is always the same shape.
-fn toolbar(ui: &mut egui::Ui, status: &Status, info_shown: bool, histogram_shown: bool) -> Option<Action> {
-    let mut action = None;
+fn toolbar(ui: &mut egui::Ui, status: &Status, info_shown: bool, histogram_shown: bool, mark: &mut Option<egui::TextureHandle>) -> Option<Action> {
     let alone = status.position.is_none_or(|(_, count)| count <= 1);
     let showing = status.size.is_some();
 
     egui::Panel::top("toolbar")
-        .frame(
-            egui::Frame::new()
-                .fill(egui::Color32::from_rgba_unmultiplied(14, 16, 20, 220))
-                .inner_margin(egui::Margin::symmetric(8, 4)),
-        )
+        .frame(egui::Frame::new().fill(crate::theme::panel(ui)).inner_margin(egui::Margin::symmetric(8, 4)))
         .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                action = button(ui, "◀", "Previous image  (←)", !alone, Action::Previous)
-                    .or(button(ui, "▶", "Next image  (→)", !alone, Action::Next))
+            // The actions are laid out first, from the right, so they always
+            // get their room; the identity on the left takes what is left,
+            // and it is the trail that gives way on a narrow window.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Right to left, so the first added is the rightmost. The two
+                // that carry a state show which one they are in rather than
+                // only what they would do.
+                let chosen = button(ui, "?", "Keys  (?)", true, Action::Keys)
+                    .or(button(ui, "⚙", "Settings  (,)", true, Action::Settings))
+                    .or(button(ui, "⛶", "Full screen  (F11)", true, Action::FullScreen))
+                    .or(toggle(ui, "Info", "What the file says about itself  (I)", showing, info_shown, Action::Info))
+                    .or(toggle(
+                        ui,
+                        "Tones",
+                        "What tones the picture is made of  (H)",
+                        showing,
+                        histogram_shown,
+                        Action::Histogram,
+                    ))
+                    .or(toggle(
+                        ui,
+                        "Clip",
+                        "Mark what the file clipped  (G)",
+                        showing,
+                        status.clipping,
+                        Action::Clipping,
+                    ))
+                    .or(toggle(
+                        ui,
+                        "Pick",
+                        "Read the colour under the pointer  (C)",
+                        showing,
+                        status.picking,
+                        Action::Pick,
+                    ))
                     .or_else(|| {
                         separator(ui);
                         None
                     })
-                    .or(button(ui, "−", "Zoom out  (-)", showing, Action::ZoomOut))
-                    .or(button(ui, "+", "Zoom in  (+)", showing, Action::ZoomIn))
-                    .or(button(ui, "Fit", "Fit to window  (0)", showing, Action::Fit))
-                    .or(button(ui, "1:1", "Actual size  (1)", showing, Action::Actual))
+                    // The cull, in the order the hand meets it: judge this
+                    // one, judge it the other way, then look at what the
+                    // judging produced.
+                    .or(toggle(
+                        ui,
+                        "Keep",
+                        "Keep this one; again to take the mark off  (P)",
+                        showing,
+                        status.mark == crate::cull::Mark::Keep,
+                        Action::Keep,
+                    ))
+                    .or(toggle(
+                        ui,
+                        "Reject",
+                        "Reject this one; again to take the mark off  (X)",
+                        showing,
+                        status.mark == crate::cull::Mark::Reject,
+                        Action::Reject,
+                    ))
+                    .or(toggle(
+                        ui,
+                        "Marked",
+                        "Walk only the pictures that are marked  (M)",
+                        !alone,
+                        status.filtered,
+                        Action::Filter,
+                    ))
                     .or_else(|| {
                         separator(ui);
                         None
                     })
+                    .or(toggle(ui, "Lock", "Hold the framing across a step  (L)", !alone, status.locked, Action::Lock))
+                    .or(toggle(
+                        ui,
+                        status.backdrop.unwrap_or("scene"),
+                        "What shows through transparency  (B)",
+                        true,
+                        status.backdrop.is_some(),
+                        Action::Backdrop,
+                    ))
+                    .or_else(|| {
+                        separator(ui);
+                        None
+                    })
+                    .or(button(ui, "↻", "Turn clockwise  (R)", showing, Action::TurnRight))
                     .or(button(ui, "↺", "Turn anticlockwise  (Shift+R)", showing, Action::TurnLeft))
-                    .or(button(ui, "↻", "Turn clockwise  (R)", showing, Action::TurnRight));
-
-                // The right-hand end, laid out from the right. The two that
-                // carry a state show which one they are in rather than only
-                // what they would do.
-                let from_the_right = ui
-                    .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        button(ui, "?", "Keys  (?)", true, Action::Keys)
-                            .or(button(ui, "⚙", "Settings  (,)", true, Action::Settings))
-                            .or(button(ui, "⛶", "Full screen  (F11)", true, Action::FullScreen))
-                            .or(toggle(ui, "Info", "What the file says about itself  (I)", showing, info_shown, Action::Info))
-                            .or(toggle(
-                                ui,
-                                "Tones",
-                                "What tones the picture is made of  (H)",
-                                showing,
-                                histogram_shown,
-                                Action::Histogram,
-                            ))
-                            .or(toggle(
-                                ui,
-                                "Clip",
-                                "Mark what the file clipped  (G)",
-                                showing,
-                                status.clipping,
-                                Action::Clipping,
-                            ))
-                            .or(toggle(
-                                ui,
-                                "Pick",
-                                "Read the colour under the pointer  (C)",
-                                showing,
-                                status.picking,
-                                Action::Pick,
-                            ))
-                            .or_else(|| {
-                                separator(ui);
-                                None
-                            })
-                            // The cull, in the order the hand meets it: judge
-                            // this one, judge it the other way, then look at
-                            // what the judging produced.
-                            .or(toggle(
-                                ui,
-                                "Keep",
-                                "Keep this one; again to take the mark off  (P)",
-                                showing,
-                                status.mark == crate::cull::Mark::Keep,
-                                Action::Keep,
-                            ))
-                            .or(toggle(
-                                ui,
-                                "Reject",
-                                "Reject this one; again to take the mark off  (X)",
-                                showing,
-                                status.mark == crate::cull::Mark::Reject,
-                                Action::Reject,
-                            ))
-                            .or(toggle(
-                                ui,
-                                "Marked",
-                                "Walk only the pictures that are marked  (M)",
-                                !alone,
-                                status.filtered,
-                                Action::Filter,
-                            ))
-                            .or_else(|| {
-                                separator(ui);
-                                None
-                            })
-                            .or(toggle(ui, "Lock", "Hold the framing across a step  (L)", !alone, status.locked, Action::Lock))
-                            .or(toggle(
-                                ui,
-                                status.backdrop.unwrap_or("scene"),
-                                "What shows through transparency  (B)",
-                                true,
-                                status.backdrop.is_some(),
-                                Action::Backdrop,
-                            ))
+                    .or_else(|| {
+                        separator(ui);
+                        None
                     })
-                    .inner;
-                action = action.or(from_the_right);
-            });
-        });
+                    .or(button(ui, "1:1", "Actual size  (1)", showing, Action::Actual))
+                    .or(button(ui, "Fit", "Fit to window  (0)", showing, Action::Fit))
+                    .or(button(ui, "+", "Zoom in  (+)", showing, Action::ZoomIn))
+                    .or(button(ui, "−", "Zoom out  (-)", showing, Action::ZoomOut))
+                    .or_else(|| {
+                        separator(ui);
+                        None
+                    })
+                    .or(button(ui, "▶", "Next image  (→)", !alone, Action::Next))
+                    .or(button(ui, "◀", "Previous image  (←)", !alone, Action::Previous));
 
-    action
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| identity(ui, status, mark));
+                chosen
+            })
+            .inner
+        })
+        .inner
+}
+
+/// How big the mark is drawn in the bar, in points.
+const MARK_SIZE: f32 = 20.0;
+
+/// Which of the icon's images the mark is drawn from: the one that is at
+/// least the mark's size at 150%, the scale most laptops of the line run at.
+const MARK_PIXELS: u32 = 32;
+
+/// What goes between two steps of the trail.
+const TRAIL_STEP: &str = "  ›  ";
+
+/// The left of the bar: the mark, the name, and the trail to the file.
+fn identity(ui: &mut egui::Ui, status: &Status, mark: &mut Option<egui::TextureHandle>) {
+    if mark.is_none() {
+        *mark = crate::icon::rgba(MARK_PIXELS).map(|(pixels, width, height)| {
+            ui.ctx().load_texture(
+                "mark",
+                egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], &pixels),
+                egui::TextureOptions::LINEAR,
+            )
+        });
+    }
+    if let Some(texture) = mark {
+        ui.add(egui::Image::new((texture.id(), egui::vec2(MARK_SIZE, MARK_SIZE))));
+    }
+    ui.label(egui::RichText::new("nitid").strong());
+
+    let Some(path) = &status.path else {
+        return;
+    };
+    let steps = trail(path);
+    if steps.is_empty() {
+        return;
+    }
+    separator(ui);
+
+    // Measured with the font the steps are drawn in, so what is dropped is
+    // decided by what fits rather than by a count of characters.
+    let palette = crate::theme::palette(ui);
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let measure = |text: &str| ui.painter().layout_no_wrap(text.to_owned(), font.clone(), palette.text).size().x;
+    let room = ui.available_width();
+    let shown = fit_trail(&steps, room, &measure);
+
+    let mut job = egui::text::LayoutJob::default();
+    let dim = egui::TextFormat::simple(font.clone(), palette.dim);
+    let plain = egui::TextFormat::simple(font, palette.text);
+    if shown.len() < steps.len() {
+        job.append("…", 0.0, dim.clone());
+        job.append(TRAIL_STEP, 0.0, dim.clone());
+    }
+    for (index, step) in shown.iter().enumerate() {
+        let last = index + 1 == shown.len();
+        job.append(step, 0.0, if last { plain.clone() } else { dim.clone() });
+        if !last {
+            job.append(TRAIL_STEP, 0.0, dim.clone());
+        }
+    }
+    job.wrap = egui::text::TextWrapping::truncate_at_width(room);
+    ui.add(egui::Label::new(job).selectable(false)).on_hover_text(path.display().to_string());
+}
+
+/// The folders a file sits in, then the file: the steps of the trail.
+///
+/// The drive and the root are left out. A trail answers "where in my pictures
+/// is this", and `C:\` is on every one of them.
+fn trail(path: &std::path::Path) -> Vec<String> {
+    path.components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The steps that fit in `room`, dropping from the start.
+///
+/// The file is kept whatever happens — it is the one step the trail exists to
+/// show — and the folders nearest it go last, because the folder a picture is
+/// in says more than the one that folder is in. When a step is dropped, room
+/// is kept for the ellipsis that says so.
+fn fit_trail<'a>(steps: &'a [String], room: f32, measure: &dyn Fn(&str) -> f32) -> &'a [String] {
+    let separator = measure(TRAIL_STEP);
+    let ellipsis = measure("…") + separator;
+    let mut used = 0.0;
+    let mut first = steps.len();
+    for (index, step) in steps.iter().enumerate().rev() {
+        let width = measure(step) + if index + 1 < steps.len() { separator } else { 0.0 };
+        let keep_ellipsis = if index > 0 { ellipsis } else { 0.0 };
+        if first < steps.len() && used + width + keep_ellipsis > room {
+            break;
+        }
+        used += width;
+        first = index;
+    }
+    &steps[first..]
 }
 
 /// One toolbar button, reporting what it asks for when pressed.
@@ -1081,11 +1186,7 @@ fn toggle(ui: &mut egui::Ui, label: &str, hint: &str, enabled: bool, on: bool, w
 fn status_line(ui: &mut egui::Ui, status: &Status) -> Option<Action> {
     let mut action = None;
     egui::Panel::bottom("status")
-        .frame(
-            egui::Frame::new()
-                .fill(egui::Color32::from_rgba_unmultiplied(14, 16, 20, 220))
-                .inner_margin(egui::Margin::symmetric(10, 5)),
-        )
+        .frame(egui::Frame::new().fill(crate::theme::panel(ui)).inner_margin(egui::Margin::symmetric(10, 5)))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(&status.name).strong());
@@ -1206,11 +1307,7 @@ fn info_panel(ui: &mut egui::Ui, status: &Status) {
     egui::Panel::right("info")
         .exact_size(300.0)
         .resizable(false)
-        .frame(
-            egui::Frame::new()
-                .fill(egui::Color32::from_rgba_unmultiplied(14, 16, 20, 235))
-                .inner_margin(egui::Margin::symmetric(12, 10)),
-        )
+        .frame(egui::Frame::new().fill(crate::theme::panel(ui)).inner_margin(egui::Margin::symmetric(12, 10)))
         .show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.label(egui::RichText::new("Info").strong());
@@ -1379,9 +1476,9 @@ fn histogram_panel(ui: &mut egui::Ui, status: &Status) {
         .interactable(false)
         .show(ui.ctx(), |ui| {
             egui::Frame::new()
-                .fill(egui::Color32::from_rgba_unmultiplied(14, 16, 20, 235))
+                .fill(crate::theme::panel(ui))
                 .inner_margin(egui::Margin::symmetric(10, 8))
-                .corner_radius(6)
+                .corner_radius(crate::theme::PANEL_RADIUS)
                 .show(ui, |ui| {
                     ui.set_width(HISTOGRAM_WIDTH);
                     match &status.histogram {
@@ -1425,7 +1522,7 @@ fn plot_histogram(ui: &mut egui::Ui, histogram: &Histogram) {
 
     // The plot's own ground, so the curves are read against something rather
     // than against whatever part of the photograph is behind them.
-    painter.rect_filled(rect, 2.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 140));
+    painter.rect_filled(rect, crate::theme::dowel::radius::XS, crate::theme::PLOT_GROUND);
 
     // One column per bucket, its colour mixed from whichever channels reach
     // that height. Walking the buckets rather than the channels is what makes
@@ -1454,7 +1551,7 @@ fn plot_histogram(ui: &mut egui::Ui, histogram: &Histogram) {
                 continue;
             }
             // Which channels still reach into this band.
-            let colour = band_colour([heights[0] >= boundary, heights[1] >= boundary, heights[2] >= boundary]);
+            let colour = crate::theme::channels([heights[0] >= boundary, heights[1] >= boundary, heights[2] >= boundary]);
             painter.rect_filled(
                 egui::Rect::from_min_max(egui::pos2(x, rect.bottom() - boundary), egui::pos2(x + width, rect.bottom() - from)),
                 0.0,
@@ -1472,10 +1569,7 @@ fn plot_histogram(ui: &mut egui::Ui, histogram: &Histogram) {
         .enumerate()
         .map(|(bucket, count)| egui::pos2(rect.left() + bucket as f32 * width + width / 2.0, rect.bottom() - plot(*count)))
         .collect();
-    painter.add(egui::Shape::line(
-        line,
-        egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(240, 240, 245, 210)),
-    ));
+    painter.add(egui::Shape::line(line, egui::Stroke::new(1.0, crate::theme::LUMA)));
 
     ui.add_space(2.0);
     // What the axis means, because a histogram measured somewhere else answers
@@ -1486,23 +1580,6 @@ fn plot_histogram(ui: &mut egui::Ui, histogram: &Histogram) {
             ui.label(egui::RichText::new("highlights").weak().small());
         });
     });
-}
-
-/// The colour of one band of a histogram column: the channels present in it,
-/// added.
-///
-/// This is what stops the plot from being a picture of whichever channel was
-/// painted last. All three present is white — a neutral picture reads as one
-/// grey shape — and any two make the secondary between them, so a cast shows
-/// as the colour of the channels that are *missing* from a band.
-fn band_colour(lit: [bool; 3]) -> egui::Color32 {
-    /// How bright a channel is where it is present, and where it is not. The
-    /// floor is not zero: a band with one channel in it still has to read as a
-    /// column against the plot's dark ground.
-    const ON: u8 = 235;
-    const OFF: u8 = 30;
-
-    egui::Color32::from_rgb(if lit[0] { ON } else { OFF }, if lit[1] { ON } else { OFF }, if lit[2] { ON } else { OFF })
 }
 
 /// What the eyedropper reads, beside the pointer's own end of the window.
@@ -1517,9 +1594,9 @@ fn eyedropper_panel(ui: &mut egui::Ui, status: &Status, units: Units, magnifier:
         .interactable(false)
         .show(ui.ctx(), |ui| {
             egui::Frame::new()
-                .fill(egui::Color32::from_rgba_unmultiplied(14, 16, 20, 235))
+                .fill(crate::theme::panel(ui))
                 .inner_margin(egui::Margin::symmetric(12, 10))
-                .corner_radius(6)
+                .corner_radius(crate::theme::PANEL_RADIUS)
                 .show(ui, |ui| {
                     ui.set_width(EYEDROPPER_WIDTH);
                     let Some(reading) = status.reading else {
@@ -1545,7 +1622,7 @@ fn eyedropper_panel(ui: &mut egui::Ui, status: &Status, units: Units, magnifier:
                             // different colour from the pixel beside it.
                             let (rect, _) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::hover());
                             ui.painter()
-                                .rect_filled(rect, 3.0, egui::Color32::from_rgb(reading.display[0], reading.display[1], reading.display[2]));
+                                .rect_filled(rect, crate::theme::dowel::radius::XS, crate::theme::pixel(reading.display));
                             ui.label(egui::RichText::new(reading.hex()).strong().monospace());
                         });
                     }
@@ -1605,10 +1682,11 @@ fn neighbourhood(ui: &mut egui::Ui, around: &Neighbourhood) {
                 egui::vec2(NEIGHBOURHOOD_CELL, NEIGHBOURHOOD_CELL),
             );
             let colour = match around.cell(column, row) {
-                Some([r, g, b]) => egui::Color32::from_rgb(r, g, b),
-                // Outside the picture: a dark that is not a colour the file
-                // could hold, so it reads as absence rather than as black.
-                None => egui::Color32::from_rgb(28, 31, 37),
+                Some(pixel) => crate::theme::pixel(pixel),
+                // Outside the picture: the chrome's own ground, which is not
+                // a colour the file could hold, so it reads as absence rather
+                // than as black.
+                None => crate::theme::palette(ui).bg,
             };
             painter.rect_filled(cell, 0.0, colour);
         }
@@ -1624,8 +1702,8 @@ fn neighbourhood(ui: &mut egui::Ui, around: &Neighbourhood) {
             ),
         egui::vec2(NEIGHBOURHOOD_CELL, NEIGHBOURHOOD_CELL),
     );
-    painter.rect_stroke(centre, 0.0, egui::Stroke::new(1.0, egui::Color32::BLACK), egui::StrokeKind::Outside);
-    painter.rect_stroke(centre, 0.0, egui::Stroke::new(1.5, egui::Color32::WHITE), egui::StrokeKind::Inside);
+    painter.rect_stroke(centre, 0.0, egui::Stroke::new(1.0, crate::theme::MARK_EDGE), egui::StrokeKind::Outside);
+    painter.rect_stroke(centre, 0.0, egui::Stroke::new(1.5, crate::theme::MARK), egui::StrokeKind::Inside);
 }
 
 /// How wide the minimap is drawn, in logical points.
@@ -1703,9 +1781,9 @@ fn minimap_panel(ui: &mut egui::Ui, status: &Status, texture: &mut Option<(egui:
         .interactable(false)
         .show(ui.ctx(), |ui| {
             egui::Frame::new()
-                .fill(egui::Color32::from_rgba_unmultiplied(14, 16, 20, 235))
+                .fill(crate::theme::panel(ui))
                 .inner_margin(egui::Margin::same(5))
-                .corner_radius(6)
+                .corner_radius(crate::theme::PANEL_RADIUS)
                 .show(ui, |ui| {
                     let (map, _) = ui.allocate_exact_size(egui::vec2(MINIMAP_WIDTH, height), egui::Sense::hover());
                     let painter = ui.painter();
@@ -1713,7 +1791,7 @@ fn minimap_panel(ui: &mut egui::Ui, status: &Status, texture: &mut Option<(egui:
                         handle.id(),
                         map,
                         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                        egui::Color32::WHITE,
+                        crate::theme::UNTINTED,
                     );
                     frame_on_map(painter, map, status.visible);
                 });
@@ -1760,7 +1838,7 @@ fn frame_on_map(painter: &egui::Painter, map: egui::Rect, visible: (f32, f32, f3
 
     // What is off screen, dimmed, so the frame reads as "this part" rather
     // than as a rectangle drawn on a picture.
-    let shade = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 110);
+    let shade = crate::theme::SHADE;
     for outside in [
         egui::Rect::from_min_max(map.min, egui::pos2(map.right(), rect.top())),
         egui::Rect::from_min_max(egui::pos2(map.left(), rect.bottom()), map.max),
@@ -1772,13 +1850,8 @@ fn frame_on_map(painter: &egui::Painter, map: egui::Rect, visible: (f32, f32, f3
         }
     }
 
-    painter.rect_stroke(
-        rect,
-        0.0,
-        egui::Stroke::new(3.0, egui::Color32::from_black_alpha(160)),
-        egui::StrokeKind::Outside,
-    );
-    painter.rect_stroke(rect, 0.0, egui::Stroke::new(1.5, egui::Color32::WHITE), egui::StrokeKind::Inside);
+    painter.rect_stroke(rect, 0.0, egui::Stroke::new(3.0, crate::theme::MARK_EDGE), egui::StrokeKind::Outside);
+    painter.rect_stroke(rect, 0.0, egui::Stroke::new(1.5, crate::theme::MARK), egui::StrokeKind::Inside);
 }
 
 /// A save in the making: what the box is showing before anything is written.
@@ -2737,14 +2810,15 @@ fn toast_stack(ui: &mut egui::Ui, toasts: &[(String, f32)]) {
         .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -52.0))
         .interactable(false)
         .show(ui.ctx(), |ui| {
+            let palette = crate::theme::palette(ui);
             for (text, opacity) in toasts {
-                let alpha = (opacity * 235.0) as u8;
                 egui::Frame::new()
-                    .fill(egui::Color32::from_rgba_unmultiplied(24, 27, 33, alpha))
+                    .fill(crate::theme::faded(crate::theme::panel(ui), *opacity))
+                    .stroke(egui::Stroke::new(1.0, crate::theme::faded(palette.line_2, *opacity)))
                     .inner_margin(egui::Margin::symmetric(14, 8))
-                    .corner_radius(6)
+                    .corner_radius(crate::theme::PANEL_RADIUS)
                     .show(ui, |ui| {
-                        ui.label(egui::RichText::new(text).color(egui::Color32::from_rgba_unmultiplied(235, 238, 245, alpha)));
+                        ui.label(egui::RichText::new(text).color(crate::theme::faded(palette.text, *opacity)));
                     });
             }
         });
@@ -2758,11 +2832,12 @@ fn toast_stack(ui: &mut egui::Ui, toasts: &[(String, f32)]) {
 fn drop_invitation(ui: &mut egui::Ui) {
     let screen = ui.ctx().viewport_rect();
     area("drop").fixed_pos(screen.min).interactable(false).show(ui.ctx(), |ui| {
+        let accent = crate::theme::palette(ui).accent;
         let painter = ui.painter();
         painter.rect_stroke(
             screen.shrink(3.0),
-            8.0,
-            egui::Stroke::new(3.0, egui::Color32::from_rgb(120, 170, 255)),
+            crate::theme::PANEL_RADIUS,
+            egui::Stroke::new(3.0, accent),
             egui::StrokeKind::Inside,
         );
     });
@@ -2792,7 +2867,7 @@ fn crop_overlay(ui: &mut egui::Ui, crop: &CropView) -> Option<CropAction> {
 
     area("crop-shade").interactable(false).order(egui::Order::Background).show(ui.ctx(), |ui| {
         let painter = ui.painter();
-        let shade = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 132);
+        let shade = crate::theme::SHADE;
         // Four bands around the box rather than one rectangle with a hole:
         // egui paints convex shapes, and a hole is not one.
         for band in [
@@ -2808,7 +2883,7 @@ fn crop_overlay(ui: &mut egui::Ui, crop: &CropView) -> Option<CropAction> {
 
         // The thirds, which is what a person composing to them is looking for.
         // Thin and half-transparent: guides, not furniture.
-        let guide = egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 90));
+        let guide = egui::Stroke::new(1.0, crate::theme::MARK_GUIDE);
         for step in 1..3 {
             let fraction = step as f32 / 3.0;
             let x = rect.left() + rect.width() * fraction;
@@ -2817,18 +2892,13 @@ fn crop_overlay(ui: &mut egui::Ui, crop: &CropView) -> Option<CropAction> {
             painter.line_segment([egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)], guide);
         }
 
-        painter.rect_stroke(
-            rect,
-            0.0,
-            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 220)),
-            egui::StrokeKind::Inside,
-        );
+        painter.rect_stroke(rect, 0.0, egui::Stroke::new(1.0, crate::theme::MARK), egui::StrokeKind::Inside);
 
         // The corners, drawn as brackets inside the box: a person has to see
         // where to take hold, and a bracket says "corner" where a dot on the
         // line would read as part of the frame.
         let arm = (rect.width().min(rect.height()) / 5.0).clamp(6.0, 28.0);
-        let bracket = egui::Stroke::new(3.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 235));
+        let bracket = egui::Stroke::new(3.0, crate::theme::MARK);
         for (corner, along_x, along_y) in [
             (rect.left_top(), 1.0, 1.0),
             (rect.right_top(), -1.0, 1.0),
@@ -2845,9 +2915,9 @@ fn crop_overlay(ui: &mut egui::Ui, crop: &CropView) -> Option<CropAction> {
         .fixed_pos(egui::pos2(screen.left() + 12.0, screen.bottom() - CROP_BAR_HEIGHT))
         .show(ui.ctx(), |ui| {
             egui::Frame::new()
-                .fill(egui::Color32::from_rgba_unmultiplied(14, 16, 20, 238))
+                .fill(crate::theme::panel(ui))
                 .inner_margin(egui::Margin::symmetric(12, 8))
-                .corner_radius(6)
+                .corner_radius(crate::theme::PANEL_RADIUS)
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new(format!("{} × {}", crop.size.0, crop.size.1)).strong().monospace());
@@ -3116,20 +3186,20 @@ mod tests {
     #[test]
     fn the_channels_add_where_they_overlap() {
         // All three present is neutral: a grey picture is one grey shape.
-        let all = band_colour([true, true, true]);
+        let all = crate::theme::channels([true, true, true]);
         assert_eq!(all.r(), all.g(), "a neutral band came out tinted");
         assert_eq!(all.g(), all.b(), "a neutral band came out tinted");
         assert!(all.r() > 200, "a band with every channel in it is not bright");
 
         // Two channels make the secondary between them rather than the last
         // one drawn: red and green are yellow, not green.
-        let yellow = band_colour([true, true, false]);
+        let yellow = crate::theme::channels([true, true, false]);
         assert!(yellow.r() > 200 && yellow.g() > 200, "red and green did not add");
         assert!(yellow.b() < 60, "a channel that is not in this band showed up in it");
 
         // And one channel alone is that channel, still legible against the
         // plot's dark ground.
-        let blue = band_colour([false, false, true]);
+        let blue = crate::theme::channels([false, false, true]);
         assert!(blue.b() > 200 && blue.r() < 60 && blue.g() < 60);
         assert!(blue.b() > 60, "a lone channel is too dark to read as a column");
     }
@@ -3143,7 +3213,7 @@ mod tests {
         for red in [false, true] {
             for green in [false, true] {
                 for blue in [false, true] {
-                    let colour = band_colour([red, green, blue]);
+                    let colour = crate::theme::channels([red, green, blue]);
                     assert!(!seen.contains(&colour), "[{red}, {green}, {blue}] draws the same colour as another mixture",);
                     seen.push(colour);
                 }
@@ -3625,6 +3695,35 @@ mod tests {
             }
         }
         panic!("no button on the toolbar asked for {wanted:?}");
+    }
+
+    #[test]
+    fn a_trail_is_the_folders_and_then_the_file() {
+        let path = std::path::Path::new("/photos/2026/iceland/falls.jpg");
+        assert_eq!(trail(path), ["photos", "2026", "iceland", "falls.jpg"]);
+    }
+
+    #[test]
+    fn a_narrow_trail_gives_up_the_far_folders_first() {
+        // One point per character, so the arithmetic is readable.
+        let measure = |text: &str| text.chars().count() as f32;
+        let steps: Vec<String> = ["photos", "2026", "iceland", "falls.jpg"].map(String::from).to_vec();
+        let whole: f32 = 6.0 + 4.0 + 7.0 + 9.0 + 3.0 * 5.0;
+        assert_eq!(fit_trail(&steps, whole, &measure), &steps[..], "everything fits in exactly its own width");
+        // Short by one: the farthest folder goes, and the ellipsis takes a
+        // little of what it freed.
+        assert_eq!(fit_trail(&steps, whole - 1.0, &measure), &steps[1..]);
+        // Room for nothing: the file is still there.
+        assert_eq!(fit_trail(&steps, 0.0, &measure), &steps[3..]);
+    }
+
+    #[test]
+    fn the_nearest_folder_is_the_last_to_go() {
+        let measure = |text: &str| text.chars().count() as f32;
+        let steps: Vec<String> = ["photos", "2026", "iceland", "falls.jpg"].map(String::from).to_vec();
+        // The file, its folder, and the ellipsis before them.
+        let room = 9.0 + 5.0 + 7.0 + 1.0 + 5.0;
+        assert_eq!(fit_trail(&steps, room, &measure), &steps[2..]);
     }
 
     /// The measurement the toolbar exists for: a button can be pressed, and
