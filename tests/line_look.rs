@@ -38,12 +38,21 @@ fn typed_colours(text: &str) -> Vec<(usize, String)> {
 /// The interface without its tests: a test is allowed to name the exact
 /// colour it expects to find painted.
 fn interface_code() -> String {
-    let text = source("src/interface.rs");
-    let marker = "\n#[cfg(test)]\nmod tests";
-    let end = text
-        .find(marker)
-        .expect("src/interface.rs no longer has its test module where this gate looks for it");
-    text[..end].to_owned()
+    before_tests(&source("src/interface.rs")).expect("src/interface.rs no longer has its test module where this gate looks for it")
+}
+
+/// A source file up to its test module, or `None` when it has none.
+///
+/// The module is found line by line rather than by a string with `\n` in it:
+/// a checkout with `core.autocrlf` (the Windows runners have it) ends every
+/// line with `\r\n`, and a marker spelled with bare newlines finds nothing
+/// there.
+fn before_tests(text: &str) -> Option<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines
+        .windows(2)
+        .position(|pair| pair[0].trim_end() == "#[cfg(test)]" && pair[1].trim_end().starts_with("mod tests"))?;
+    Some(lines[..start].join("\n"))
 }
 
 #[test]
@@ -69,6 +78,11 @@ fn the_gate_sees_a_colour_when_there_is_one() {
         typed_colours(&source("src/theme.rs")).len() >= 5,
         "the gate finds almost no colours in theme.rs, which holds all of them — it has stopped seeing"
     );
+    // The test module is found whichever line ending the checkout has.
+    for ending in ["\n", "\r\n"] {
+        let text = ["let a = 1;", "#[cfg(test)]", "mod tests {", "}"].join(ending);
+        assert_eq!(before_tests(&text).as_deref(), Some("let a = 1;"), "line ending {ending:?}");
+    }
     // And the part of the interface it reads is the whole of it rather than a
     // stub: the toolbar and the status line are both in there.
     let code = interface_code();
