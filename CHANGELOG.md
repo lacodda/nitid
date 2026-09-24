@@ -2,6 +2,11 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.34.1] - 2026-09-24
+
+### Bug Fixes
+- Find the interface's test module on a CRLF checkout
+
 ## [0.34.0] - 2026-09-24
 
 ### Build
