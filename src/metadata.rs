@@ -371,13 +371,23 @@ fn uint(exif: &exif::Exif, tag: exif::Tag) -> Option<u32> {
     exif.get_field(tag, exif::In::PRIMARY)?.value.get_uint(0)
 }
 
+/// A measured value, as a number.
+///
+/// The standard says rational, and cameras write rationals. Software that
+/// rewrites a file sometimes writes a float instead — Pillow does, for a Python
+/// float — and refusing it would leave the exposure out of the panel and out
+/// of a comparison for a reason no person looking at the picture could guess.
+/// A value that is not finite is not a measurement.
 fn rational(exif: &exif::Exif, tag: exif::Tag) -> Option<f64> {
     let field = exif.get_field(tag, exif::In::PRIMARY)?;
-    match field.value {
+    let value = match field.value {
         exif::Value::Rational(ref values) => values.first().map(|value| value.to_f64()),
         exif::Value::SRational(ref values) => values.first().map(|value| value.to_f64()),
+        exif::Value::Double(ref values) => values.first().copied(),
+        exif::Value::Float(ref values) => values.first().map(|value| f64::from(*value)),
         _ => None,
-    }
+    }?;
+    value.is_finite().then_some(value)
 }
 
 /// Drop the decimals a number does not need: `2.8` stays, `35.0` becomes `35`.
@@ -460,6 +470,7 @@ mod tests {
         Ascii(&'static str),
         Rational(Vec<(u32, u32)>),
         SRational(Vec<(i32, i32)>),
+        Double(f64),
     }
 
     impl Exif {
@@ -583,6 +594,7 @@ mod tests {
                     }
                     (10, parts.len() as u32, bytes)
                 }
+                Value::Double(value) => (12, 1, value.to_le_bytes().to_vec()),
             }
         }
     }
@@ -813,6 +825,27 @@ mod tests {
         assert_eq!(parse_offset("-04:30"), Some(-270));
         assert_eq!(parse_offset("03:00"), None, "an offset without a sign");
         assert_eq!(parse_offset("+25:00"), None);
+    }
+
+    /// Written as floats rather than rationals — what Pillow does with a
+    /// Python float — the exposure still reads. Found by a live comparison of
+    /// Pillow-made frames, where the shutter, the aperture and the focal
+    /// length were simply missing from the table.
+    #[test]
+    fn a_value_written_as_a_float_still_reads() {
+        let rewritten = read(&jpeg_with(
+            &Exif::default()
+                .sub(0x829A, Value::Double(0.004))
+                .sub(0x829D, Value::Double(2.8))
+                .sub(0x920A, Value::Double(35.0))
+                .build(),
+        ));
+        assert_eq!(value_of(&rewritten, "Exposure").as_deref(), Some("1/250 s"));
+        assert_eq!(value_of(&rewritten, "Aperture").as_deref(), Some("f/2.8"));
+        assert_eq!(value_of(&rewritten, "Focal length").as_deref(), Some("35 mm"));
+
+        let nonsense = read(&jpeg_with(&Exif::default().sub(0x829D, Value::Double(f64::NAN)).build()));
+        assert_eq!(value_of(&nonsense, "Aperture"), None, "a value that is not a number was shown");
     }
 
     /// Compensation is shown only when it was dialled in, and always with its
