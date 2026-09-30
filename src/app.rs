@@ -21,15 +21,16 @@ use moxcms::ColorProfile;
 
 use crate::animation::Player;
 use crate::color::{self, ColorTransform};
+use crate::compare::{self, Layout, Which};
 use crate::config::{Config, Opening, Wheel};
 use crate::folder::Folder;
 use crate::format::Format;
 use crate::gpu::Renderer;
-use crate::gpu::{Overlay, Painted};
+use crate::gpu::{Overlay, Painted, Pane, Slot};
 use crate::histogram::Histogram;
 use crate::image_source::{self, Depth, Fidelity, LoadedImage, Orientation};
 use crate::interface::{Action, Interface, Status};
-use crate::loader::{Decoded, Loader, Request};
+use crate::loader::{Asked, Decoded, Loader, Request};
 use crate::minimap::Thumbnail;
 use crate::startup;
 use crate::vector::VectorImage;
@@ -193,6 +194,93 @@ struct Shown {
     thumbnail: Option<Thumbnail>,
 }
 
+/// Two pictures on screen at once: the pinned one, and the one the arrow keys
+/// walk.
+struct Comparison {
+    layout: Layout,
+    pinned: Pinned,
+    /// The blink's clock. Restarted whenever a blink begins, so it always
+    /// opens on the picture that was already up.
+    blink: compare::Blink,
+    /// Which picture the last frame of a blink drew, so a wake-up that finds
+    /// the same one still due draws nothing.
+    drawn: Option<Which>,
+}
+
+impl Comparison {
+    /// Which picture fills the window, while blinking.
+    fn showing(&self, now: Instant) -> Which {
+        self.blink.showing(now)
+    }
+}
+
+/// Where the viewer lands when a comparison ends.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Leave {
+    /// On the pinned picture, framed as it was: the comparison was about it,
+    /// and after a walk through a burst it is the one that beat the rest —
+    /// the one a person then wants to mark.
+    ToPinned,
+    /// Where the arrow keys are: for a crop, which cuts the right-hand
+    /// picture, and for a pinned file that has gone.
+    Here,
+}
+
+/// The picture held beside the one on screen: the one to beat.
+///
+/// Everything the status line and the table say about it is copied here when
+/// it is pinned, because from then on it is not the picture on screen, and
+/// the facts about the picture on screen are what `Shown` holds.
+struct Pinned {
+    /// `None` for a picture pasted from the clipboard, which has no file.
+    path: Option<PathBuf>,
+    name: String,
+    /// What the file asks for, and the turn the person gave it on top.
+    file_orientation: Orientation,
+    turn: Orientation,
+    /// Its size, as it is shown: after both of those.
+    size: (u32, u32),
+    format: Option<Format>,
+    file_size: Option<u64>,
+    metadata: crate::metadata::Metadata,
+    mark: crate::cull::Mark,
+    /// The pixels, once the whole picture is in hand — what the eyedropper
+    /// reads and a drag hands over. `None` while an embedded thumbnail stands
+    /// in for it on screen and the full decode is on its way.
+    pixels: Option<Pixels>,
+}
+
+impl Pinned {
+    fn orientation(&self) -> Orientation {
+        self.file_orientation.then(self.turn)
+    }
+}
+
+/// Where a pinned picture's pixels live.
+enum Pixels {
+    /// Shared with the loader, so pinning a sixty-megapixel photograph copies
+    /// nothing.
+    File(Arc<LoadedImage>),
+    Pasted(Arc<crate::image_source::DecodedImage>),
+}
+
+impl Pixels {
+    fn image(&self) -> &crate::image_source::DecodedImage {
+        match self {
+            Self::File(loaded) => &loaded.image,
+            Self::Pasted(image) => image,
+        }
+    }
+
+    fn profile(&self) -> Option<&ColorProfile> {
+        match self {
+            Self::File(loaded) => loaded.profile.as_ref(),
+            // A clipboard bitmap carries no profile (ADR 0005, ADR 0020).
+            Self::Pasted(_) => None,
+        }
+    }
+}
+
 struct App {
     /// The files to open once the window exists.
     initial: Vec<PathBuf>,
@@ -304,6 +392,8 @@ struct App {
     /// same order the viewer already uses for an embedded thumbnail: show the
     /// picture first, then improve it.
     shown_once: bool,
+    /// The comparison, while two pictures are up.
+    comparing: Option<Comparison>,
 }
 
 /// One laid-out interface frame, held between the layout and the draw.
@@ -348,6 +438,7 @@ impl App {
             reading: None,
             shown_once: false,
             idle_deadline: None,
+            comparing: None,
         }
     }
 
@@ -509,6 +600,11 @@ impl App {
 
     fn upload(&mut self, path: &Path, loaded: &LoadedImage) {
         let scale_factor = self.scale_factor();
+        let area = self.picture_area();
+        // While two are compared the framing always carries, lock or no lock:
+        // the pinned picture is framed from this one, and a step that refitted
+        // it would move the one to beat under the eye on every arrow key.
+        let locked = self.zoom_locked || self.comparing.is_some();
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
@@ -527,9 +623,9 @@ impl App {
                 same_file: shown.path == path,
             }),
             loaded.display_size(),
-            renderer.size(),
+            area,
             scale_factor,
-            self.zoom_locked,
+            locked,
             self.config.behaviour.opening,
         );
 
@@ -633,6 +729,251 @@ impl App {
         startup::milestone(&format!("vector redrawn at {raster_width}x{raster_height}"));
     }
 
+    /// Start comparing, change how the comparison is shown, or stop — the
+    /// same key twice is the way out, the other key switches the layout.
+    fn compare(&mut self, layout: Layout) {
+        match self.comparing.as_mut() {
+            Some(comparison) if comparison.layout == layout => self.stop_comparing(Leave::ToPinned),
+            Some(comparison) => {
+                comparison.layout = layout;
+                comparison.blink = compare::Blink::new(Instant::now());
+                comparison.drawn = None;
+                self.fit_to_area();
+                self.refresh();
+            }
+            None => self.start_comparing(layout),
+        }
+    }
+
+    /// Pin the picture on screen and put the next one beside it.
+    ///
+    /// The next, or the one before at the end of a folder that does not wrap:
+    /// a comparison started on the last frame of a burst compares it with the
+    /// frame before rather than refusing.
+    fn start_comparing(&mut self, layout: Layout) {
+        let next = self.folder.as_mut().and_then(|folder| folder.next().map(Path::to_path_buf));
+        let next = next.or_else(|| self.folder.as_mut().and_then(|folder| folder.previous().map(Path::to_path_buf)));
+        let Some(next) = next else {
+            self.interface.toast("nothing beside this one to compare it with", Instant::now());
+            self.request_redraw();
+            return;
+        };
+        let Some(pinned) = self.pin_what_is_shown() else {
+            return;
+        };
+
+        // The crop and a comparison both want the whole window and the mouse.
+        self.cropping = None;
+        self.comparing = Some(Comparison {
+            layout,
+            pinned,
+            blink: compare::Blink::new(Instant::now()),
+            drawn: None,
+        });
+        self.show(&next);
+    }
+
+    /// The right-hand picture becomes the one to beat, and the walk moves on.
+    ///
+    /// Refused at the end of a folder that does not wrap rather than pinning
+    /// the last picture against itself: a comparison of a picture with itself
+    /// looks like two identical frames, which is a claim about the burst.
+    fn pin_current(&mut self) {
+        let Some(next) = self.folder.as_mut().and_then(|folder| folder.next().map(Path::to_path_buf)) else {
+            self.interface.toast("nothing after this one to compare it with", Instant::now());
+            self.request_redraw();
+            return;
+        };
+        let Some(pinned) = self.pin_what_is_shown() else {
+            return;
+        };
+        if let Some(comparison) = self.comparing.as_mut() {
+            comparison.pinned = pinned;
+        }
+        // The new pinned picture may be of another shape, and the split is
+        // decided by it.
+        self.fit_to_area();
+        self.show(&next);
+    }
+
+    /// Take the picture on screen as the pinned one: its facts, its pixels,
+    /// and its textures, which move to the pinned slot on the GPU.
+    ///
+    /// When only the embedded thumbnail is up the loader is asked to hold the
+    /// full picture, and it replaces the thumbnail in the pane when it lands
+    /// (`held`) — pinning is not refused for being quick.
+    fn pin_what_is_shown(&mut self) -> Option<Pinned> {
+        let shown = self.shown.as_ref()?;
+        let pixels = if shown.pasted {
+            self.pasted.clone().map(|image| Pixels::Pasted(Arc::new(image)))
+        } else if shown.fidelity == Fidelity::Full {
+            self.loader.hold(&shown.path).map(Pixels::File)
+        } else {
+            // Asked for here and answered in `held`.
+            let _ = self.loader.hold(&shown.path);
+            None
+        };
+        let pinned = Pinned {
+            path: (!shown.pasted).then(|| shown.path.clone()),
+            name: if shown.pasted { "clipboard".to_string() } else { name_of(&shown.path) },
+            file_orientation: shown.orientation,
+            turn: shown.turn,
+            size: shown.size,
+            format: shown.format,
+            file_size: shown.file_size,
+            metadata: shown.metadata.clone(),
+            mark: shown.mark,
+            pixels,
+        };
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.pin_main();
+        }
+        Some(pinned)
+    }
+
+    /// The full picture a pinned thumbnail was standing in for has arrived.
+    fn held(&mut self, path: &Path, result: Result<LoadedImage, String>) {
+        let Some(pinned) = self.comparing.as_mut().map(|comparison| &mut comparison.pinned) else {
+            return;
+        };
+        // Pinned again since it was asked for, or already whole: the answer
+        // is for a picture that is no longer waiting.
+        if pinned.path.as_deref() != Some(path) || pinned.pixels.is_some() {
+            return;
+        }
+        let loaded = match result {
+            Ok(loaded) => Arc::new(loaded),
+            Err(error) => {
+                eprintln!("nitid: {}: {error}", path.display());
+                let name = pinned.name.clone();
+                self.interface.toast(format!("{name} will not open"), Instant::now());
+                self.request_redraw();
+                return;
+            }
+        };
+
+        // The thumbnail's facts were a stand-in's: the size, the depth and
+        // what the file says are the full picture's from here on.
+        pinned.file_orientation = loaded.orientation;
+        pinned.size = size_after_turn(loaded.display_size(), Orientation::Normal, pinned.turn).unwrap_or(loaded.display_size());
+        pinned.format = Some(loaded.format);
+        pinned.metadata = loaded.metadata.clone();
+        pinned.mark = loaded.mark;
+        let transform = ColorTransform::for_image(loaded.profile.as_ref(), &self.display_profile);
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.set_pinned(&loaded.image, &transform);
+        }
+        pinned.pixels = Some(Pixels::File(loaded));
+        self.fit_to_area();
+        self.request_redraw();
+    }
+
+    /// Put the pinned picture away and give the window back to one.
+    ///
+    /// Going back to the pinned picture uses the pixels the comparison has
+    /// been holding, so a sixty-megapixel frame pinned ten steps ago comes
+    /// back at once rather than being decoded again. It is only possible for
+    /// a file still in the listing whose full picture arrived; otherwise the
+    /// viewer stays where it is, which is never wrong, only less helpful.
+    fn stop_comparing(&mut self, leave: Leave) {
+        let Some(comparison) = self.comparing.take() else {
+            return;
+        };
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.unpin();
+        }
+
+        let pinned = comparison.pinned;
+        let steered = self.shown.as_ref().map(|shown| shown.view);
+        let back = match (leave, pinned.path, pinned.pixels) {
+            (Leave::ToPinned, Some(path), Some(Pixels::File(loaded))) if self.folder.as_mut().is_some_and(|folder| folder.go_to(&path)) => Some((path, loaded)),
+            _ => None,
+        };
+        let Some((path, loaded)) = back else {
+            self.fit_to_area();
+            self.refresh();
+            return;
+        };
+
+        // What `show` does before a picture changes: the name box and the
+        // crop belong to the picture that is leaving.
+        self.interface.cancel_rename();
+        self.cropping = None;
+        self.upload(&path, &loaded);
+
+        let window = self.picture_area();
+        let scale_factor = self.scale_factor();
+        if let Some(shown) = self.shown.as_mut() {
+            // The turn it was given while it was pinned is still its turn.
+            shown.turn = pinned.turn;
+            if let Some(turned) = size_after_turn(shown.size, Orientation::Normal, pinned.turn) {
+                shown.size = turned;
+            }
+            // And the framing it was seen in: landing on it at a fresh fit
+            // would move the picture under the eye at the moment it becomes
+            // the only one.
+            if let Some(steered) = steered {
+                let mut kept = steered.matched(shown.size);
+                kept.resize(window, scale_factor);
+                shown.view = kept;
+            }
+            shown.thumbnail = None;
+        }
+        self.map_if_needed();
+        self.refresh();
+        self.prefetch_neighbours();
+    }
+
+    /// The gap between two panes, in physical pixels.
+    fn gutter(&self) -> u32 {
+        (compare::GUTTER * self.scale_factor()).round() as u32
+    }
+
+    /// Where the two panes are while the pictures are side by side, pinned
+    /// first, and which way the window is split. `None` with one picture up,
+    /// and during a blink, which gives the whole window to each in turn.
+    fn pane_rects(&self) -> Option<(compare::Split, [compare::Rect; 2])> {
+        let comparison = self.comparing.as_ref().filter(|comparison| comparison.layout == Layout::Side)?;
+        let window = self.renderer.as_ref()?.size();
+        let gutter = self.gutter();
+        let split = compare::split_for(comparison.pinned.size, window, gutter);
+        Some((split, compare::panes(window, split, gutter)))
+    }
+
+    /// The size the picture on screen is framed against: its pane while two
+    /// are side by side, the whole window otherwise.
+    fn picture_area(&self) -> (u32, u32) {
+        match self.pane_rects() {
+            Some((_, [_, current])) => (current.2, current.3),
+            None => self.renderer.as_ref().map_or((1, 1), Renderer::size),
+        }
+    }
+
+    /// Frame the picture on screen for the area it has now — after a
+    /// comparison starts or stops, the window changes, or the pinned picture
+    /// changes shape and with it the split.
+    fn fit_to_area(&mut self) {
+        let area = self.picture_area();
+        let scale_factor = self.scale_factor();
+        if let Some(shown) = self.shown.as_mut() {
+            shown.view.resize(area, scale_factor);
+        }
+    }
+
+    /// Which picture a window position is over, and the position inside its
+    /// pane — what a zoom anchors to and what the eyedropper reads.
+    fn which_at(&self, position: (f32, f32)) -> (Which, (f32, f32)) {
+        match (self.comparing.as_ref(), self.pane_rects()) {
+            (_, Some((split, rects))) => compare::pane_at(&rects, split, position),
+            (Some(comparison), None) => (comparison.showing(Instant::now()), position),
+            (None, None) => (Which::Current, position),
+        }
+    }
+
+    fn under_pointer(&self) -> (Which, (f32, f32)) {
+        self.which_at(self.cursor_position())
+    }
+
     /// Rewrite the title bar: file name, position in the folder, and the zoom
     /// once the user has left the default framing.
     ///
@@ -693,13 +1034,15 @@ impl App {
 
     /// A background decode came back.
     fn decoded(&mut self, decoded: Decoded) {
-        // A reply for an image the user has already left is not an error, just
-        // work that finished too late to matter.
-        if !self.loader.is_current(decoded.generation) {
-            return;
+        let Decoded { asked, path, result } = decoded;
+        match asked {
+            Asked::Held => return self.held(&path, result),
+            // A reply for an image the user has already left is not an error,
+            // just work that finished too late to matter.
+            Asked::Shown(generation) if !self.loader.is_current(generation) => return,
+            Asked::Shown(_) => {}
         }
 
-        let Decoded { path, result, .. } = decoded;
         match result {
             Ok(image) => {
                 startup::milestone("full image up");
@@ -841,14 +1184,18 @@ impl App {
                 self.request_redraw();
             }
             Key::Named(NamedKey::Enter) if self.cropping.is_some() => self.take_crop(),
-            Key::Named(NamedKey::Escape) => {
-                if self.interface.settings_shown() {
-                    self.interface.close_settings();
-                    self.request_redraw();
-                } else {
-                    event_loop.exit();
-                }
+            Key::Named(NamedKey::Escape) if self.interface.settings_shown() => {
+                self.interface.close_settings();
+                self.request_redraw();
             }
+            // A comparison is a mode too, and Esc leaves it rather than the
+            // program — the dialog first, when both are up, because it is
+            // the thing in front.
+            Key::Named(NamedKey::Escape) if self.comparing.is_some() => self.stop_comparing(Leave::ToPinned),
+            // The right-hand picture beat the pinned one: it becomes the one
+            // to beat, and the walk goes on to the next.
+            Key::Named(NamedKey::Enter) if self.comparing.is_some() => self.pin_current(),
+            Key::Named(NamedKey::Escape) => event_loop.exit(),
             // On an animated image the space bar is its pause; everywhere
             // else it steps to the next file, as it always has.
             Key::Named(NamedKey::Space) => match self.shown.as_mut().and_then(|shown| shown.player.as_mut()) {
@@ -941,6 +1288,11 @@ impl App {
                 // Walk only the pictures that have been judged, or the whole
                 // folder again.
                 "m" | "M" => self.toggle_filter(),
+                // Two pictures at once: this one pinned, the next beside it.
+                // Shift for the blink, the way Shift turns the other way on
+                // `R` — the same comparison, shown one over the other.
+                "v" => self.compare(Layout::Side),
+                "V" => self.compare(Layout::Blink),
                 // The colour under the cursor. A mode, so it can be pointed
                 // about the picture and clicked with one hand.
                 "c" | "C" => self.toggle_picking(),
@@ -1341,6 +1693,10 @@ impl App {
             self.request_redraw();
             return;
         }
+        // A crop is framed on one picture over the whole window, and the
+        // file it writes is the one on the right: the comparison goes first,
+        // so the box is drawn over the picture it will cut.
+        self.stop_comparing(Leave::Here);
 
         let Some(shown) = self.shown.as_ref() else {
             return;
@@ -1973,6 +2329,14 @@ impl App {
                 if let Some(shown) = self.shown.as_mut() {
                     shown.path = renamed.clone();
                 }
+                // Stepped onto itself, the pinned picture is the file just
+                // renamed, and a tag naming the old name would name nothing.
+                if let Some(pinned) = self.comparing.as_mut().map(|comparison| &mut comparison.pinned)
+                    && pinned.path.as_ref() == Some(&path)
+                {
+                    pinned.name = name_of(&renamed);
+                    pinned.path = Some(renamed.clone());
+                }
                 self.set_title();
                 self.interface.toast(format!("renamed to {}", name_of(&renamed)), Instant::now());
             }
@@ -2188,6 +2552,17 @@ impl App {
     /// is a worse answer than the last picture of a folder that is now empty,
     /// and the message already says what happened.
     fn after_removal(&mut self) {
+        // The pinned picture was the file on screen too — stepped onto itself
+        // — and it has just gone. Comparing against a file that is no longer
+        // there would be comparing against a memory of it.
+        if self
+            .comparing
+            .as_ref()
+            .and_then(|comparison| comparison.pinned.path.as_ref())
+            .is_some_and(|path| !path.exists())
+        {
+            self.stop_comparing(Leave::Here);
+        }
         let next = self.folder.as_mut().and_then(|folder| folder.remove_current().map(Path::to_path_buf));
         match next {
             Some(path) => self.show(&path),
@@ -2264,12 +2639,23 @@ impl App {
     /// This blocks until the drop: `DoDragDrop` runs its own message loop.
     /// The viewer is unresponsive for that stretch by the shell's design —
     /// every application that can be dragged from behaves this way.
-    fn drag_out(&mut self) {
+    fn drag_out(&mut self, from: PhysicalPosition<f64>) {
         let Some(shown) = self.shown.as_ref() else {
             return;
         };
 
-        let (image, hdrop) = if shown.pasted {
+        let (which, _) = self.which_at((from.x as f32, from.y as f32));
+        let pinned = self.comparing.as_ref().map(|comparison| &comparison.pinned).filter(|_| which == Which::Pinned);
+
+        let (image, hdrop) = if let Some(pinned) = pinned {
+            // Dragged from the pinned pane: that file, not the one the status
+            // line names. Handing over the other picture would be the wrong
+            // file with nothing on screen to say so.
+            (
+                pinned.pixels.as_ref().map(|pixels| pixels.image().clone()),
+                pinned.path.as_deref().map(|path| crate::drag::to_hdrop(&[path])),
+            )
+        } else if shown.pasted {
             // Nothing on disk to hand over, so only the pixels travel. A
             // temporary file would be writing to disk unasked, which ADR 0020
             // says the viewer does not do.
@@ -2377,6 +2763,7 @@ impl App {
     /// Put a picture with no file behind it on screen.
     fn show_pasted(&mut self, image: crate::image_source::DecodedImage) {
         let scale_factor = self.scale_factor();
+        let area = self.picture_area();
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
@@ -2386,7 +2773,7 @@ impl App {
         renderer.set_image(&image, &transform);
 
         let size = (image.width, image.height);
-        let view = View::new(size, renderer.size(), scale_factor);
+        let view = View::new(size, area, scale_factor);
 
         // The folder goes with the file: there is nothing beside a pasted
         // picture to step to, and leaving the old folder in place would let
@@ -2451,7 +2838,11 @@ impl App {
         if !self.picking {
             return;
         }
-        let cursor = self.cursor_position();
+        let (which, cursor) = self.under_pointer();
+        if which == Which::Pinned {
+            self.reading = self.read_pinned(cursor);
+            return;
+        }
         let Some(shown) = self.shown.as_ref() else {
             self.reading = None;
             return;
@@ -2498,6 +2889,23 @@ impl App {
         self.reading = crate::eyedropper::read(&pixels, orientation, &transform, at);
     }
 
+    /// Read the pinned picture at a place in its pane.
+    ///
+    /// The eyedropper reads whichever picture it is over: two variants of a
+    /// cover are compared by their colours as often as by their shapes, and
+    /// a reading that always named the right-hand picture would name the
+    /// wrong one half the time with nothing to say so.
+    fn read_pinned(&self, cursor: (f32, f32)) -> Option<crate::eyedropper::Reading> {
+        let shown = self.shown.as_ref()?;
+        let pinned = &self.comparing.as_ref()?.pinned;
+        // A thumbnail standing in is not the file's pixels, for the reason
+        // the picture on screen waits for its own.
+        let pixels = pinned.pixels.as_ref()?;
+        let at = shown.view.matched(pinned.size).pixel_under(cursor)?;
+        let transform = ColorTransform::for_image(pixels.profile(), &self.display_profile);
+        crate::eyedropper::read(pixels.image(), pinned.orientation(), &transform, at)
+    }
+
     /// Put the colour under the cursor on the clipboard.
     ///
     /// The file's value, not the display's, for the reason the module states:
@@ -2517,7 +2925,7 @@ impl App {
     /// The cursor is where the eye already is, which is what makes this
     /// cheaper than zooming: no pan to the place, no pan back.
     fn hold_loupe(&mut self) {
-        let cursor = self.cursor_position();
+        let (_, cursor) = self.under_pointer();
         if let Some(shown) = self.shown.as_mut() {
             if shown.view.loupe_held() {
                 return;
@@ -2545,15 +2953,10 @@ impl App {
     }
 
     fn zoom(&mut self, notches: f32) {
-        // Keyboard zoom has no cursor to anchor to, so it uses the centre.
-        let centre = self
-            .renderer
-            .as_ref()
-            .map(|renderer| {
-                let (width, height) = renderer.size();
-                (width as f32 / 2.0, height as f32 / 2.0)
-            })
-            .unwrap_or((0.0, 0.0));
+        // Keyboard zoom has no cursor to anchor to, so it uses the centre —
+        // of the pane, while two pictures share the window.
+        let (width, height) = self.picture_area();
+        let centre = (width as f32 / 2.0, height as f32 / 2.0);
 
         if let Some(shown) = self.shown.as_mut() {
             shown.view.zoom_at(notches, centre);
@@ -2567,10 +2970,10 @@ impl App {
     /// width and height: a landscape photograph fitted to the window is a
     /// portrait one that no longer fits.
     fn turn(&mut self, clockwise: bool) {
-        let Some(renderer) = self.renderer.as_ref() else {
+        if self.renderer.is_none() {
             return;
-        };
-        let window = renderer.size();
+        }
+        let window = self.picture_area();
         let scale_factor = self.scale_factor();
         let Some(shown) = self.shown.as_mut() else {
             return;
@@ -2746,7 +3149,57 @@ impl App {
             visible: self.shown.as_ref().map_or((0.0, 0.0, 1.0, 1.0), |shown| shown.view.visible_fraction()),
             mark: self.shown.as_ref().map(|shown| shown.mark).unwrap_or_default(),
             filtered: self.folder.as_ref().is_some_and(crate::folder::Folder::is_filtered),
+            compared: self.compared(),
         }
+    }
+
+    /// What the interface says about a comparison: where the panes are, which
+    /// picture a blink is showing, and how the two differ.
+    fn compared(&self) -> Option<crate::interface::Compared> {
+        let comparison = self.comparing.as_ref()?;
+        let shown = self.shown.as_ref()?;
+        let scale = self.scale_factor().max(0.01);
+        let window = self.renderer.as_ref().map_or((1, 1), Renderer::size);
+        let to_points = |(left, top, width, height): (u32, u32, u32, u32)| {
+            egui::Rect::from_min_size(
+                egui::pos2(left as f32 / scale, top as f32 / scale),
+                egui::vec2(width as f32 / scale, height as f32 / scale),
+            )
+        };
+        let panes = match self.pane_rects() {
+            Some((_, [pinned, current])) => [to_points(pinned), to_points(current)],
+            None => [to_points((0, 0, window.0, window.1)); 2],
+        };
+
+        let pinned = &comparison.pinned;
+        let table = compare::differences(
+            &compare::Side {
+                size: Some(pinned.size),
+                format: pinned.format,
+                file_size: pinned.file_size,
+                shot: &pinned.metadata.shot,
+            },
+            &compare::Side {
+                size: Some(shown.size),
+                format: shown.format,
+                file_size: shown.file_size,
+                shot: &shown.metadata.shot,
+            },
+        );
+
+        Some(crate::interface::Compared {
+            layout: comparison.layout,
+            panes,
+            // Only a blink has one picture up; side by side the clock is not
+            // read, or every half second would look like a change.
+            showing: match comparison.layout {
+                Layout::Blink => comparison.showing(Instant::now()),
+                Layout::Side => Which::Current,
+            },
+            pinned_name: pinned.name.clone(),
+            pinned_mark: pinned.mark,
+            table,
+        })
     }
 
     /// Lay out an interface frame, but only if it would look different.
@@ -2893,14 +3346,60 @@ impl App {
             self.act(action, event_loop);
         }
 
+        // Worked out before the renderer is borrowed, because both ask
+        // `self` about the window.
+        let window = self.renderer.as_ref().map_or((1, 1), Renderer::size);
+        let rects = self.pane_rects().map(|(_, rects)| rects);
+        let now = Instant::now();
+        // What a blink shows this frame, noted so a wake-up that finds the
+        // same picture still due does not draw it again.
+        let showing = self.comparing.as_mut().map(|comparison| {
+            let showing = comparison.showing(now);
+            comparison.drawn = Some(showing);
+            showing
+        });
+
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
-        // With no image open the pass still runs and clears to the background,
-        // so the window is never a hole showing whatever was behind it.
-        // What the file asks for, then what the user asked for on top of it.
-        let shown = self.shown.as_ref().map(|shown| (&shown.view, shown.orientation.then(shown.turn)));
-        let carries_image = shown.is_some();
+        // What goes where. With no image open there are no panes and the pass
+        // still clears to the background, so the window is never a hole
+        // showing whatever was behind it. The orientation is what the file
+        // asks for, then what the user asked for on top of it.
+        let pinned_view;
+        let panes: Vec<Pane<'_>> = match (self.shown.as_ref(), self.comparing.as_ref()) {
+            (None, _) => Vec::new(),
+            (Some(shown), None) => vec![Pane {
+                slot: Slot::Main,
+                rect: (0, 0, window.0, window.1),
+                view: &shown.view,
+                orientation: shown.orientation.then(shown.turn),
+            }],
+            (Some(shown), Some(comparison)) => {
+                // The pinned picture is framed from the one being steered,
+                // every frame: the two can never drift apart, because there is
+                // only one framing and the other is worked out from it.
+                pinned_view = shown.view.matched(comparison.pinned.size);
+                let pinned = |rect| Pane {
+                    slot: Slot::Pinned,
+                    rect,
+                    view: &pinned_view,
+                    orientation: comparison.pinned.orientation(),
+                };
+                let current = |rect| Pane {
+                    slot: Slot::Main,
+                    rect,
+                    view: &shown.view,
+                    orientation: shown.orientation.then(shown.turn),
+                };
+                match (rects, showing) {
+                    (Some([left, right]), _) => vec![pinned(left), current(right)],
+                    (None, Some(Which::Pinned)) => vec![pinned((0, 0, window.0, window.1))],
+                    (None, _) => vec![current((0, 0, window.0, window.1))],
+                }
+            }
+        };
+        let carries_image = !panes.is_empty();
 
         // The interface's place on the GPU is built here, the first time
         // there is something to draw into it, and never on the path to a
@@ -2921,7 +3420,7 @@ impl App {
             _ => None,
         };
 
-        if let Err(error) = renderer.render(shown, interface) {
+        if let Err(error) = renderer.render(&panes, interface) {
             self.failure = Some(error);
             event_loop.exit();
             return;
@@ -3049,6 +3548,8 @@ fn handled(key: &Key) -> bool {
                 | "G"
                 | "m"
                 | "M"
+                | "v"
+                | "V"
         ),
         _ => false,
     }
@@ -3401,6 +3902,8 @@ fn key_for(action: Action) -> Key {
         Action::Keep => Key::Character("p".into()),
         Action::Reject => Key::Character("x".into()),
         Action::Filter => Key::Character("m".into()),
+        Action::Compare => Key::Character("v".into()),
+        Action::Blink => Key::Character("V".into()),
     }
 }
 
@@ -3590,14 +4093,11 @@ impl ApplicationHandler<Event> for App {
             return;
         }
 
-        let advanced = match self.shown.as_mut().and_then(|shown| shown.player.as_mut()) {
-            Some(player) => player.advance_to(Instant::now()),
-            None => {
-                event_loop.set_control_flow(self.idle_until());
-                return;
-            }
-        };
-
+        let advanced = self
+            .shown
+            .as_mut()
+            .and_then(|shown| shown.player.as_mut())
+            .is_some_and(|player| player.advance_to(Instant::now()));
         if advanced {
             if let (Some(renderer), Some(shown)) = (self.renderer.as_mut(), self.shown.as_ref())
                 && let Some(player) = shown.player.as_ref()
@@ -3608,25 +4108,29 @@ impl ApplicationHandler<Event> for App {
             self.request_redraw();
         }
 
-        let flow = match self.shown.as_ref().and_then(|shown| shown.player.as_ref()).and_then(Player::wake_at) {
-            // Whichever comes first: the animation's next frame, or the check
-            // on the display.
-            Some(due) => match self.idle_until() {
-                ControlFlow::WaitUntil(watch) => ControlFlow::WaitUntil(due.min(watch)),
-                _ => ControlFlow::WaitUntil(due),
-            },
-            None => self.idle_until(),
-        };
-        // The gate's deadline has to be able to wake the loop, or a viewer
-        // that is genuinely idle — which is what it is measuring — would
-        // sleep straight past it and never quit.
-        let flow = match self.idle_deadline {
-            Some(deadline) => match flow {
-                ControlFlow::WaitUntil(due) => ControlFlow::WaitUntil(due.min(deadline)),
-                _ => ControlFlow::WaitUntil(deadline),
-            },
-            None => flow,
-        };
+        // A blink is the other clock a picture can run on, and it is bounded
+        // the same way: the loop wakes for its next flip and for nothing else,
+        // and leaving the blink restores the silence.
+        let now = Instant::now();
+        let blink = self.comparing.as_ref().filter(|comparison| comparison.layout == Layout::Blink);
+        if blink.is_some_and(|comparison| comparison.drawn != Some(comparison.showing(now))) {
+            self.request_redraw();
+        }
+        let blink_due = blink.map(|comparison| comparison.blink.next_flip(now));
+
+        // Whichever comes first: the animation's next frame, the blink's next
+        // flip, or the check on the display. The gate's deadline is among
+        // them too, or a viewer that is genuinely idle — which is what it is
+        // measuring — would sleep straight past it and never quit.
+        let wakes = [
+            self.shown.as_ref().and_then(|shown| shown.player.as_ref()).and_then(Player::wake_at),
+            blink_due,
+            self.idle_deadline,
+        ];
+        let flow = wakes.into_iter().flatten().fold(self.idle_until(), |flow, due| match flow {
+            ControlFlow::WaitUntil(other) => ControlFlow::WaitUntil(other.min(due)),
+            _ => ControlFlow::WaitUntil(due),
+        });
         event_loop.set_control_flow(flow);
     }
 
@@ -3764,13 +4268,12 @@ impl ApplicationHandler<Event> for App {
             WindowEvent::CloseRequested => event_loop.exit(),
 
             WindowEvent::Resized(size) => {
-                let scale_factor = self.scale_factor();
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.resize((size.width, size.height));
-                    if let Some(shown) = self.shown.as_mut() {
-                        shown.view.resize(renderer.size(), scale_factor);
-                    }
                 }
+                // After the surface, because the area is worked out from it:
+                // a pane is half of the window as it is now.
+                self.fit_to_area();
                 if let (Some(overlay), Some(renderer)) = (self.overlay.as_mut(), self.renderer.as_ref()) {
                     overlay.resize(renderer.size());
                 }
@@ -3797,8 +4300,9 @@ impl ApplicationHandler<Event> for App {
             // follows in a `Resized` event, but the framing must be redone
             // against the new scale factor either way.
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
-                if let (Some(renderer), Some(shown)) = (&self.renderer, self.shown.as_mut()) {
-                    shown.view.resize(renderer.size(), scale_factor as f32);
+                let area = self.picture_area();
+                if let Some(shown) = self.shown.as_mut() {
+                    shown.view.resize(area, scale_factor as f32);
                 }
                 self.refresh();
             }
@@ -3874,7 +4378,10 @@ impl ApplicationHandler<Event> for App {
                 };
                 match gesture {
                     Wheel::Zoom => {
-                        let cursor = self.cursor_position();
+                        // Anchored inside the pane the pointer is over: both
+                        // pictures show the same part of the scene, so the
+                        // point under the pointer stays put in both.
+                        let (_, cursor) = self.under_pointer();
                         if let Some(shown) = self.shown.as_mut() {
                             shown.view.zoom_at_step(notches, cursor, self.config.gestures.zoom_step);
                             self.refresh();
@@ -3965,7 +4472,7 @@ impl ApplicationHandler<Event> for App {
                     && crate::drag::far_enough((from.x, from.y), (position.x, position.y))
                 {
                     self.pressed_at = None;
-                    self.drag_out();
+                    self.drag_out(from);
                 }
             }
 
@@ -4519,7 +5026,7 @@ mod tests {
     /// trusted: a hand-kept list is one an added action is forgotten from, and
     /// the two tests over it would then pass while saying nothing about the
     /// new button. Adding a variant now fails to compile until it is listed.
-    const EVERY_ACTION: [Action; 21] = [
+    const EVERY_ACTION: [Action; 23] = [
         Action::Previous,
         Action::Next,
         Action::ZoomOut,
@@ -4541,6 +5048,8 @@ mod tests {
         Action::Keep,
         Action::Reject,
         Action::Filter,
+        Action::Compare,
+        Action::Blink,
     ];
 
     /// What makes `EVERY_ACTION` exhaustive: this match has no catch-all, so a
@@ -4572,6 +5081,8 @@ mod tests {
                 Action::Keep => 18,
                 Action::Reject => 19,
                 Action::Filter => 20,
+                Action::Compare => 21,
+                Action::Blink => 22,
             };
         }
 

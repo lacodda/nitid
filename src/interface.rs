@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use std::path::PathBuf;
 
 use crate::color::Passport;
+use crate::compare::{Layout, Table, Which};
 use crate::config::{
     Appearance, Behaviour, Chrome, Config, Copies, Gestures, MAX_ZOOM_STEP, MIN_ZOOM_STEP, Minimap, Opening, Order, Programs, Sorting, Tools, Units, Wheel,
 };
@@ -132,6 +133,29 @@ pub struct Status {
     /// while it is up. A mode with no sign of itself is a mode the user
     /// fights rather than uses — the same rule the locked framing follows.
     pub filtered: bool,
+    /// The comparison, while two pictures are up.
+    pub compared: Option<Compared>,
+}
+
+/// What the interface says about a comparison, worked out by the application.
+///
+/// The panes arrive already in the window's points, for the reason the crop
+/// box does: where a picture is drawn is the application's business, and a
+/// second copy of that rule here would be a place for the tags to drift off
+/// the pictures they name.
+#[derive(Clone, Debug)]
+pub struct Compared {
+    pub layout: Layout,
+    /// The pinned picture's pane and the current one's, in logical points.
+    /// A blink gives both the whole window.
+    pub panes: [egui::Rect; 2],
+    /// Which picture a blink has up. Always `Current` side by side, where
+    /// both are.
+    pub showing: Which,
+    pub pinned_name: String,
+    pub pinned_mark: crate::cull::Mark,
+    /// How the two differ, field by field.
+    pub table: Table,
 }
 
 /// What the crop overlay draws, worked out by the application.
@@ -204,6 +228,10 @@ pub enum Action {
     Reject,
     /// Walk only the marked pictures, or the whole folder again.
     Filter,
+    /// Compare this picture with the next, side by side, or stop.
+    Compare,
+    /// Compare them by blinking one over the other, or stop.
+    Blink,
 }
 
 /// What the crop bar asks for.
@@ -771,7 +799,14 @@ impl Interface {
             if status.hovering {
                 drop_invitation(ui);
             }
-            toast_stack(ui, &toasts);
+            // The table sits where the toasts do, so they are stacked above
+            // it rather than over it.
+            let mut lift = 0.0;
+            if let Some(compared) = &status.compared {
+                pane_tags(ui, status, compared, toolbar_shown);
+                lift = difference_table(ui, status, compared);
+            }
+            toast_stack(ui, &toasts, lift);
         });
         self.minimap_texture = minimap_texture;
         self.mark_texture = mark_texture;
@@ -903,6 +938,19 @@ impl Interface {
                 status.thumbnail.as_ref().map(|thumbnail| thumbnail.pixels.len()).unwrap_or(0),
             )
             + &format!("|{:?}", self.chrome.minimap)
+            // The comparison: a blink flipping, a pane moving with the window,
+            // a new pinned picture and the table that follows from it.
+            + &format!(
+                "|{:?}",
+                status.compared.as_ref().map(|compared| (
+                    compared.layout,
+                    compared.showing,
+                    compared.panes.map(|pane| (pane.left() as i32, pane.top() as i32, pane.width() as i32, pane.height() as i32)),
+                    &compared.pinned_name,
+                    compared.pinned_mark,
+                    &compared.table,
+                ))
+            )
             // The box itself, and every keystroke in it.
             + &format!("|{:?}", self.renaming)
             // The crop box, rounded to a tenth of a point. This is what makes
@@ -1039,6 +1087,10 @@ fn state(label: &'static str, hint: &'static str, enabled: bool, on: bool, actio
 fn toolbar_groups(status: &Status, info_shown: bool, histogram_shown: bool) -> Vec<Vec<Tool>> {
     let alone = status.position.is_none_or(|(_, count)| count <= 1);
     let showing = status.size.is_some();
+    let comparing = status.compared.as_ref().map(|compared| compared.layout);
+    // A comparison can be left from a picture with nothing beside it — a
+    // paste replaces the right-hand one and takes the folder with it.
+    let can_compare = comparing.is_some() || (showing && !alone);
 
     vec![
         vec![
@@ -1066,7 +1118,8 @@ fn toolbar_groups(status: &Status, info_shown: bool, histogram_shown: bool) -> V
             state("Lock", "Hold the framing across a step  (L)", !alone, status.locked, Action::Lock),
         ],
         // The cull, in the order the hand meets it: judge this one, judge it
-        // the other way, then look at what the judging produced.
+        // the other way, look at what the judging produced — and put two
+        // frames against each other when judging one alone is not enough.
         vec![
             state(
                 "Keep",
@@ -1083,6 +1136,20 @@ fn toolbar_groups(status: &Status, info_shown: bool, histogram_shown: bool) -> V
                 Action::Reject,
             ),
             state("Marked", "Walk only the pictures that are marked  (M)", !alone, status.filtered, Action::Filter),
+            state(
+                "Compare",
+                "Put the next one beside this one; again to stop  (V)",
+                can_compare,
+                comparing == Some(Layout::Side),
+                Action::Compare,
+            ),
+            state(
+                "Blink",
+                "Blink the next one over this one; again to stop  (Shift+V)",
+                can_compare,
+                comparing == Some(Layout::Blink),
+                Action::Blink,
+            ),
         ],
         // From what the file says, through what it is made of, to one pixel.
         vec![
@@ -1296,6 +1363,16 @@ fn status_line(ui: &mut egui::Ui, status: &Status) -> Option<Action> {
                 // the file name changes length.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(monospace(format!("{:.0}%", status.scale * 100.0)));
+                    // A comparison changes what the arrow keys and the zoom
+                    // do, so it says so where the zoom is read.
+                    if let Some(compared) = &status.compared {
+                        separator(ui);
+                        let (word, hint) = match compared.layout {
+                            Layout::Side => ("side by side", "Comparing with the pinned picture  (V to stop, Enter to pin this one)"),
+                            Layout::Blink => ("blinking", "Blinking against the pinned picture  (Shift+V to stop, Enter to pin this one)"),
+                        };
+                        ui.label(egui::RichText::new(word).strong()).on_hover_text(hint);
+                    }
                     // Beside the zoom, because that is what it holds.
                     if status.locked {
                         separator(ui);
@@ -1416,7 +1493,7 @@ fn row(ui: &mut egui::Ui, label: &str, value: &str, measurable: bool) {
 }
 
 /// A file size the way a person reads one.
-fn file_size(bytes: u64) -> String {
+pub(crate) fn file_size(bytes: u64) -> String {
     const UNITS: [(&str, u64); 3] = [("MB", 1024 * 1024), ("kB", 1024), ("bytes", 1)];
     for (unit, scale) in UNITS {
         if bytes >= scale {
@@ -2799,6 +2876,9 @@ pub const KEYS: &[(&str, &str)] = &[
     ("X", "reject this one; again to take the mark off"),
     ("U", "take the mark off"),
     ("M", "walk only the pictures that are marked"),
+    ("V", "put the next one beside this one to compare; again to stop"),
+    ("Shift+V", "compare them by blinking one over the other"),
+    ("Enter", "while comparing, pin the right-hand one and move on"),
     ("Ctrl+X", "frame a crop; Enter saves it as a copy, Esc leaves it"),
     ("Ctrl+Drag", "drag the picture into another window"),
     ("Ctrl+C", "copy the picture"),
@@ -2819,20 +2899,25 @@ pub const KEYS: &[(&str, &str)] = &[
     ("F11", "full screen"),
     (",", "settings"),
     ("?", "this list"),
-    ("Esc", "quit"),
+    ("Esc", "leave a crop, a comparison or the settings; otherwise quit"),
 ];
 
 /// What the toolbar is, said where a person looking for it would read it.
 const TOOLBAR_HINT: &str = "Every one of these is on the toolbar too, which appears when the pointer reaches the top of the window.";
 
-/// Messages, stacked above the status line.
-fn toast_stack(ui: &mut egui::Ui, toasts: &[(String, f32)]) {
+/// How far above the bottom of the window the toasts and the comparison's
+/// table sit: clear of the status line.
+const ABOVE_STATUS: f32 = 52.0;
+
+/// Messages, stacked above the status line — and above `lift` more, where the
+/// comparison's table already is.
+fn toast_stack(ui: &mut egui::Ui, toasts: &[(String, f32)], lift: f32) {
     if toasts.is_empty() {
         return;
     }
 
     area("toasts")
-        .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -52.0))
+        .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -ABOVE_STATUS - lift))
         .interactable(false)
         .show(ui.ctx(), |ui| {
             let palette = crate::theme::palette(ui);
@@ -2847,6 +2932,110 @@ fn toast_stack(ui: &mut egui::Ui, toasts: &[(String, f32)]) {
                     });
             }
         });
+}
+
+/// A name in the corner of each pane: which picture is which.
+///
+/// Side by side, the pinned one says it is pinned; in a blink the one tag
+/// follows the picture that is up, which is the only way to tell the two
+/// apart at a glance when they are nearly identical — the case a blink is for.
+fn pane_tags(ui: &mut egui::Ui, status: &Status, compared: &Compared, toolbar_shown: bool) {
+    let below_toolbar = if toolbar_shown { TOOLBAR_HEIGHT } else { 0.0 };
+    let pinned = (compared.panes[0], true, compared.pinned_name.as_str(), compared.pinned_mark);
+    let current = (compared.panes[1], false, status.name.as_str(), status.mark);
+    let tags = match (compared.layout, compared.showing) {
+        (Layout::Side, _) => vec![pinned, current],
+        (Layout::Blink, Which::Pinned) => vec![pinned],
+        (Layout::Blink, Which::Current) => vec![current],
+    };
+
+    for (pane, is_pinned, name, mark) in tags {
+        let at = egui::pos2(pane.left() + 10.0, pane.top() + below_toolbar + 10.0);
+        area(if is_pinned { "tag-pinned" } else { "tag-current" })
+            .fixed_pos(at)
+            .interactable(false)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::new()
+                    .fill(crate::theme::panel(ui))
+                    .inner_margin(egui::Margin::symmetric(10, 5))
+                    .corner_radius(crate::theme::PANEL_RADIUS)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            if is_pinned {
+                                ui.label(egui::RichText::new("pinned").weak());
+                            }
+                            ui.label(egui::RichText::new(name).strong());
+                            if mark.is_marked() {
+                                separator(ui);
+                                ui.label(mark.name());
+                            }
+                        });
+                    });
+            });
+    }
+}
+
+/// How two pictures differ, between them at the bottom of the window.
+///
+/// Only the rows that differ: two frames of a burst share nearly everything,
+/// and a full table would bury the one line that decides between them. What
+/// they share is named on one line underneath, so "the same ISO" is still an
+/// answer and not a silence. The last column says how far apart a value is —
+/// in stops of light for the exposure, in time for the moment — measured from
+/// the pinned picture to the other.
+///
+/// Returns the height it took, for the toasts to stand clear of it.
+fn difference_table(ui: &mut egui::Ui, status: &Status, compared: &Compared) -> f32 {
+    let table = &compared.table;
+    let response = area("differences")
+        .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -ABOVE_STATUS))
+        .interactable(false)
+        .show(ui.ctx(), |ui| {
+            egui::Frame::new()
+                .fill(crate::theme::panel(ui))
+                .inner_margin(egui::Margin::symmetric(12, 8))
+                .corner_radius(crate::theme::PANEL_RADIUS)
+                .show(ui, |ui| {
+                    if table.rows.is_empty() {
+                        ui.label(egui::RichText::new("Nothing the files say tells these two apart").weak());
+                    } else {
+                        egui::Grid::new("difference-rows").num_columns(4).spacing(egui::vec2(16.0, 3.0)).show(ui, |ui| {
+                            ui.label("");
+                            ui.label(egui::RichText::new(truncated(&compared.pinned_name)).weak());
+                            ui.label(egui::RichText::new(truncated(&status.name)).weak());
+                            ui.label("");
+                            ui.end_row();
+                            for row in &table.rows {
+                                ui.label(egui::RichText::new(row.label).weak());
+                                ui.label(monospace(row.pinned.clone()));
+                                ui.label(monospace(row.current.clone()));
+                                match &row.note {
+                                    Some(note) => ui.label(monospace(note.clone()).strong()),
+                                    None => ui.label(""),
+                                };
+                                ui.end_row();
+                            }
+                        });
+                    }
+                    if !table.same.is_empty() {
+                        let same = table.same.iter().map(|label| label.to_lowercase()).collect::<Vec<_>>().join(", ");
+                        ui.label(egui::RichText::new(format!("same {same}")).weak());
+                    }
+                });
+        });
+    response.response.rect.height() + 8.0
+}
+
+/// A name cut to fit a column, keeping its end: a camera's counter and most
+/// names a person gives a series put what tells two files apart last.
+fn truncated(name: &str) -> String {
+    const ROOM: usize = 24;
+    let count = name.chars().count();
+    if count <= ROOM {
+        return name.to_string();
+    }
+    let tail: String = name.chars().skip(count - (ROOM - 1)).collect();
+    format!("…{tail}")
 }
 
 /// What the window shows while files are held over it.
@@ -3127,6 +3316,7 @@ mod tests {
             visible: (0.0, 0.0, 1.0, 1.0),
             mark: crate::cull::Mark::Unmarked,
             filtered: false,
+            compared: None,
         }
     }
 
@@ -4765,6 +4955,8 @@ mod tests {
             Action::Info,
             Action::FullScreen,
             Action::Keys,
+            Action::Compare,
+            Action::Blink,
         ] {
             let mut interface = Interface::new();
             interface.follow_pointer(Some((400.0, 10.0)));
@@ -4960,5 +5152,81 @@ mod tests {
         let (texts, action) = toolbar_press(&mut pressed, &status, click);
         assert_eq!(action, Some(Action::Keys), "the press did not land on the button, so this proves nothing");
         assert_eq!(separators(&texts), still, "the frame carrying a press drew a different number of separators");
+    }
+
+    /// A status with a comparison up: two frames of a burst, the right one a
+    /// stop darker.
+    fn comparing(layout: Layout, showing: Which) -> Status {
+        let mut status = status();
+        status.name = "burst-0413.jpg".into();
+        status.compared = Some(Compared {
+            layout,
+            panes: [
+                egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(448.0, 600.0)),
+                egui::Rect::from_min_size(egui::pos2(452.0, 0.0), egui::vec2(448.0, 600.0)),
+            ],
+            showing,
+            pinned_name: "burst-0412.jpg".into(),
+            pinned_mark: crate::cull::Mark::Keep,
+            table: Table {
+                rows: vec![crate::compare::Row {
+                    label: "Exposure",
+                    pinned: "1/250 s".into(),
+                    current: "1/500 s".into(),
+                    note: Some("\u{2212}1 EV".into()),
+                }],
+                same: vec!["Camera", "ISO"],
+            },
+        });
+        status
+    }
+
+    /// Side by side, both pictures are named and the pinned one says so; the
+    /// table shows what differs, by how much, and what is shared.
+    #[test]
+    fn a_comparison_names_both_pictures_and_what_tells_them_apart() {
+        let said = words_on_screen(&comparing(Layout::Side, Which::Current));
+        for expected in [
+            "pinned",
+            "burst-0412.jpg",
+            "burst-0413.jpg",
+            "side by side",
+            "Exposure",
+            "1/250 s",
+            "1/500 s",
+            "\u{2212}1 EV",
+            "same camera, iso",
+        ] {
+            assert!(said.contains(expected), "the comparison did not show {expected:?}: {said}");
+        }
+        assert!(said.contains(crate::cull::Mark::Keep.name()), "the pinned picture's mark was not shown: {said}");
+    }
+
+    /// A blink shows one picture at a time, and the one tag follows it: two
+    /// nearly identical frames can only be told apart by it.
+    #[test]
+    fn a_blink_names_the_picture_that_is_up() {
+        let pinned_up = words_on_screen(&comparing(Layout::Blink, Which::Pinned));
+        assert!(pinned_up.contains("pinned") && pinned_up.contains("burst-0412.jpg"), "{pinned_up}");
+        assert!(pinned_up.contains("blinking"), "the status line did not say it is blinking: {pinned_up}");
+
+        let current_up = words_on_screen(&comparing(Layout::Blink, Which::Current));
+        assert!(
+            !current_up.contains("pinned"),
+            "the tag named the pinned picture while the other was up: {current_up}"
+        );
+    }
+
+    /// A flip of the blink has to reach the screen, and a still comparison
+    /// must not ask for frames.
+    #[test]
+    fn a_blink_flipping_is_a_change_and_a_still_comparison_is_not() {
+        let mut interface = Interface::new();
+        assert!(interface.changed(&comparing(Layout::Blink, Which::Current)));
+        assert!(
+            !interface.changed(&comparing(Layout::Blink, Which::Current)),
+            "an unchanged comparison asked for a frame"
+        );
+        assert!(interface.changed(&comparing(Layout::Blink, Which::Pinned)), "the flip was not seen");
     }
 }

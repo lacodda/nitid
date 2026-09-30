@@ -200,6 +200,53 @@ impl View {
         next
     }
 
+    /// Frame another picture over the same part of the scene this one shows,
+    /// at the same size on screen — the framing of the pinned picture in a
+    /// comparison, worked out from the one the person is steering.
+    ///
+    /// Matched by content rather than by pixel scale. Two frames of a burst
+    /// are the same size and come out identical either way; the difference
+    /// is a cover exported at 2000 pixels beside its 4000-pixel original,
+    /// where holding the pixel scale would show twice as much of one as of the
+    /// other and a blink between them would be a jump rather than a
+    /// difference. So the zoom carried is the zoom *relative to the whole
+    /// picture filling the pane* — uncapped, unlike `fit`, whose 100% ceiling
+    /// would put a small picture and a large one at different sizes — and the
+    /// place carried is the point of the picture at the pane's centre, as a
+    /// fraction of the image.
+    ///
+    /// Taken from the framing on screen, the loupe included: a look through
+    /// it is a look at both pictures, which is what the loupe is for while
+    /// comparing sharpness. The result holds no loupe of its own — it is
+    /// worked out again for every frame, and nothing lets go of it.
+    pub fn matched(&self, image: (u32, u32)) -> Self {
+        let mut other = Self {
+            image: (image.0.max(1) as f32, image.1.max(1) as f32),
+            window: self.window,
+            scale: 1.0,
+            scale_factor: self.scale_factor,
+            offset: (0.0, 0.0),
+            mode: self.mode,
+            held: None,
+        };
+
+        let relative = self.scale / self.filling_scale();
+        other.scale = (relative * other.filling_scale()).clamp(MIN_SCALE, MAX_SCALE);
+
+        let (width, height) = self.scaled_size();
+        let centre = (0.5 - self.offset.0 / width, 0.5 - self.offset.1 / height);
+        let (other_width, other_height) = other.scaled_size();
+        other.offset = ((0.5 - centre.0) * other_width, (0.5 - centre.1) * other_height);
+        other.clamp_offset();
+        other
+    }
+
+    /// The scale at which the whole picture just fills the window, with no
+    /// ceiling: the ruler a matched framing is measured against.
+    fn filling_scale(&self) -> f32 {
+        (self.window.0 / self.image.0).min(self.window.1 / self.image.1).max(f32::MIN_POSITIVE)
+    }
+
     /// Where in the frame the user is looking, as a fraction of the pan range.
     ///
     /// Zero is centred; ±1 is against an edge. Expressed this way it means the
@@ -817,6 +864,82 @@ mod tests {
         let next = first.carry_onto((4000, 3000), (2000, 1600), 2.0);
         assert!(about(next.scale(), 2.0), "the zoom read {} on the scaled display", next.scale());
         assert!(about(next.physical_scale(), 4.0), "the physical scale did not follow the display");
+    }
+
+    /// Two frames of one burst are the same size, and the pinned one has to
+    /// sit exactly under the framing of the one being steered — any drift is
+    /// a difference the comparison would invent.
+    #[test]
+    fn a_matched_picture_of_the_same_size_is_framed_identically() {
+        let mut steered = view((6000, 4000), (900, 800));
+        steered.zoom_at(9.0, (200.0, 300.0));
+        steered.pan((-140.0, 60.0));
+
+        let pinned = steered.matched((6000, 4000));
+        assert!(
+            about(pinned.scale(), steered.scale()),
+            "the zoom drifted: {} vs {}",
+            pinned.scale(),
+            steered.scale()
+        );
+        assert!(about(pinned.offset().0, steered.offset().0) && about(pinned.offset().1, steered.offset().1));
+    }
+
+    /// A cover exported at half the size of its original shows the same part
+    /// of the picture at the same size on screen — matched by content, not by
+    /// pixel scale, or a blink between them would be a jump.
+    #[test]
+    fn a_matched_picture_of_another_size_shows_the_same_part_at_the_same_size() {
+        let mut steered = view((4000, 3000), (1000, 800));
+        steered.zoom_at(6.0, (700.0, 250.0));
+        steered.pan((90.0, -40.0));
+
+        let pinned = steered.matched((2000, 1500));
+        let (steered_width, steered_height) = steered.scaled_size();
+        let (pinned_width, pinned_height) = pinned.scaled_size();
+        assert!(
+            about(steered_width, pinned_width) && about(steered_height, pinned_height),
+            "the two are drawn at different sizes"
+        );
+
+        let (a, b) = (steered.visible_fraction(), pinned.visible_fraction());
+        for (left, right) in [(a.0, b.0), (a.1, b.1), (a.2, b.2), (a.3, b.3)] {
+            assert!((left - right).abs() < 0.001, "the panes show different parts: {a:?} vs {b:?}");
+        }
+    }
+
+    /// `fit` stops at 100%, so a small picture fitted into a pane is drawn at
+    /// its own size while a large one fills it. Matched against that ceiling
+    /// the two would come out at different sizes; matched against the pane
+    /// they do not.
+    #[test]
+    fn a_small_picture_fitted_is_matched_at_its_size_on_screen() {
+        let steered = view((500, 400), (1000, 800));
+        assert!(about(steered.scale(), 1.0), "the fixture is not held at 100%");
+
+        let pinned = steered.matched((5000, 4000));
+        assert!(
+            about(pinned.scaled_size().0, 500.0),
+            "the large picture came out {} wide",
+            pinned.scaled_size().0
+        );
+    }
+
+    /// Pictures of different shapes cannot overlap exactly, but the point
+    /// at the centre of the pane is the same point of each.
+    #[test]
+    fn a_matched_picture_of_another_shape_keeps_the_point_at_the_centre() {
+        let mut steered = view((3000, 2000), (800, 800));
+        steered.zoom_to_at(1.0, (400.0, 400.0));
+        steered.pan((600.0, 300.0));
+
+        let pinned = steered.matched((2000, 3000));
+        let centre = |view: &View| {
+            let (width, height) = view.scaled_size();
+            (0.5 - view.offset().0 / width, 0.5 - view.offset().1 / height)
+        };
+        let (a, b) = (centre(&steered), centre(&pinned));
+        assert!((a.0 - b.0).abs() < 0.001 && (a.1 - b.1).abs() < 0.001, "the centres differ: {a:?} vs {b:?}");
     }
 
     /// What the eyedropper is built on: a window position names a pixel of

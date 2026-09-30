@@ -32,11 +32,21 @@ const PREFETCH_RADIUS: usize = 1;
 
 /// A decode that finished, addressed to the request that asked for it.
 pub struct Decoded {
-    /// Which `request` this answers. A reply whose generation is stale belongs
-    /// to an image the user has already navigated away from.
-    pub generation: u64,
+    pub asked: Asked,
     pub path: PathBuf,
     pub result: Result<LoadedImage, String>,
+}
+
+/// Which kind of request a decode answers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Asked {
+    /// The picture on screen, under the generation it was asked for in. A
+    /// reply whose generation is stale belongs to an image the user has
+    /// already navigated away from.
+    Shown(u64),
+    /// A picture held beside the one on screen, which no step of the arrow
+    /// keys makes stale: it stays wanted until it is let go of.
+    Held,
 }
 
 /// What the worker threads are asked to do.
@@ -48,6 +58,10 @@ enum Job {
     },
     /// Decode this file into the cache without notifying anyone.
     Prefetch {
+        path: PathBuf,
+    },
+    /// Decode this file and report back, whatever the user does meanwhile.
+    Held {
         path: PathBuf,
     },
     Stop,
@@ -127,7 +141,7 @@ impl Loader {
                                 };
 
                                 notify(Decoded {
-                                    generation: want,
+                                    asked: Asked::Shown(want),
                                     path,
                                     result: result.map(unwrap_or_clone),
                                 });
@@ -143,6 +157,18 @@ impl Loader {
                                 if let Ok(image) = load_or_take(&cache, &path, &|| true) {
                                     remember(&cache, &path, image);
                                 }
+                            }
+                            // Not remembered in the cache: the caller keeps
+                            // the one copy for as long as it holds the
+                            // picture, and a second in the cache would be
+                            // evicted by the next step anyway.
+                            Ok(Job::Held { path }) => {
+                                let result = load_or_take(&cache, &path, &|| true);
+                                notify(Decoded {
+                                    asked: Asked::Held,
+                                    path,
+                                    result: result.map(unwrap_or_clone),
+                                });
                             }
                             Ok(Job::Stop) | Err(_) => break,
                         }
@@ -176,6 +202,20 @@ impl Loader {
         });
 
         Request::Pending
+    }
+
+    /// Ask for a picture to be held beside the one on screen.
+    ///
+    /// Answered at once when it is already decoded; otherwise a worker decodes
+    /// it and the answer arrives as a [`Decoded`] marked [`Asked::Held`]. The
+    /// generation is left alone, so this never makes the picture on screen's
+    /// own decode stale — and navigation never makes this one stale either.
+    pub fn hold(&self, path: &Path) -> Option<Arc<LoadedImage>> {
+        if let Some(ready) = self.cache.lock().expect("the cache is poisoned").get(path) {
+            return Some(Arc::clone(ready));
+        }
+        let _ = self.jobs.send(Job::Held { path: path.to_path_buf() });
+        None
     }
 
     /// Whether a reply still concerns the image on screen.
@@ -312,7 +352,7 @@ mod tests {
         let generation = loader.current_generation();
 
         let decoded = replies.recv_timeout(Duration::from_secs(10)).expect("the decode should be delivered");
-        assert_eq!(decoded.generation, generation);
+        assert_eq!(decoded.asked, Asked::Shown(generation));
         assert_eq!(decoded.path, path);
         assert!(decoded.result.is_ok());
     }
@@ -351,6 +391,33 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
         panic!("the prefetched image never became ready");
+    }
+
+    /// A pinned picture is asked for and then stepped away from at once —
+    /// that is what pinning does. Its decode must still arrive, marked as
+    /// held, however far the arrow keys have gone meanwhile.
+    #[test]
+    fn a_held_picture_arrives_whatever_the_navigation_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let pinned = image_file(dir.path(), "pinned.png");
+        let elsewhere = image_file(dir.path(), "elsewhere.png");
+
+        let (sender, replies) = mpsc::channel();
+        let loader = Loader::new(move |decoded| {
+            let _ = sender.send(decoded);
+        });
+
+        assert!(loader.hold(&pinned).is_none(), "an undecoded picture was handed over as ready");
+        let before = loader.current_generation();
+        loader.request(&elsewhere);
+        loader.request(&elsewhere);
+
+        let held = std::iter::from_fn(|| replies.recv_timeout(Duration::from_secs(10)).ok())
+            .find(|decoded| decoded.asked == Asked::Held)
+            .expect("the held picture never arrived");
+        assert_eq!(held.path, pinned);
+        assert!(held.result.is_ok());
+        assert_eq!(before, 0, "asking to hold a picture moved the generation of the one on screen");
     }
 
     #[test]

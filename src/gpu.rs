@@ -352,13 +352,53 @@ struct TileUpload {
     tile: Tile,
 }
 
-/// The image currently resident on the GPU.
-struct Upload {
+/// One picture resident on the GPU, with everything its draws read.
+///
+/// The colour state lives here rather than on the renderer because two
+/// pictures can be up at once, and they rarely share a profile: a photograph
+/// in Display P3 compared with its sRGB export needs two sets of curves and
+/// two matrices in the same frame. A single shared uniform would draw one of
+/// them in the other's colours — wrong in exactly the case a comparison is
+/// for.
+struct Resident {
     tiles: Vec<TileUpload>,
     size: (u32, u32),
     /// The sample depth the textures were created for. A frame of another
     /// depth cannot be written into them — the formats differ.
     depth: Depth,
+    /// How this picture's colours reach the display. Kept so the uniform can
+    /// be rewritten when the surface changes under it — the same picture needs
+    /// different encoding on an SDR and an HDR surface.
+    transform: ColorTransform,
+    colour: wgpu::Buffer,
+    /// Tone curves sampled to linear light: three rows, one per channel. Held
+    /// so the texture lives as long as the bind groups that read it.
+    _curves: wgpu::Texture,
+}
+
+/// Which of the two pictures a draw is of.
+///
+/// `Main` is the picture the viewer is on — the one the arrow keys move and
+/// the status line names. `Pinned` is the one held beside it while two are
+/// compared. Named for their roles rather than their places, because a
+/// comparison shows them side by side or one at a time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Slot {
+    Main,
+    Pinned,
+}
+
+/// One rectangle of the window and the picture drawn in it.
+///
+/// A single picture is one pane covering the window; a comparison is two. The
+/// view is framed against the pane's own size, not the window's, so zoom and
+/// pan mean inside a pane what they mean in a whole window.
+pub struct Pane<'a> {
+    pub slot: Slot,
+    /// Left, top, width and height, in physical pixels.
+    pub rect: (u32, u32, u32, u32),
+    pub view: &'a View,
+    pub orientation: Orientation,
 }
 
 /// Device, surface, pipeline, and the texture being shown.
@@ -381,18 +421,9 @@ pub struct Renderer {
     pipeline_layout: wgpu::PipelineLayout,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
-    /// Tone curves sampled to linear light: three rows, one per channel.
-    curves: wgpu::Texture,
-    curves_view: wgpu::TextureView,
     curve_sampler: wgpu::Sampler,
-    colour: wgpu::Buffer,
-    /// The transform of the image currently up, kept so the colour uniform can
-    /// be rewritten when the surface changes under it — the same picture needs
-    /// different encoding on an SDR and an HDR surface.
-    transform: ColorTransform,
-    /// What shows through a transparent pixel. Held here for the same reason
-    /// as the transform: it outlives any one image and has to be restated
-    /// whenever the uniform is rewritten.
+    /// What shows through a transparent pixel. It outlives any one image and
+    /// has to be restated whenever a picture's uniform is rewritten.
     backdrop: Backdrop,
     /// Whether the clipping zebra is showing.
     ///
@@ -413,7 +444,10 @@ pub struct Renderer {
     /// The longest side a texture may have, and so the size an image is cut
     /// into pieces at. Taken from the device; see [`tile_limit`].
     tile_limit: u32,
-    upload: Option<Upload>,
+    /// The picture the viewer is on.
+    main: Option<Resident>,
+    /// The picture held beside it while two are compared.
+    pinned: Option<Resident>,
 }
 
 /// Decide how an image is cut up, and refuse the result if it still would not
@@ -534,27 +568,6 @@ impl Renderer {
             ..Default::default()
         });
 
-        // One row per channel. `R16Float` rather than `R32Float` because only
-        // 16-bit floats are guaranteed filterable — a 32-bit curve texture is
-        // rejected on hardware that cannot interpolate it, and interpolation
-        // between entries is the whole point. Half precision holds a 0..1
-        // curve to about eleven bits, well past what an 8-bit image needs.
-        let curves = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("nitid tone curves"),
-            size: wgpu::Extent3d {
-                width: CURVE_SAMPLES as u32,
-                height: 3,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R16Float,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let curves_view = curves.create_view(&wgpu::TextureViewDescriptor::default());
-
         let curve_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("nitid curve sampler"),
             // Linear so values between curve entries interpolate. The shader
@@ -565,19 +578,6 @@ impl Renderer {
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             ..Default::default()
-        });
-
-        let colour = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("nitid colour"),
-            contents: bytemuck::bytes_of(&ColourUniform::new(
-                &ColorTransform::identity(),
-                output,
-                Depth::Eight,
-                Backdrop::default(),
-                false,
-                Thresholds::default(),
-            )),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
         Ok(Self {
@@ -592,17 +592,14 @@ impl Renderer {
             pipeline_layout,
             layout,
             sampler,
-            curves,
-            curves_view,
             curve_sampler,
-            colour,
-            transform: ColorTransform::identity(),
             backdrop: Backdrop::default(),
             zebra: false,
             thresholds: Thresholds::default(),
             wide_textures,
             tile_limit,
-            upload: None,
+            main: None,
+            pinned: None,
         })
     }
 
@@ -675,10 +672,14 @@ impl Renderer {
     /// half is still a method on a `Renderer` no test can build. What does
     /// cover it is opening the viewer and pressing `B`, which is part of the
     /// release checklist rather than of `cargo test`.
-    fn write_colour(&mut self) {
-        let depth = self.upload.as_ref().map_or(Depth::Eight, |upload| upload.depth);
-        let uniform = ColourUniform::new(&self.transform, self.output, depth, self.backdrop, self.zebra, self.thresholds);
-        self.queue.write_buffer(&self.colour, 0, bytemuck::bytes_of(&uniform));
+    ///
+    /// Every picture that is up is rewritten, each from its own transform and
+    /// depth: a backdrop chosen while two are compared belongs to both panes.
+    fn write_colour(&self) {
+        for resident in [self.main.as_ref(), self.pinned.as_ref()].into_iter().flatten() {
+            let uniform = ColourUniform::new(&resident.transform, self.output, resident.depth, self.backdrop, self.zebra, self.thresholds);
+            self.queue.write_buffer(&resident.colour, 0, bytemuck::bytes_of(&uniform));
+        }
     }
 
     /// Point an existing interface layer at the surface as it is now.
@@ -760,6 +761,37 @@ impl Renderer {
     /// uploaded instead, because the shader has to apply the image's own tone
     /// curves rather than assume sRGB.
     pub fn set_image(&mut self, image: &DecodedImage, transform: &ColorTransform) {
+        self.main = self.resident(image, transform);
+    }
+
+    /// Put a picture beside the main one, for a comparison.
+    pub fn set_pinned(&mut self, image: &DecodedImage, transform: &ColorTransform) {
+        self.pinned = self.resident(image, transform);
+    }
+
+    /// Hold the picture that is up as the pinned one, and leave the main slot
+    /// empty for the next.
+    ///
+    /// A move rather than a second upload: the textures, the curves and the
+    /// colour state are already on the GPU and are exactly what the pinned
+    /// picture needs, so pinning a sixty-megapixel photograph costs nothing
+    /// at all rather than a full copy of it.
+    pub fn pin_main(&mut self) {
+        self.pinned = self.main.take();
+    }
+
+    /// Let go of the pinned picture.
+    pub fn unpin(&mut self) {
+        self.pinned = None;
+    }
+
+    /// Build everything one picture needs on the GPU.
+    ///
+    /// `None` when nothing can be drawn within this device's limits, or when a
+    /// decoder handed over a buffer shorter than it promised; either way the
+    /// slot is left empty rather than given a texture the driver would reject
+    /// or a torn picture.
+    fn resident(&self, image: &DecodedImage, transform: &ColorTransform) -> Option<Resident> {
         let size = (image.width.max(1), image.height.max(1));
 
         // A wide image on a device without wide textures is narrowed here,
@@ -795,13 +827,35 @@ impl Renderer {
         // the device's error handler, whose default is a panic. Measured — a
         // 20000-pixel-wide file decoded in full and then took the viewer down
         // as it was about to appear. See ADR 0015.
-        let Some(grid) = plan_tiles(size, self.tile_limit, self.device.limits().max_texture_dimension_2d) else {
-            // Nothing can be drawn within this device's limits. Drop what is
-            // up rather than hand the driver a texture it will reject.
-            self.upload = None;
-            return;
-        };
+        let grid = plan_tiles(size, self.tile_limit, self.device.limits().max_texture_dimension_2d)?;
         let bytes_per_pixel = 4 * depth.bytes() as usize;
+
+        // One row per channel. `R16Float` rather than `R32Float` because only
+        // 16-bit floats are guaranteed filterable — a 32-bit curve texture is
+        // rejected on hardware that cannot interpolate it, and interpolation
+        // between entries is the whole point. Half precision holds a 0..1
+        // curve to about eleven bits, well past what an 8-bit image needs.
+        let curves = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("nitid tone curves"),
+            size: wgpu::Extent3d {
+                width: CURVE_SAMPLES as u32,
+                height: 3,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.write_curves(&curves, transform);
+        let curves_view = curves.create_view(&wgpu::TextureViewDescriptor::default());
+        let colour = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("nitid colour"),
+            contents: bytemuck::bytes_of(&ColourUniform::new(transform, self.output, depth, self.backdrop, self.zebra, self.thresholds)),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
 
         let mut uploads = Vec::with_capacity(grid.len());
         for tile in grid.tiles() {
@@ -828,13 +882,8 @@ impl Renderer {
             let data: &[u8] = if grid.is_single() {
                 pixels
             } else {
-                let Some(copied) = tiles::extract(pixels, size, tile, bytes_per_pixel) else {
-                    // Short buffer: a decoder broke its own contract. Drop
-                    // what is up rather than draw a torn picture.
-                    self.upload = None;
-                    return;
-                };
-                owned = copied;
+                // Short buffer: a decoder broke its own contract.
+                owned = tiles::extract(pixels, size, tile, bytes_per_pixel)?;
                 &owned
             };
 
@@ -875,7 +924,7 @@ impl Renderer {
                     },
                     wgpu::BindGroupEntry {
                         binding: 3,
-                        resource: wgpu::BindingResource::TextureView(&self.curves_view),
+                        resource: wgpu::BindingResource::TextureView(&curves_view),
                     },
                     wgpu::BindGroupEntry {
                         binding: 4,
@@ -883,7 +932,7 @@ impl Renderer {
                     },
                     wgpu::BindGroupEntry {
                         binding: 5,
-                        resource: self.colour.as_entire_binding(),
+                        resource: colour.as_entire_binding(),
                     },
                 ],
             });
@@ -896,15 +945,14 @@ impl Renderer {
             });
         }
 
-        self.transform = transform.clone();
-        self.write_curves(transform);
-        self.queue.write_buffer(
-            &self.colour,
-            0,
-            bytemuck::bytes_of(&ColourUniform::new(transform, self.output, depth, self.backdrop, self.zebra, self.thresholds)),
-        );
-
-        self.upload = Some(Upload { tiles: uploads, size, depth });
+        Some(Resident {
+            tiles: uploads,
+            size,
+            depth,
+            transform: transform.clone(),
+            colour,
+            _curves: curves,
+        })
     }
 
     /// Write new pixels into the texture already on screen.
@@ -916,7 +964,7 @@ impl Renderer {
     /// not match, in which case the caller's picture is wrong enough that a
     /// full `set_image` is the answer.
     pub fn update_pixels(&mut self, image: &DecodedImage) -> bool {
-        let Some(upload) = &self.upload else {
+        let Some(upload) = &self.main else {
             return false;
         };
         if upload.size != (image.width, image.height) || upload.depth != image.depth {
@@ -962,11 +1010,11 @@ impl Renderer {
     }
 
     /// Upload the sampled tone curves the shader reads.
-    fn write_curves(&self, transform: &ColorTransform) {
+    fn write_curves(&self, curves: &wgpu::Texture, transform: &ColorTransform) {
         let halves: Vec<half::f16> = transform.decode.iter().map(|value| half::f16::from_f32(*value)).collect();
 
         self.queue.write_texture(
-            self.curves.as_image_copy(),
+            curves.as_image_copy(),
             bytemuck::cast_slice(&halves),
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
@@ -985,7 +1033,12 @@ impl Renderer {
     ///
     /// A lost or outdated swapchain is reconfigured and the frame skipped: the
     /// next redraw request paints it. Out of memory is fatal and propagates.
-    pub fn render(&mut self, shown: Option<(&View, Orientation)>, interface: Option<Painted<'_>>) -> Result<()> {
+    ///
+    /// `panes` says what goes where: one covering the window for a single
+    /// picture, two for a comparison, none for an empty window — which still
+    /// clears to the background, so the window is never a hole showing
+    /// whatever was behind it.
+    pub fn render(&mut self, panes: &[Pane<'_>], interface: Option<Painted<'_>>) -> Result<()> {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
             // Suboptimal still presents; reconfiguring restores the fast path
@@ -1004,7 +1057,7 @@ impl Renderer {
         };
 
         let target = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = self.draw_into(&target, self.size(), shown);
+        let mut encoder = self.draw_into(&target, self.size(), panes);
 
         // The interface goes into the same encoder, so it and the picture it
         // sits on reach the screen in one frame rather than as two.
@@ -1034,12 +1087,24 @@ impl Renderer {
     /// reads back: the swapchain is the one thing an offscreen test cannot
     /// have, and everything worth checking — where each tile lands, what it
     /// samples, how many draws it takes — is on this side of that line.
-    fn draw_into(&self, target: &wgpu::TextureView, size: (u32, u32), shown: Option<(&View, Orientation)>) -> wgpu::CommandEncoder {
-        if let (Some((view, orientation)), Some(upload)) = (shown, self.upload.as_ref()) {
-            let whole = Placement::new(view, size, orientation);
-            for piece in &upload.tiles {
-                let placement = whole.for_tile(orientation, piece.tile.span(upload.size), piece.tile.inner_uv());
-                self.queue.write_buffer(&piece.placement, 0, placement.as_bytes());
+    fn draw_into(&self, target: &wgpu::TextureView, size: (u32, u32), panes: &[Pane<'_>]) -> wgpu::CommandEncoder {
+        // Each picture's placement is written for the pane it is drawn in.
+        // A tile has one placement buffer, so a picture can be in one pane of
+        // a frame and no more — which is all a comparison ever asks for.
+        debug_assert!(
+            panes
+                .iter()
+                .enumerate()
+                .all(|(index, pane)| panes[index + 1..].iter().all(|other| other.slot != pane.slot)),
+            "a picture was asked for in two panes of one frame",
+        );
+        for pane in panes {
+            if let Some(resident) = self.resident_in(pane.slot) {
+                let whole = Placement::new(pane.view, (pane.rect.2, pane.rect.3), pane.orientation);
+                for piece in &resident.tiles {
+                    let placement = whole.for_tile(pane.orientation, piece.tile.span(resident.size), piece.tile.inner_uv());
+                    self.queue.write_buffer(&piece.placement, 0, placement.as_bytes());
+                }
             }
         }
 
@@ -1065,19 +1130,59 @@ impl Renderer {
                 multiview_mask: None,
             });
 
-            if let Some(upload) = &self.upload {
-                pass.set_pipeline(&self.pipeline);
-                // One draw call per tile, which for every image that fits a
-                // texture is one draw call in total.
-                for piece in &upload.tiles {
-                    pass.set_bind_group(0, &piece.bind_group, &[]);
-                    pass.draw(0..4, 0..1);
+            pass.set_pipeline(&self.pipeline);
+            for pane in panes {
+                if let Some(resident) = self.resident_in(pane.slot) {
+                    draw_pane(&mut pass, pane.rect, size, resident.tiles.iter().map(|piece| &piece.bind_group));
                 }
             }
         }
 
         encoder
     }
+
+    fn resident_in(&self, slot: Slot) -> Option<&Resident> {
+        match slot {
+            Slot::Main => self.main.as_ref(),
+            Slot::Pinned => self.pinned.as_ref(),
+        }
+    }
+}
+
+/// Draw one pane: its pieces, into its rectangle of the target.
+///
+/// The viewport is what places the picture — clip space spans the pane rather
+/// than the window, so the placement worked out for the pane lands inside it.
+/// The scissor is the same rectangle again, and it is there as a guarantee
+/// rather than a correction: the rasteriser already clips to the viewport, but
+/// a picture zoomed far past its pane must not be able to paint across the
+/// other one on a driver that reads that rule generously.
+///
+/// One draw call per tile, which for every image that fits a texture is one
+/// draw call per pane.
+fn draw_pane<'a>(pass: &mut wgpu::RenderPass<'_>, rect: (u32, u32, u32, u32), target: (u32, u32), pieces: impl Iterator<Item = &'a wgpu::BindGroup>) {
+    let Some((x, y, width, height)) = inside(rect, target) else {
+        return;
+    };
+    pass.set_viewport(x as f32, y as f32, width as f32, height as f32, 0.0, 1.0);
+    pass.set_scissor_rect(x, y, width, height);
+    for piece in pieces {
+        pass.set_bind_group(0, piece, &[]);
+        pass.draw(0..4, 0..1);
+    }
+}
+
+/// The part of a rectangle that lies on the target, or `None` when none does.
+///
+/// wgpu refuses a scissor that reaches past the target — through the device's
+/// error handler, whose default is a panic — so a pane is held to the target
+/// rather than trusted. A window shrinking between the layout and the draw is
+/// how one would get there.
+fn inside(rect: (u32, u32, u32, u32), target: (u32, u32)) -> Option<(u32, u32, u32, u32)> {
+    let (x, y) = (rect.0.min(target.0), rect.1.min(target.1));
+    let right = rect.0.saturating_add(rect.2).min(target.0);
+    let bottom = rect.1.saturating_add(rect.3).min(target.1);
+    (right > x && bottom > y).then(|| (x, y, right - x, bottom - y))
 }
 
 /// The bindings one image draw needs: the texture and its sampler, placement,
@@ -2169,6 +2274,257 @@ mod tests {
     /// one races every other test in the binary. The sandbox suite learned
     /// this in v0.9.0, where "hang on purpose" leaked into four neighbours.
     static ENVIRONMENT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Draw a picture into two panes of one target through `draw_pane`, and
+    /// read the row back as what each pixel shows.
+    ///
+    /// The picture is four pixels wide, red on its left half and green on its
+    /// right, and each pane is four pixels wide too, so a pane that places it
+    /// correctly reads red, red, green, green. The production pipeline,
+    /// shader and `draw_pane` draw it; only the device and the swapchain are
+    /// stood in for.
+    fn draw_two_panes(panes: [(u32, u32, u32, u32); 2], width: u32) -> Option<Vec<char>> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()?;
+
+        let output = plain_surface();
+        let transform = ColorTransform::identity();
+        let layout = bind_group_layout(&device);
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: None,
+            source: wgpu::ShaderSource::Wgsl(include_str!("gpu/shader.wgsl").into()),
+        });
+        let pipeline = build_pipeline(&device, &pipeline_layout, &shader, output.format);
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor::default());
+
+        let picture: Vec<u8> = [[255, 0, 0, 255], [255, 0, 0, 255], [0, 255, 0, 255], [0, 255, 0, 255]].concat();
+        let extent = wgpu::Extent3d {
+            width: 4,
+            height: 1,
+            depth_or_array_layers: 1,
+        };
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            texture.as_image_copy(),
+            &picture,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(16),
+                rows_per_image: Some(1),
+            },
+            extent,
+        );
+
+        let curve_extent = wgpu::Extent3d {
+            width: CURVE_SAMPLES as u32,
+            height: 3,
+            depth_or_array_layers: 1,
+        };
+        let curves = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: curve_extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let halves: Vec<half::f16> = transform.decode.iter().map(|value| half::f16::from_f32(*value)).collect();
+        queue.write_texture(
+            curves.as_image_copy(),
+            bytemuck::cast_slice(&halves),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some((CURVE_SAMPLES * 2) as u32),
+                rows_per_image: Some(3),
+            },
+            curve_extent,
+        );
+
+        // Placed for a pane, the way `draw_into` places it: the view is framed
+        // against the pane's size, which is the picture's.
+        let placement = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: Placement::new(&View::new((4, 1), (4, 1), 1.0), (4, 1), Orientation::Normal).as_bytes(),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let colour = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::bytes_of(&ColourUniform::new(
+                &transform,
+                output,
+                Depth::Eight,
+                Backdrop::default(),
+                false,
+                Thresholds::default(),
+            )),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let curves_view = curves.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&texture_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: placement.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&curves_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: colour.as_entire_binding(),
+                },
+            ],
+        });
+
+        let target_extent = wgpu::Extent3d {
+            width,
+            height: 1,
+            depth_or_array_layers: 1,
+        };
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: target_extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: output.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        let row = (width * 4).next_multiple_of(256);
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: u64::from(row),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(BACKGROUND),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&pipeline);
+            for pane in panes {
+                draw_pane(&mut pass, pane, (width, 1), std::iter::once(&bind_group));
+            }
+        }
+        encoder.copy_texture_to_buffer(
+            target.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row),
+                    rows_per_image: Some(1),
+                },
+            },
+            target_extent,
+        );
+        queue.submit([encoder.finish()]);
+        readback.map_async(wgpu::MapMode::Read, .., |_| {});
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            })
+            .ok()?;
+        let bytes = readback.slice(..).get_mapped_range().ok()?.to_vec();
+
+        // The target is BGRA: red is the third byte, green the second.
+        Some(
+            bytes[..(width * 4) as usize]
+                .chunks(4)
+                .map(|pixel| match (pixel[2] > 200, pixel[1] > 200) {
+                    (true, false) => 'R',
+                    (false, true) => 'G',
+                    _ if pixel[1] < 60 && pixel[2] < 60 => '.',
+                    _ => '?',
+                })
+                .collect(),
+        )
+    }
+
+    /// Two panes, each with the whole picture in it and the scene between:
+    /// what makes side by side side by side. Without the viewport the picture
+    /// is placed against the whole target and the scissor cuts a slice of it
+    /// into each pane — red in one, green in the other — which reads as two
+    /// pictures while being one picture torn in half.
+    #[test]
+    fn each_pane_holds_the_whole_picture() {
+        let Some(row) = draw_two_panes([(0, 0, 4, 1), (6, 0, 4, 1)], 10) else {
+            eprintln!("skipping: no graphics adapter here");
+            return;
+        };
+        assert_eq!(row.iter().collect::<String>(), "RRGG..RRGG", "the panes do not each hold the picture");
+    }
+
+    /// A pane reaching past the target is held to it rather than handed to
+    /// wgpu, which refuses such a scissor by panicking through the device.
+    #[test]
+    fn a_pane_past_the_target_is_held_to_it() {
+        assert_eq!(inside((6, 0, 10, 5), (10, 3)), Some((6, 0, 4, 3)));
+        assert_eq!(inside((12, 0, 4, 4), (10, 3)), None, "a pane wholly off the target was kept");
+        assert_eq!(inside((0, 0, 0, 4), (10, 3)), None, "an empty pane was kept");
+        assert_eq!(inside((u32::MAX, 0, u32::MAX, 1), (10, 3)), None, "the arithmetic wrapped");
+
+        let Some(row) = draw_two_panes([(0, 0, 4, 1), (6, 0, 400, 1)], 10) else {
+            eprintln!("skipping: no graphics adapter here");
+            return;
+        };
+        assert_eq!(
+            row[..6].iter().collect::<String>(),
+            "RRGG..",
+            "a pane past the edge disturbed the one beside it"
+        );
+    }
 
     /// Draw a whole image at `limit` as the texture side limit, and read the
     /// target back as 8-bit RGBA rows.

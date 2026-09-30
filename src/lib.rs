@@ -15,6 +15,7 @@ mod app;
 mod avif;
 mod clipboard;
 mod color;
+mod compare;
 mod config;
 mod console;
 mod crop;

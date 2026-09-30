@@ -38,6 +38,10 @@ difference, not the function.
 - **Tools for reading a picture**, not just looking at it: histogram, loupe,
   clipping warning, an eyedropper that reads in the file's terms and the
   display's.
+- **Two frames at once.** `V` pins one and walks the rest of a burst beside it
+  with the zoom in step, `Shift+V` blinks the two in one place, and a table
+  says what the camera did differently - in stops and in fractions of a
+  second.
 - **A copy without the camera, the date and the place.** `Ctrl+M` strips EXIF,
   XMP and IPTC by not copying them - no encoder runs, so the photograph you send
   is the photograph you took.
@@ -72,7 +76,9 @@ From there, arrow keys walk the folder, `?` shows every key, `I` says what the
 file says about itself, `H` draws a histogram of its own values, and `C` reads
 the pixel under the pointer in both the file's terms and the display's.
 `P` and `X` mark a picture as kept or rejected while you go through a shoot,
-and `M` then walks only the ones you marked.
+and `M` then walks only the ones you marked. When two frames of a burst are
+too close to call, `V` puts them side by side and `Enter` keeps the better one
+pinned while you walk the rest.
 
 ## Install
 

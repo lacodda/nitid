@@ -33,6 +33,9 @@ Opening a file opens its folder: the arrow keys walk the images beside it.
 | `X` | reject this one; again to take the mark off |
 | `U` | take the mark off |
 | `M` | walk only the pictures that are marked |
+| `V` | put the next picture beside this one to compare; again to stop |
+| `Shift+V` | compare them by blinking one over the other |
+| `Enter` | while comparing, pin the right-hand picture and move on |
 | `Ctrl+X` | frame a crop; Enter saves it as a copy, Esc leaves it |
 | `Ctrl+Drag` | drag the picture into another window |
 | `Ctrl+C` | copy the picture |
@@ -52,7 +55,7 @@ Opening a file opens its folder: the arrow keys walk the images beside it.
 | `F11` | fullscreen |
 | `,` | settings |
 | `?` | every key there is |
-| `Esc` | close the settings, or quit |
+| `Esc` | leave a crop, a comparison or the settings; otherwise quit |
 
 "100%" means one image pixel per logical pixel, so a photo is the same size
 here as everywhere else on a scaled display.

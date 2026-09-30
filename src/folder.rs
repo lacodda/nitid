@@ -118,6 +118,24 @@ impl Folder {
         Some(self.current())
     }
 
+    /// Move to a picture already in the listing, without stepping through
+    /// the ones between — back to the pinned picture when a comparison ends.
+    ///
+    /// False when it is not listed any more: removed or renamed behind the
+    /// viewer's back, in which case the cursor stays where it was. A filter
+    /// does not stand in the way, for the reason switching one on does not
+    /// move the picture: the cursor may rest on a picture the filter leaves
+    /// out, and the next step goes into the selection.
+    pub fn go_to(&mut self, path: &Path) -> bool {
+        match self.entries.iter().position(|entry| entry == path) {
+            Some(index) => {
+                self.current = index;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// The file the viewer is showing.
     pub fn current(&self) -> &Path {
         &self.entries[self.current]
@@ -654,6 +672,26 @@ mod tests {
     fn named(names: &[&str]) -> impl Fn(&Path) -> bool + use<> {
         let names: Vec<String> = names.iter().map(|name| (*name).to_string()).collect();
         move |path: &Path| names.iter().any(|name| path.file_name().is_some_and(|actual| actual == name.as_str()))
+    }
+
+    /// A comparison ends on the pinned picture, however far the walk went:
+    /// the cursor goes straight there and the next step carries on from it.
+    #[test]
+    fn going_to_a_listed_picture_moves_the_cursor_there() {
+        let (dir, _) = folder_with(&["a.png", "b.png", "c.png", "d.png"]);
+        let mut folder = Folder::open(&dir.path().join("a.png"), Order::Name, false).unwrap();
+        let pinned = folder.current().to_path_buf();
+        folder.next();
+        folder.next();
+
+        assert!(folder.go_to(&pinned));
+        assert_eq!(folder.current(), pinned);
+        assert_eq!(folder.next().unwrap().file_name().unwrap(), "b.png", "the walk did not carry on from it");
+
+        let gone = dir.path().join("gone.png");
+        let before = folder.current().to_path_buf();
+        assert!(!folder.go_to(&gone), "a picture that is not listed was gone to");
+        assert_eq!(folder.current(), before, "a refused move moved the cursor");
     }
 
     /// The filter narrows what the arrow keys walk, and the count with it.
