@@ -954,9 +954,15 @@ impl Interface {
 /// A button is disabled rather than hidden when it would do nothing: a strip
 /// whose contents move about as folders change is harder to aim at than one
 /// that is always the same shape.
+///
+/// The buttons are written down in groups, in the order they read from left
+/// to right, and laid out from that list. Written as a chain of calls in the
+/// right-to-left layout the bar needs, the order on screen was the reverse of
+/// the order in the source inside every group, and a separator placed with
+/// `or_else` vanished on the frame a button was pressed — the bar shifted
+/// under the pointer at the moment it was used.
 fn toolbar(ui: &mut egui::Ui, status: &Status, info_shown: bool, histogram_shown: bool, mark: &mut Option<egui::TextureHandle>) -> Option<Action> {
-    let alone = status.position.is_none_or(|(_, count)| count <= 1);
-    let showing = status.size.is_some();
+    let groups = toolbar_groups(status, info_shown, histogram_shown);
 
     egui::Panel::top("toolbar")
         .frame(egui::Frame::new().fill(crate::theme::panel(ui)).inner_margin(egui::Margin::symmetric(8, 4)))
@@ -965,101 +971,21 @@ fn toolbar(ui: &mut egui::Ui, status: &Status, info_shown: bool, histogram_shown
             // get their room; the identity on the left takes what is left,
             // and it is the trail that gives way on a narrow window.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // Right to left, so the first added is the rightmost. The two
-                // that carry a state show which one they are in rather than
-                // only what they would do.
-                let chosen = button(ui, "?", "Keys  (?)", true, Action::Keys)
-                    .or(button(ui, "⚙", "Settings  (,)", true, Action::Settings))
-                    .or(button(ui, "⛶", "Full screen  (F11)", true, Action::FullScreen))
-                    .or(toggle(ui, "Info", "What the file says about itself  (I)", showing, info_shown, Action::Info))
-                    .or(toggle(
-                        ui,
-                        "Tones",
-                        "What tones the picture is made of  (H)",
-                        showing,
-                        histogram_shown,
-                        Action::Histogram,
-                    ))
-                    .or(toggle(
-                        ui,
-                        "Clip",
-                        "Mark what the file clipped  (G)",
-                        showing,
-                        status.clipping,
-                        Action::Clipping,
-                    ))
-                    .or(toggle(
-                        ui,
-                        "Pick",
-                        "Read the colour under the pointer  (C)",
-                        showing,
-                        status.picking,
-                        Action::Pick,
-                    ))
-                    .or_else(|| {
+                // Right to left, so the list is walked from its end: the last
+                // group is the rightmost, and the last button in each group
+                // the rightmost within it.
+                let mut chosen = None;
+                for (index, group) in groups.iter().rev().enumerate() {
+                    if index > 0 {
                         separator(ui);
-                        None
-                    })
-                    // The cull, in the order the hand meets it: judge this
-                    // one, judge it the other way, then look at what the
-                    // judging produced.
-                    .or(toggle(
-                        ui,
-                        "Keep",
-                        "Keep this one; again to take the mark off  (P)",
-                        showing,
-                        status.mark == crate::cull::Mark::Keep,
-                        Action::Keep,
-                    ))
-                    .or(toggle(
-                        ui,
-                        "Reject",
-                        "Reject this one; again to take the mark off  (X)",
-                        showing,
-                        status.mark == crate::cull::Mark::Reject,
-                        Action::Reject,
-                    ))
-                    .or(toggle(
-                        ui,
-                        "Marked",
-                        "Walk only the pictures that are marked  (M)",
-                        !alone,
-                        status.filtered,
-                        Action::Filter,
-                    ))
-                    .or_else(|| {
-                        separator(ui);
-                        None
-                    })
-                    .or(toggle(ui, "Lock", "Hold the framing across a step  (L)", !alone, status.locked, Action::Lock))
-                    .or(toggle(
-                        ui,
-                        status.backdrop.unwrap_or("scene"),
-                        "What shows through transparency  (B)",
-                        true,
-                        status.backdrop.is_some(),
-                        Action::Backdrop,
-                    ))
-                    .or_else(|| {
-                        separator(ui);
-                        None
-                    })
-                    .or(button(ui, "↻", "Turn clockwise  (R)", showing, Action::TurnRight))
-                    .or(button(ui, "↺", "Turn anticlockwise  (Shift+R)", showing, Action::TurnLeft))
-                    .or_else(|| {
-                        separator(ui);
-                        None
-                    })
-                    .or(button(ui, "1:1", "Actual size  (1)", showing, Action::Actual))
-                    .or(button(ui, "Fit", "Fit to window  (0)", showing, Action::Fit))
-                    .or(button(ui, "+", "Zoom in  (+)", showing, Action::ZoomIn))
-                    .or(button(ui, "−", "Zoom out  (-)", showing, Action::ZoomOut))
-                    .or_else(|| {
-                        separator(ui);
-                        None
-                    })
-                    .or(button(ui, "▶", "Next image  (→)", !alone, Action::Next))
-                    .or(button(ui, "◀", "Previous image  (←)", !alone, Action::Previous));
+                    }
+                    for tool in group.iter().rev() {
+                        // Every button is drawn whatever was pressed before
+                        // it; only the first press is kept.
+                        let pressed = draw_tool(ui, tool);
+                        chosen = chosen.or(pressed);
+                    }
+                }
 
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| identity(ui, status, mark));
                 chosen
@@ -1067,6 +993,110 @@ fn toolbar(ui: &mut egui::Ui, status: &Status, info_shown: bool, histogram_shown
             .inner
         })
         .inner
+}
+
+/// One button of the toolbar, as data.
+struct Tool {
+    label: &'static str,
+    /// What it does, and its key in brackets at the end — which a test holds
+    /// against the key the button asks for.
+    hint: &'static str,
+    enabled: bool,
+    /// Whether it is on, for a button that carries a state. `None` for one
+    /// that only does something.
+    on: Option<bool>,
+    action: Action,
+}
+
+fn tool(label: &'static str, hint: &'static str, enabled: bool, action: Action) -> Tool {
+    Tool {
+        label,
+        hint,
+        enabled,
+        on: None,
+        action,
+    }
+}
+
+fn state(label: &'static str, hint: &'static str, enabled: bool, on: bool, action: Action) -> Tool {
+    Tool {
+        label,
+        hint,
+        enabled,
+        on: Some(on),
+        action,
+    }
+}
+
+/// The toolbar's buttons, in groups, as they read from left to right.
+///
+/// Where the hand goes first is on the left: through the folder, then the
+/// framing, then the turn, the scene, the cull and the comparison, then the
+/// panels that read the picture, and the window's own controls at the end. A
+/// button is disabled rather than hidden when it would do nothing: a strip
+/// whose contents move about as folders change is harder to aim at than one
+/// that is always the same shape.
+fn toolbar_groups(status: &Status, info_shown: bool, histogram_shown: bool) -> Vec<Vec<Tool>> {
+    let alone = status.position.is_none_or(|(_, count)| count <= 1);
+    let showing = status.size.is_some();
+
+    vec![
+        vec![
+            tool("◀", "Previous image  (←)", !alone, Action::Previous),
+            tool("▶", "Next image  (→)", !alone, Action::Next),
+        ],
+        vec![
+            tool("−", "Zoom out  (-)", showing, Action::ZoomOut),
+            tool("+", "Zoom in  (+)", showing, Action::ZoomIn),
+            tool("Fit", "Fit to window  (0)", showing, Action::Fit),
+            tool("1:1", "Actual size  (1)", showing, Action::Actual),
+        ],
+        vec![
+            tool("↺", "Turn anticlockwise  (Shift+R)", showing, Action::TurnLeft),
+            tool("↻", "Turn clockwise  (R)", showing, Action::TurnRight),
+        ],
+        vec![
+            state(
+                status.backdrop.unwrap_or("scene"),
+                "What shows through transparency  (B)",
+                true,
+                status.backdrop.is_some(),
+                Action::Backdrop,
+            ),
+            state("Lock", "Hold the framing across a step  (L)", !alone, status.locked, Action::Lock),
+        ],
+        // The cull, in the order the hand meets it: judge this one, judge it
+        // the other way, then look at what the judging produced.
+        vec![
+            state(
+                "Keep",
+                "Keep this one; again to take the mark off  (P)",
+                showing,
+                status.mark == crate::cull::Mark::Keep,
+                Action::Keep,
+            ),
+            state(
+                "Reject",
+                "Reject this one; again to take the mark off  (X)",
+                showing,
+                status.mark == crate::cull::Mark::Reject,
+                Action::Reject,
+            ),
+            state("Marked", "Walk only the pictures that are marked  (M)", !alone, status.filtered, Action::Filter),
+        ],
+        // From what the file says, through what it is made of, to one pixel.
+        vec![
+            state("Info", "What the file says about itself  (I)", showing, info_shown, Action::Info),
+            state("Tones", "What tones the picture is made of  (H)", showing, histogram_shown, Action::Histogram),
+            state("Clip", "Mark what the file clipped  (G)", showing, status.clipping, Action::Clipping),
+            state("Pick", "Read the colour under the pointer  (C)", showing, status.picking, Action::Pick),
+        ],
+        vec![
+            tool("⛶", "Full screen  (F11)", true, Action::FullScreen),
+            tool("⚙", "Settings  (,)", true, Action::Settings),
+            tool("?", "Keys  (?)", true, Action::Keys),
+        ],
+    ]
 }
 
 /// How big the mark is drawn in the bar, in points.
@@ -1166,20 +1196,14 @@ fn fit_trail<'a>(steps: &'a [String], room: f32, measure: &dyn Fn(&str) -> f32) 
     &steps[first..]
 }
 
-/// One toolbar button, reporting what it asks for when pressed.
-fn button(ui: &mut egui::Ui, label: &str, hint: &str, enabled: bool, wanted: Action) -> Option<Action> {
-    ui.add_enabled(enabled, egui::Button::new(label))
-        .on_hover_text(hint)
-        .clicked()
-        .then_some(wanted)
-}
-
-/// A button that carries a state, and shows which one it is in.
-fn toggle(ui: &mut egui::Ui, label: &str, hint: &str, enabled: bool, on: bool, wanted: Action) -> Option<Action> {
-    ui.add_enabled(enabled, egui::Button::new(label).selected(on))
-        .on_hover_text(hint)
-        .clicked()
-        .then_some(wanted)
+/// One toolbar button, reporting what it asks for when pressed. A button that
+/// carries a state shows which one it is in.
+fn draw_tool(ui: &mut egui::Ui, tool: &Tool) -> Option<Action> {
+    let button = match tool.on {
+        Some(on) => egui::Button::new(tool.label).selected(on),
+        None => egui::Button::new(tool.label),
+    };
+    ui.add_enabled(tool.enabled, button).on_hover_text(tool.hint).clicked().then_some(tool.action)
 }
 
 /// The bar along the bottom: what this picture is.
@@ -4795,5 +4819,146 @@ mod tests {
         for key in ["←", "→", "Home", "End", "Space", "F11", "Esc", "0", "1", "+", "-", "?"] {
             assert!(listed.contains(key), "the key sheet does not mention {key}");
         }
+    }
+
+    /// Every text shape one layout with the toolbar up draws, with where its
+    /// left edge landed. The second of two frames, for the reason
+    /// `words_on_screen` gives.
+    fn toolbar_texts(interface: &mut Interface, status: &Status, events: Vec<egui::Event>) -> Vec<(String, f32)> {
+        fn walk(shape: &egui::Shape, into: &mut Vec<(String, f32)>) {
+            match shape {
+                egui::Shape::Text(text) => into.push((text.galley.text().to_string(), text.pos.x)),
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|shape| walk(shape, into)),
+                _ => {}
+            }
+        }
+        let mut texts = Vec::new();
+        for frame in 0..2 {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 600.0))),
+                // The pointer arrives a frame ahead of any press, the way a
+                // hand does: egui answers a click on a widget it already has
+                // under the pointer.
+                events: if frame == 1 {
+                    events.clone()
+                } else {
+                    events.iter().filter(|event| matches!(event, egui::Event::PointerMoved(_))).cloned().collect()
+                },
+                ..Default::default()
+            };
+            let (mut output, _, _) = interface.layout(raw, status, &mut Config::default(), Instant::now());
+            output.textures_delta.clear();
+            if frame == 1 {
+                for shape in &output.shapes {
+                    walk(&shape.shape, &mut texts);
+                }
+            }
+            drop(interface.context().tessellate(output.shapes, 1.0));
+        }
+        texts
+    }
+
+    /// The same, returning what the press asked for too.
+    fn toolbar_press(interface: &mut Interface, status: &Status, events: Vec<egui::Event>) -> (Vec<(String, f32)>, Option<Action>) {
+        let moved: Vec<egui::Event> = events.iter().filter(|event| matches!(event, egui::Event::PointerMoved(_))).cloned().collect();
+        let raw = |events| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 600.0))),
+            events,
+            ..Default::default()
+        };
+        let (mut output, _, _) = interface.layout(raw(moved), status, &mut Config::default(), Instant::now());
+        output.textures_delta.clear();
+        drop(interface.context().tessellate(output.shapes, 1.0));
+
+        let (mut output, action, _) = interface.layout(raw(events), status, &mut Config::default(), Instant::now());
+        output.textures_delta.clear();
+        let mut texts = Vec::new();
+        for shape in &output.shapes {
+            collect_positions(&shape.shape, &mut texts);
+        }
+        drop(interface.context().tessellate(output.shapes, 1.0));
+        (texts, action)
+    }
+
+    fn collect_positions(shape: &egui::Shape, into: &mut Vec<(String, f32)>) {
+        match shape {
+            egui::Shape::Text(text) => into.push((text.galley.text().to_string(), text.pos.x)),
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|shape| collect_positions(shape, into)),
+            _ => {}
+        }
+    }
+
+    /// Where a label was drawn, as a point on the toolbar's middle line.
+    fn drawn_at(texts: &[(String, f32)], label: &str) -> egui::Pos2 {
+        let x = texts
+            .iter()
+            .find(|(text, _)| text == label)
+            .map(|(_, x)| *x)
+            .unwrap_or_else(|| panic!("the toolbar did not draw {label:?}"));
+        egui::pos2(x, TOOLBAR_HEIGHT / 2.0)
+    }
+
+    /// The toolbar reads in the order it is written: each group left to
+    /// right as listed, and the groups themselves in their listed order.
+    /// Written as a chain of calls into a right-to-left layout, every group
+    /// came out backwards — "Marked · Reject · Keep" under a comment
+    /// promising the order a hand meets them — and nothing noticed, because
+    /// every button still worked.
+    #[test]
+    fn the_toolbar_reads_in_the_order_it_is_written() {
+        let status = status();
+        let mut interface = Interface::new();
+        interface.follow_pointer(Some((400.0, 10.0)));
+        let texts = toolbar_texts(&mut interface, &status, Vec::new());
+
+        let written: Vec<&'static str> = toolbar_groups(&status, false, false).iter().flatten().map(|tool| tool.label).collect();
+        assert!(written.len() >= 20, "only {} buttons were read from the list", written.len());
+        for pair in written.windows(2) {
+            assert!(
+                drawn_at(&texts, pair[0]).x < drawn_at(&texts, pair[1]).x,
+                "{:?} is written before {:?} but drawn after it",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    /// A press must not move the bar under the pointer. The separators were
+    /// drawn only while no button to their left had been pressed, so in the
+    /// frame of a click they vanished and every button shifted by their width.
+    #[test]
+    fn the_separators_stay_on_the_frame_a_button_is_pressed() {
+        let separators = |texts: &[(String, f32)]| texts.iter().filter(|(text, _)| text == "·").count();
+        let status = status();
+        let mut interface = Interface::new();
+        interface.follow_pointer(Some((400.0, 10.0)));
+        let texts = toolbar_texts(&mut interface, &status, Vec::new());
+        let still = separators(&texts);
+        assert!(still >= toolbar_groups(&status, false, false).len() - 1, "the bar drew {still} separators");
+
+        // The rightmost button, so every separator is to its left: laid out
+        // right to left, those are the ones drawn after the press, which the
+        // old chain skipped once something had been pressed.
+        let at = drawn_at(&texts, "?") + egui::vec2(3.0, 0.0);
+        let click = vec![
+            egui::Event::PointerMoved(at),
+            egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ];
+        let mut pressed = Interface::new();
+        pressed.follow_pointer(Some((400.0, 10.0)));
+        let (texts, action) = toolbar_press(&mut pressed, &status, click);
+        assert_eq!(action, Some(Action::Keys), "the press did not land on the button, so this proves nothing");
+        assert_eq!(separators(&texts), still, "the frame carrying a press drew a different number of separators");
     }
 }
