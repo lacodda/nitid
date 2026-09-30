@@ -827,10 +827,6 @@ impl App {
     }
 
     fn handle_key(&mut self, key: &Key, event_loop: &ActiveEventLoop) {
-        debug_assert!(
-            handled(key),
-            "the viewer was handed a key it does not answer: {key:?} — a toolbar button asking for it would do nothing",
-        );
         match key {
             // With the settings up, Esc puts them away rather than ending
             // the program: one key that both closes a dialog and quits is a
@@ -2856,7 +2852,16 @@ impl App {
     /// would be a place for the toolbar and the keyboard to drift apart, and
     /// the drift would be invisible — both would work, differently.
     fn act(&mut self, action: Action, event_loop: &ActiveEventLoop) {
-        self.handle_key(&key_for(action), event_loop);
+        let key = key_for(action);
+        // Asked here, where a key stands for a button, and not in
+        // `handle_key`, which the keyboard reaches with every key there is:
+        // a bare Shift arrives as a key of its own on the way to `Shift+R`,
+        // and asserting there ended a debug build on the first capital.
+        debug_assert!(
+            handled(&key),
+            "the toolbar's {action:?} asks for {key:?}, which the viewer does not answer — the button would do nothing",
+        );
+        self.handle_key(&key, event_loop);
         // A button press changes what is on screen, and the frame it was
         // pressed in was laid out before it happened.
         //
