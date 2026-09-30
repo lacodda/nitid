@@ -2,6 +2,17 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.35.0] - 2026-09-30
+
+### Bug Fixes
+- Stop a bare Shift ending a debug build
+- Lay the toolbar out in the order it is written
+- Read an exposure written as a float
+
+### Features
+- Read the shot as values, with its fraction of a second
+- Put two pictures side by side or blink them, in step
+
 ## [0.34.1] - 2026-09-24
 
 ### Bug Fixes
@@ -18,11 +29,14 @@ All notable changes to this project are documented in this file.
 ### Features
 - Draw the chrome in the line's colours and top bar
 
-## [0.33.0] - 2026-09-20
+## [0.33.0] - 2026-09-22
 
 ### Bug Fixes
 - Stop a rejected frame showing as a favourite
 - Read a mark back before calling it saved
+
+### Documentation
+- Say where a rejected mark is written and why it shows unrated
 
 ### Features
 - Mark a picture where Explorer can see it
