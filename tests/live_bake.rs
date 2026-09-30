@@ -713,9 +713,9 @@ fn a_refused_bake_leaves_the_orientation_where_the_picture_still_needs_it() {
     // the lens and the date do not come back with it.
     let metadata = nitid::testing::read_metadata(&restored);
     assert!(
-        metadata.camera.is_empty(),
+        metadata.camera().is_empty(),
         "putting the orientation back brought the camera with it: {:?}",
-        metadata.camera
+        metadata.camera()
     );
     assert!(metadata.location.is_none(), "putting the orientation back brought the place with it");
 

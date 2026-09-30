@@ -1345,11 +1345,12 @@ fn info_panel(ui: &mut egui::Ui, status: &Status) {
                 // What the camera wrote. Absent for every screenshot and most
                 // PNGs, which is why the section only appears when there is
                 // something in it.
-                if !status.metadata.camera.is_empty() {
+                let camera = status.metadata.camera();
+                if !camera.is_empty() {
                     ui.add_space(10.0);
                     ui.label(egui::RichText::new("Camera").strong());
                     ui.add_space(4.0);
-                    for entry in &status.metadata.camera {
+                    for entry in &camera {
                         row(ui, entry.label, &entry.value, entry.label != "Lens");
                     }
                 }
@@ -3806,16 +3807,11 @@ mod tests {
     fn photographed() -> Status {
         let mut status = status();
         status.metadata = Metadata {
-            camera: vec![
-                crate::metadata::Entry {
-                    label: "Camera",
-                    value: "NITID Probe One".into(),
-                },
-                crate::metadata::Entry {
-                    label: "ISO",
-                    value: "400".into(),
-                },
-            ],
+            shot: crate::metadata::Shot {
+                camera: Some("NITID Probe One".into()),
+                iso: Some(400),
+                ..Default::default()
+            },
             location: Some(crate::metadata::Location {
                 latitude: -25.2637,
                 longitude: -57.5759,

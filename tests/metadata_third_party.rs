@@ -36,7 +36,7 @@ fn a_third_party_file_reads_the_same_way_ours_does() {
     assert_eq!(&bytes[..3], &[0xFF, 0xD8, 0xFF], "the fixture is not a JPEG");
 
     let metadata = nitid::testing::read_metadata(&bytes);
-    let value = |label: &str| metadata.camera.iter().find(|entry| entry.label == label).map(|entry| entry.value.clone());
+    let value = |label: &str| metadata.camera().iter().find(|entry| entry.label == label).map(|entry| entry.value.clone());
 
     // The same expectations the hand-built fixture is held to, against bytes
     // this project did not lay out.
@@ -65,13 +65,13 @@ fn decoding_a_photograph_carries_what_it_says_about_itself() {
     let decoded = nitid::testing::decode_here(&bytes).expect("the fixture decodes");
 
     assert!(
-        !decoded.metadata.camera.is_empty(),
+        !decoded.metadata.camera().is_empty(),
         "the decoded image carries no metadata, so the Info panel would be empty",
     );
     assert!(
-        decoded.metadata.camera.iter().any(|entry| entry.label == "Camera"),
+        decoded.metadata.camera().iter().any(|entry| entry.label == "Camera"),
         "the camera did not survive the decode: {:?}",
-        decoded.metadata.camera,
+        decoded.metadata.camera(),
     );
     assert!(decoded.metadata.location.is_some(), "the place did not survive the decode");
 }

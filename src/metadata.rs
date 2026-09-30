@@ -23,15 +23,149 @@ pub struct Entry {
 /// Everything the panel shows about one file.
 #[derive(Clone, Debug, Default)]
 pub struct Metadata {
-    /// Camera, exposure, lens — the fields grouped as a photographer reads
-    /// them. Empty when the file carries no EXIF, which is the common case:
-    /// every screenshot and most PNGs have none.
-    pub camera: Vec<Entry>,
+    /// How the picture was taken: the camera, the exposure, the moment.
+    ///
+    /// Held as values rather than as the lines the panel shows, because two
+    /// readers need them: the Info panel writes them the way a photographer
+    /// reads them, and a comparison measures the distance between two of them
+    /// — a stop of exposure, four tenths of a second — which a string that
+    /// already says `1/250 s` cannot be asked for.
+    pub shot: Shot,
     /// Where the photograph was taken, as decimal degrees.
     ///
     /// Kept apart from the rest because it is the one field that is about the
     /// person rather than the picture, and because it is what a click copies.
     pub location: Option<Location>,
+}
+
+impl Metadata {
+    /// The lines of the panel's Camera section, in the order a photographer
+    /// reads them: what took the picture, how it was exposed, and when.
+    ///
+    /// Empty when the file carries no EXIF, which is the common case: every
+    /// screenshot and most PNGs have none.
+    pub fn camera(&self) -> Vec<Entry> {
+        let shot = &self.shot;
+        let mut entries = Vec::new();
+        let mut push = |label: &'static str, value: Option<String>| {
+            if let Some(value) = value {
+                entries.push(Entry { label, value });
+            }
+        };
+
+        push("Camera", shot.camera.clone());
+        push("Lens", shot.lens.clone());
+        push("Exposure", shot.exposure.map(exposure_text));
+        push("Aperture", shot.aperture.map(aperture_text));
+        push("ISO", shot.iso.map(|iso| iso.to_string()));
+        // Only when it was dialled in. Every ordinary frame carries a zero
+        // here, and "0 EV" on every photograph is a line saying nothing.
+        push("Compensation", shot.compensation.filter(|value| value.abs() >= 0.05).map(compensation_text));
+        push("Focal length", shot.focal_length.map(|focal| focal_text(focal, shot.equivalent)));
+        push("Taken", shot.taken.as_ref().map(Taken::text));
+        entries
+    }
+}
+
+/// How a picture was taken, as the camera wrote it down.
+///
+/// Every field is optional on its own: a phone writes no lens, a scan writes
+/// no exposure, and a field that is missing is simply absent rather than a
+/// reason to distrust the rest.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Shot {
+    /// Make and model as one name, because "SONY" and "ILCE-7M4" on separate
+    /// rows say less than they do together.
+    pub camera: Option<String>,
+    pub lens: Option<String>,
+    /// Shutter speed, in seconds.
+    pub exposure: Option<f64>,
+    /// The f-number.
+    pub aperture: Option<f64>,
+    pub iso: Option<u32>,
+    /// Exposure compensation, in stops. Kept at zero rather than dropped: a
+    /// bracketed series is told apart by exactly this, and the frame at zero
+    /// is one of the three.
+    pub compensation: Option<f64>,
+    /// Focal length, in millimetres, and its 35 mm equivalent when the camera
+    /// states one — a focal length means nothing without the sensor it was
+    /// measured on.
+    pub focal_length: Option<f64>,
+    pub equivalent: Option<u32>,
+    pub taken: Option<Taken>,
+}
+
+/// When a picture was taken.
+///
+/// The text as the camera wrote it is what a person reads; the moment is what
+/// two pictures are measured against each other by. A camera writing a date
+/// this build cannot parse still has it shown, and simply cannot be measured.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Taken {
+    /// The date as written, `2026:08:28 14:03:11`.
+    raw: String,
+    /// The fraction of the second, as its digits: `"20"` is two tenths.
+    ///
+    /// Stored as the digits rather than as a number because it is shown as
+    /// written, and `.20` read back from a float is not always `.20`.
+    subsec: Option<String>,
+    /// The offset from UTC the camera stated, in minutes.
+    offset: Option<i32>,
+}
+
+impl Taken {
+    /// The date the way a person reads it: dashes rather than the standard's
+    /// colons, and the fraction of a second when the camera kept one — a
+    /// burst of ten frames a second lives inside one second, and without it
+    /// every frame of the burst reads as taken at the same moment.
+    pub fn text(&self) -> String {
+        let date = readable_date(&self.raw);
+        match &self.subsec {
+            Some(subsec) => format!("{date}.{subsec}"),
+            None => date,
+        }
+    }
+
+    /// The time of day alone, for a table where the date is the same on both
+    /// sides and would only push the time out of sight.
+    pub fn time_text(&self) -> String {
+        let text = self.text();
+        match text.split_once(' ') {
+            Some((_, time)) => time.to_string(),
+            None => text,
+        }
+    }
+
+    /// The calendar day, as written, to tell whether two moments share one.
+    pub fn day(&self) -> &str {
+        self.raw.split_once(' ').map_or(self.raw.as_str(), |(day, _)| day)
+    }
+
+    /// Seconds from `self` to `later`, when both can be read as moments.
+    ///
+    /// The offsets are honoured when both pictures state one — a camera
+    /// carried across a time zone between two frames writes two different
+    /// clocks — and ignored when either does not, because a clock with no
+    /// offset is read as the same local time the other is in, which is the
+    /// only reading that does not invent a difference.
+    pub fn seconds_until(&self, later: &Taken) -> Option<f64> {
+        let (from, to) = (self.moment()?, later.moment()?);
+        let shift = match (self.offset, later.offset) {
+            (Some(from_offset), Some(to_offset)) => f64::from(from_offset - to_offset) * 60.0,
+            _ => 0.0,
+        };
+        Some(to - from + shift)
+    }
+
+    /// Seconds since 1970, in the camera's own clock, with the fraction.
+    fn moment(&self) -> Option<f64> {
+        let seconds = civil_seconds(&self.raw)?;
+        let fraction = match &self.subsec {
+            Some(digits) => format!("0.{digits}").parse::<f64>().ok()?,
+            None => 0.0,
+        };
+        Some(seconds as f64 + fraction)
+    }
 }
 
 /// A place, as EXIF states it.
@@ -60,7 +194,7 @@ pub fn read(bytes: &[u8]) -> Metadata {
     };
 
     Metadata {
-        camera: camera_entries(&exif),
+        shot: shot(&exif),
         location: location(&exif),
     }
 }
@@ -70,68 +204,80 @@ fn read_exif(bytes: &[u8]) -> Option<exif::Exif> {
     exif::Reader::new().read_from_container(&mut cursor).ok()
 }
 
-/// The fields worth a line, in the order a photographer reads them: what took
-/// the picture, how it was exposed, and when.
-fn camera_entries(exif: &exif::Exif) -> Vec<Entry> {
-    let mut entries = Vec::new();
-
-    // The camera itself. Make and Model are one line, because "SONY" and
-    // "ILCE-7M4" on separate rows say less than they do together.
+/// The fields worth reading, as values.
+fn shot(exif: &exif::Exif) -> Shot {
     let make = text(exif, exif::Tag::Make);
     let model = text(exif, exif::Tag::Model);
-    match (make, model) {
-        (Some(make), Some(model)) => {
-            // Most makers repeat themselves — "NIKON CORPORATION" then
-            // "NIKON D850" — and printing both reads as a stutter.
-            let value = if model.starts_with(&make) { model } else { format!("{make} {model}") };
-            entries.push(Entry { label: "Camera", value });
-        }
-        (Some(value), None) | (None, Some(value)) => entries.push(Entry { label: "Camera", value }),
-        (None, None) => {}
-    }
+    let camera = match (make, model) {
+        // Most makers repeat themselves — "NIKON CORPORATION" then "NIKON
+        // D850" — and printing both reads as a stutter.
+        (Some(make), Some(model)) => Some(if model.starts_with(&make) { model } else { format!("{make} {model}") }),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    };
 
-    if let Some(lens) = text(exif, exif::Tag::LensModel) {
-        entries.push(Entry { label: "Lens", value: lens });
-    }
+    // The original moment first, and the file's own date only when the camera
+    // wrote nothing better; each has its own fraction and offset, and taking
+    // the fraction of one with the date of the other would be a moment
+    // neither of them states.
+    let taken = match text(exif, exif::Tag::DateTimeOriginal) {
+        Some(raw) => Some(Taken {
+            raw,
+            subsec: subsec(exif, exif::Tag::SubSecTimeOriginal),
+            offset: offset(exif, exif::Tag::OffsetTimeOriginal),
+        }),
+        None => text(exif, exif::Tag::DateTime).map(|raw| Taken {
+            raw,
+            subsec: subsec(exif, exif::Tag::SubSecTime),
+            offset: offset(exif, exif::Tag::OffsetTime),
+        }),
+    };
 
-    // The exposure, as it is written on a photograph's back.
-    if let Some(exposure) = exposure_time(exif) {
-        entries.push(Entry {
-            label: "Exposure",
-            value: exposure,
-        });
+    Shot {
+        camera,
+        lens: text(exif, exif::Tag::LensModel),
+        // A zero exposure is not a picture; it is a file saying nothing.
+        exposure: rational(exif, exif::Tag::ExposureTime).filter(|value| *value > 0.0),
+        aperture: rational(exif, exif::Tag::FNumber).filter(|value| *value > 0.0),
+        iso: uint(exif, exif::Tag::PhotographicSensitivity),
+        compensation: rational(exif, exif::Tag::ExposureBiasValue).filter(|value| value.is_finite()),
+        focal_length: rational(exif, exif::Tag::FocalLength).filter(|value| *value > 0.0),
+        equivalent: uint(exif, exif::Tag::FocalLengthIn35mmFilm).filter(|value| *value > 0),
+        taken,
     }
-    if let Some(aperture) = rational(exif, exif::Tag::FNumber) {
-        entries.push(Entry {
-            label: "Aperture",
-            value: format!("f/{}", trim(aperture)),
-        });
-    }
-    if let Some(iso) = uint(exif, exif::Tag::PhotographicSensitivity) {
-        entries.push(Entry {
-            label: "ISO",
-            value: iso.to_string(),
-        });
-    }
-    if let Some(focal) = rational(exif, exif::Tag::FocalLength) {
-        // The 35 mm equivalent in brackets, because a focal length means
-        // nothing without the sensor it was measured on.
-        let equivalent = uint(exif, exif::Tag::FocalLengthIn35mmFilm);
-        let value = match equivalent {
-            Some(equivalent) => format!("{} mm ({equivalent} mm eq.)", trim(focal)),
-            None => format!("{} mm", trim(focal)),
-        };
-        entries.push(Entry { label: "Focal length", value });
-    }
+}
 
-    if let Some(taken) = text(exif, exif::Tag::DateTimeOriginal).or_else(|| text(exif, exif::Tag::DateTime)) {
-        entries.push(Entry {
-            label: "Taken",
-            value: readable_date(&taken),
-        });
+/// Shutter speed, as a photographer says it: `1/250 s` below a second and
+/// `2 s` above, rather than the raw rational either way.
+pub fn exposure_text(seconds: f64) -> String {
+    if seconds >= 1.0 {
+        return format!("{} s", trim(seconds));
     }
+    // A camera stores 1/250 as 0.004, and the reciprocal is what is written on
+    // the dial. Rounded, because 1/249.99 is the same picture.
+    format!("1/{} s", (1.0 / seconds).round() as u64)
+}
 
-    entries
+pub fn aperture_text(f_number: f64) -> String {
+    format!("f/{}", trim(f_number))
+}
+
+pub fn focal_text(millimetres: f64, equivalent: Option<u32>) -> String {
+    match equivalent {
+        Some(equivalent) => format!("{} mm ({equivalent} mm eq.)", trim(millimetres)),
+        None => format!("{} mm", trim(millimetres)),
+    }
+}
+
+/// Compensation with its sign, always: `+0.7 EV` and `−1 EV` are dialled in
+/// opposite directions, and a bare `0.7` does not say which.
+pub fn compensation_text(stops: f64) -> String {
+    let rounded = (stops * 10.0).round() / 10.0;
+    if rounded == 0.0 {
+        return "0 EV".to_string();
+    }
+    let sign = if rounded > 0.0 { "+" } else { "\u{2212}" };
+    format!("{sign}{} EV", trim(rounded.abs()))
 }
 
 /// EXIF writes the date as `2026:08:28 14:03:11`, with colons where a person
@@ -144,19 +290,71 @@ fn readable_date(raw: &str) -> String {
     }
 }
 
-/// Shutter speed, as a photographer says it: `1/250 s` below a second and
-/// `2 s` above, rather than the raw rational either way.
-fn exposure_time(exif: &exif::Exif) -> Option<String> {
-    let value = rational(exif, exif::Tag::ExposureTime)?;
-    if value <= 0.0 {
+/// Seconds since 1970 for a date written the standard's way, read as UTC.
+///
+/// `None` for anything that is not a real date: cameras with no clock set
+/// write `0000:00:00 00:00:00`, and measuring a burst against that would
+/// report a difference of two thousand years.
+fn civil_seconds(raw: &str) -> Option<i64> {
+    let (date, time) = raw.trim().split_once(' ')?;
+    let mut date = date.split(':').map(|part| part.parse::<i64>().ok());
+    let (year, month, day) = (date.next()??, date.next()??, date.next()??);
+    let mut time = time.split(':').map(|part| part.parse::<i64>().ok());
+    let (hour, minute, second) = (time.next()??, time.next()??, time.next()??);
+
+    // A leap second is written as :60, so the range allows it.
+    let valid = (1..=9999).contains(&year)
+        && (1..=12).contains(&month)
+        && (1..=31).contains(&day)
+        && (0..24).contains(&hour)
+        && (0..60).contains(&minute)
+        && (0..=60).contains(&second);
+    if !valid {
         return None;
     }
-    if value >= 1.0 {
-        return Some(format!("{} s", trim(value)));
-    }
-    // A camera stores 1/250 as 0.004, and the reciprocal is what is written on
-    // the dial. Rounded, because 1/249.99 is the same picture.
-    Some(format!("1/{} s", (1.0 / value).round() as u64))
+    Some(days_from_civil(year, month, day) * 86_400 + hour * 3600 + minute * 60 + second)
+}
+
+/// Days since 1970-01-01 of a date in the proleptic Gregorian calendar.
+///
+/// Howard Hinnant's algorithm: the year is shifted to start in March so the
+/// leap day falls at its end, and counted in 400-year eras, which repeat
+/// exactly. Twenty lines rather than a date crate for one subtraction.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let month_from_march = (month + 9) % 12;
+    let day_of_year = (153 * month_from_march + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+/// The fraction of a second, as the digits the camera wrote.
+///
+/// Some cameras pad the field with spaces or write nothing but them; only the
+/// leading digits are the fraction, and none at all is no fraction.
+fn subsec(exif: &exif::Exif, tag: exif::Tag) -> Option<String> {
+    let raw = text(exif, tag)?;
+    let digits: String = raw.chars().take_while(char::is_ascii_digit).collect();
+    (!digits.is_empty()).then_some(digits)
+}
+
+/// An offset from UTC, written `+03:00` or `-04:30`, in minutes.
+fn offset(exif: &exif::Exif, tag: exif::Tag) -> Option<i32> {
+    parse_offset(&text(exif, tag)?)
+}
+
+fn parse_offset(raw: &str) -> Option<i32> {
+    let raw = raw.trim();
+    let (sign, rest) = match raw.as_bytes().first()? {
+        b'+' => (1, &raw[1..]),
+        b'-' => (-1, &raw[1..]),
+        _ => return None,
+    };
+    let (hours, minutes) = rest.split_once(':')?;
+    let (hours, minutes) = (hours.parse::<i32>().ok()?, minutes.parse::<i32>().ok()?);
+    ((0..=14).contains(&hours) && (0..60).contains(&minutes)).then_some(sign * (hours * 60 + minutes))
 }
 
 fn text(exif: &exif::Exif, tag: exif::Tag) -> Option<String> {
@@ -183,7 +381,7 @@ fn rational(exif: &exif::Exif, tag: exif::Tag) -> Option<f64> {
 }
 
 /// Drop the decimals a number does not need: `2.8` stays, `35.0` becomes `35`.
-fn trim(value: f64) -> String {
+pub fn trim(value: f64) -> String {
     let text = format!("{value:.1}");
     text.strip_suffix(".0").map(str::to_string).unwrap_or(text)
 }
@@ -227,6 +425,17 @@ fn degrees(exif: &exif::Exif, tag: exif::Tag, reference: exif::Tag, negative: u8
     Some(if south_or_west { -value } else { value })
 }
 
+/// A moment built from its parts, for the comparison's tests: the fields are
+/// private because a `Taken` is otherwise only ever read from a file.
+#[cfg(test)]
+pub fn taken(raw: &str, subsec: Option<&str>, offset: Option<i32>) -> Taken {
+    Taken {
+        raw: raw.to_string(),
+        subsec: subsec.map(str::to_string),
+        offset,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,6 +459,7 @@ mod tests {
         Long(u32),
         Ascii(&'static str),
         Rational(Vec<(u32, u32)>),
+        SRational(Vec<(i32, i32)>),
     }
 
     impl Exif {
@@ -365,6 +575,14 @@ mod tests {
                     }
                     (5, parts.len() as u32, bytes)
                 }
+                Value::SRational(parts) => {
+                    let mut bytes = Vec::new();
+                    for (numerator, denominator) in parts {
+                        bytes.extend_from_slice(&numerator.to_le_bytes());
+                        bytes.extend_from_slice(&denominator.to_le_bytes());
+                    }
+                    (10, parts.len() as u32, bytes)
+                }
             }
         }
     }
@@ -401,7 +619,7 @@ mod tests {
     }
 
     fn value_of(metadata: &Metadata, label: &str) -> Option<String> {
-        metadata.camera.iter().find(|entry| entry.label == label).map(|entry| entry.value.clone())
+        metadata.camera().iter().find(|entry| entry.label == label).map(|entry| entry.value.clone())
     }
 
     #[test]
@@ -423,12 +641,12 @@ mod tests {
     #[test]
     fn a_file_without_exif_says_nothing_and_does_not_fail() {
         let metadata = read(&[0xFF, 0xD8, 0xFF, 0xD9]);
-        assert!(metadata.camera.is_empty());
+        assert!(metadata.camera().is_empty());
         assert!(metadata.location.is_none());
 
         // And so does something that is not an image at all.
         let metadata = read(b"not an image");
-        assert!(metadata.camera.is_empty());
+        assert!(metadata.camera().is_empty());
     }
 
     /// A maker that repeats itself in the model must not stutter.
@@ -524,5 +742,91 @@ mod tests {
         assert_eq!(readable_date("yesterday"), "yesterday");
         // A time that is itself colon-separated must not be rewritten.
         assert_eq!(readable_date("2026:08:28 14:03:11").split(' ').nth(1), Some("14:03:11"));
+    }
+
+    /// A burst of ten frames a second lives inside one second, so the
+    /// fraction the camera keeps beside the date is what tells its frames
+    /// apart — both on screen and when two of them are measured.
+    #[test]
+    fn a_burst_frame_keeps_its_fraction_of_a_second() {
+        let frame = |subsec: &'static str| {
+            read(&jpeg_with(
+                &Exif::default()
+                    .sub(0x9003, Value::Ascii("2026:08:28 14:03:11"))
+                    .sub(0x9291, Value::Ascii(subsec))
+                    .build(),
+            ))
+        };
+        let first = frame("20");
+        let second = frame("60");
+
+        assert_eq!(value_of(&first, "Taken").as_deref(), Some("2026-08-28 14:03:11.20"));
+        let first = first.shot.taken.expect("a moment");
+        let second = second.shot.taken.expect("a moment");
+        let gap = first.seconds_until(&second).expect("both are real dates");
+        assert!((gap - 0.4).abs() < 1e-6, "two frames four tenths apart measured {gap} s");
+        assert_eq!(first.time_text(), "14:03:11.20");
+    }
+
+    /// A camera with its clock never set writes a date that is not one, and
+    /// measuring against it would report two thousand years.
+    #[test]
+    fn a_date_that_is_not_one_is_shown_but_not_measured() {
+        let unset = taken("0000:00:00 00:00:00", None, None);
+        let real = taken("2026:08:28 14:03:11", None, None);
+        assert_eq!(unset.seconds_until(&real), None);
+        assert_eq!(unset.text(), "0000-00-00 00:00:00");
+        assert_eq!(
+            taken("2026:13:01 00:00:00", None, None).seconds_until(&real),
+            None,
+            "a thirteenth month was measured"
+        );
+    }
+
+    /// The calendar arithmetic, against days anyone can check: the epoch, a
+    /// leap day, and the day after it.
+    #[test]
+    fn days_are_counted_across_months_and_leap_years() {
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        assert_eq!(days_from_civil(1970, 1, 2), 1);
+        assert_eq!(days_from_civil(2000, 3, 1) - days_from_civil(2000, 2, 28), 2, "2000 was a leap year");
+        assert_eq!(days_from_civil(1900, 3, 1) - days_from_civil(1900, 2, 28), 1, "1900 was not");
+        assert_eq!(days_from_civil(2026, 1, 1), 20454);
+
+        let midnight = taken("2026:08:28 23:59:59", None, None);
+        let next_day = taken("2026:08:29 00:00:01", None, None);
+        assert_eq!(midnight.seconds_until(&next_day), Some(2.0), "two seconds across midnight");
+    }
+
+    /// Two clocks in two zones are compared as the same instant would be;
+    /// a clock with no zone is read as the local time the other is in.
+    #[test]
+    fn stated_offsets_are_honoured_and_missing_ones_are_not_invented() {
+        let home = taken("2026:08:28 14:00:00", None, Some(-180));
+        let abroad = taken("2026:08:28 20:00:00", None, Some(180));
+        assert_eq!(home.seconds_until(&abroad), Some(0.0), "the same instant in two zones read as six hours apart");
+
+        let unzoned = taken("2026:08:28 20:00:00", None, None);
+        assert_eq!(home.seconds_until(&unzoned), Some(6.0 * 3600.0));
+
+        assert_eq!(parse_offset("+03:00"), Some(180));
+        assert_eq!(parse_offset("-04:30"), Some(-270));
+        assert_eq!(parse_offset("03:00"), None, "an offset without a sign");
+        assert_eq!(parse_offset("+25:00"), None);
+    }
+
+    /// Compensation is shown only when it was dialled in, and always with its
+    /// sign — but kept as a value at zero, because a bracketed series is told
+    /// apart by it and the frame at zero is one of the three.
+    #[test]
+    fn compensation_is_signed_and_hidden_at_zero() {
+        let dialled = read(&jpeg_with(&Exif::default().sub(0x9204, Value::SRational(vec![(-2, 3)])).build()));
+        assert_eq!(value_of(&dialled, "Compensation").as_deref(), Some("\u{2212}0.7 EV"));
+
+        let level = read(&jpeg_with(&Exif::default().sub(0x9204, Value::SRational(vec![(0, 1)])).build()));
+        assert_eq!(value_of(&level, "Compensation"), None, "a level exposure was given a line");
+        assert_eq!(level.shot.compensation, Some(0.0), "the zero was dropped from the values");
+
+        assert_eq!(compensation_text(1.0), "+1 EV");
     }
 }
