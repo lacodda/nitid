@@ -6,7 +6,9 @@ description: The status line, the toolbar and the key sheet - none of it in fron
 The chrome is not there while you are looking at a photograph. There is a
 status line along the bottom saying what is on screen — the file, where it sits
 in the folder, its size, format, bit depth, what the colour transform is doing,
-and the zoom — and everything else appears when you reach for it.
+and the zoom, along with any mode that changes what the keys do: a comparison,
+a slideshow and its pace, the picture being on another display — and
+everything else appears when you reach for it.
 
 Move the pointer to the top of the window and a toolbar comes down. It is the
 top bar every product of the lacodda line opens with: the mark and the name on

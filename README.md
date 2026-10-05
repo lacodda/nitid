@@ -42,6 +42,10 @@ difference, not the function.
   with the zoom in step, `Shift+V` blinks the two in one place, and a table
   says what the camera did differently - in stops and in fractions of a
   second.
+- **A show for the room.** `S` runs the folder as a slideshow, `Shift+S`
+  shuffled like a deck, and `D` puts the picture on a television or a
+  projector while the laptop keeps its window - in HDR there if the television
+  has it.
 - **A copy without the camera, the date and the place.** `Ctrl+M` strips EXIF,
   XMP and IPTC by not copying them - no encoder runs, so the photograph you send
   is the photograph you took.

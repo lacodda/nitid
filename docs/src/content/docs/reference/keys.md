@@ -13,7 +13,7 @@ Opening a file opens its folder: the arrow keys walk the images beside it.
 | --- | --- |
 | `←` `→` | previous / next image in the folder |
 | `Home` `End` | first / last image |
-| `Space` | pause / resume an animation; next image on a still |
+| `Space` | pause / resume a slideshow or an animation; next image on a still |
 | Wheel | zoom around the cursor, or step through the folder |
 | Ctrl+Wheel | whichever of the two the bare wheel is not |
 | Drag | pan |
@@ -36,6 +36,10 @@ Opening a file opens its folder: the arrow keys walk the images beside it.
 | `V` | put the next picture beside this one to compare; again to stop |
 | `Shift+V` | compare them by blinking one over the other |
 | `Enter` | while comparing, pin the right-hand picture and move on |
+| `S` | show the folder one picture after another; again to stop |
+| `Shift+S` | the same, in a random order |
+| `↑` `↓` | during a slideshow, longer / shorter on each picture |
+| `D` | show the picture on another display too; again for the next display or to stop |
 | `Ctrl+X` | frame a crop; Enter saves it as a copy, Esc leaves it |
 | `Ctrl+Drag` | drag the picture into another window |
 | `Ctrl+C` | copy the picture |
@@ -55,7 +59,7 @@ Opening a file opens its folder: the arrow keys walk the images beside it.
 | `F11` | fullscreen |
 | `,` | settings |
 | `?` | every key there is |
-| `Esc` | leave a crop, a comparison or the settings; otherwise quit |
+| `Esc` | leave a crop, the settings, a comparison, a slideshow or the other display; otherwise quit |
 
 "100%" means one image pixel per logical pixel, so a photo is the same size
 here as everywhere else on a scaled display.
@@ -64,16 +68,18 @@ here as everywhere else on a scaled display.
 
 `,` opens the settings, or the gear on the toolbar; `Esc` closes them. There is
 no OK button — a change takes effect as it is made, so a threshold can be
-dragged while watching what it marks. Four sections:
+dragged while watching what it marks. Eight sections:
 
 | Section | What it holds |
 | --- | --- |
 | Gestures | what the bare wheel does — zoom or step through the folder — how far one notch zooms, whether the wheel is reversed, whether the middle button toggles fit and 100% |
 | View | when the toolbar and the status line are on screen: on hover, always, or never; when the minimap is — zoomed, always or never; and what shows behind transparency when a picture opens |
 | Opening | fit or 100% for a picture that arrives, whether the framing is held across a step, whether the folder wraps at its ends, and the order it is walked in — name, date or size |
+| Slideshow | how long each picture stays up, from a second to ten minutes |
 | Colour | where the clipping zebra draws its two lines, the units the eyedropper reads in, what a click copies, and whether the eyedropper magnifies the pixels around the pointer |
 | Sending | the size budget and the maximum width `Ctrl+Alt+C` copies a picture to |
 | Files | the nine folders `Ctrl+1`-`9` sort a picture into |
+| Programs | the editor `E` opens a picture in, and the nine programs `Alt+1`-`9` hand it to |
 
 Ctrl+wheel always performs whichever gesture the bare wheel does not, so both
 are reachable whichever way round the setting is.
@@ -93,4 +99,5 @@ build's settings survive a run of an older one — see
 | `NITID_TILE_LIMIT=<pixels>` | lower the texture side an image is cut into tiles at, so the tiled path can be exercised on a small file; never raises it past what the device accepts |
 | `NITID_NO_SINGLE_INSTANCE=1` | open a window of this launch's own instead of handing the file to one already open; used by the startup gate, which measures a cold start |
 | `NITID_INSTANCE_ID=<text>` | share a window only with launches carrying the same value, so a test never talks to the viewer you have open |
+| `NITID_SECOND_SCREEN_HERE=1` | let `D` open the other display as a plain window on this one, so the second screen can be exercised on a machine with a single display |
 | `NITID_HANDOVER_REPORT=1` | print which process the foreground was offered to when a file is handed over; used by the one-window gate |
