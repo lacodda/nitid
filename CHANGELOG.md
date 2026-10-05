@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.36.0] - 2026-10-05
+
+### Documentation
+- Describe the slideshow and the other display
+
+### Features
+- Run a slideshow and put the picture on another display
+
 ## [0.35.0] - 2026-09-30
 
 ### Bug Fixes
