@@ -1408,7 +1408,7 @@ fn set_orientation_upright(tiff: &mut [u8]) {
 
     for index in 0..count {
         let entry = first + 2 + index * 12;
-        let Some(tag) = tiff.get(entry..entry + 2).map(&read_u16) else {
+        let Some(tag) = tiff.get(entry..entry + 2).map(read_u16) else {
             return;
         };
         if tag != 0x0112 {
