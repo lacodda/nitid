@@ -28,7 +28,10 @@ pub enum FitMode {
 }
 
 /// The placement of one image inside one window, in physical pixels.
-#[derive(Clone, Copy, Debug)]
+///
+/// Compared whole by the second screen, which draws only when what it shows
+/// has moved; no field is ever NaN, so equality means what it says.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct View {
     /// Size of the image after its EXIF orientation is applied.
     image: (f32, f32),
@@ -55,7 +58,7 @@ pub struct View {
 }
 
 /// A framing set aside for the loupe to give back.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct Held {
     scale: f32,
     offset: (f32, f32),
@@ -220,11 +223,35 @@ impl View {
     /// comparing sharpness. The result holds no loupe of its own — it is
     /// worked out again for every frame, and nothing lets go of it.
     pub fn matched(&self, image: (u32, u32)) -> Self {
+        self.framed_as(image, (self.window.0 as u32, self.window.1 as u32), self.scale_factor)
+    }
+
+    /// The same framing on another screen: the same part of the picture,
+    /// taking the same share of a window of another size — what the other
+    /// display shows of what the main window shows.
+    ///
+    /// By content, for the reason a comparison is: a laptop and a television
+    /// differ in pixels many times over, and holding the pixel scale would
+    /// show the room a corner of what the person at the laptop sees. Holding
+    /// the share means "what I see is what they see", which is the promise a
+    /// second screen has to keep — a zoom into a face at the laptop is the
+    /// same face, filling the television the way it fills the laptop.
+    pub fn on_screen(&self, window: (u32, u32), scale_factor: f32) -> Self {
+        self.framed_as((self.image.0 as u32, self.image.1 as u32), window, scale_factor)
+    }
+
+    /// The general form of the two above: `image` framed in `window` over the
+    /// part of the scene this view shows, at the same share of its window.
+    fn framed_as(&self, image: (u32, u32), window: (u32, u32), scale_factor: f32) -> Self {
         let mut other = Self {
             image: (image.0.max(1) as f32, image.1.max(1) as f32),
-            window: self.window,
+            window: (window.0.max(1) as f32, window.1.max(1) as f32),
             scale: 1.0,
-            scale_factor: self.scale_factor,
+            scale_factor: if scale_factor.is_finite() && scale_factor > 0.0 {
+                scale_factor
+            } else {
+                self.scale_factor
+            },
             offset: (0.0, 0.0),
             mode: self.mode,
             held: None,
@@ -1313,5 +1340,48 @@ mod tests {
         let (left, top, width, height) = view.visible_fraction();
         assert!(left.is_finite() && top.is_finite());
         assert!(width > 0.0 && height > 0.0);
+    }
+
+    /// The other display shows the same part of the picture as the laptop,
+    /// whatever its size — zoomed in on a face, it is the same face.
+    #[test]
+    fn another_screen_shows_the_same_part_of_the_picture() {
+        let mut laptop = view((6000, 4000), (1600, 1000));
+        laptop.zoom_at(6.0, (400.0, 300.0));
+        laptop.pan((-120.0, 80.0));
+
+        let television = laptop.on_screen((3840, 2160), 1.5);
+        let (left, top, width, height) = laptop.visible_fraction();
+        let (other_left, other_top, other_width, other_height) = television.visible_fraction();
+        // The same centre exactly; the same extent along the axis that
+        // limits it, the other axis showing more or less as the shape allows.
+        assert!(about(left + width / 2.0, other_left + other_width / 2.0), "the centre moved across");
+        assert!(about(top + height / 2.0, other_top + other_height / 2.0), "the centre moved down");
+        assert!(
+            about(height, other_height),
+            "the television showed {other_height} of the height, the laptop {height}"
+        );
+    }
+
+    /// Fitted at the laptop, fitted on the television: the whole picture,
+    /// filling it the way it fills the laptop.
+    #[test]
+    fn a_fitted_picture_fills_the_other_screen_the_same_way() {
+        let laptop = view((6000, 4000), (1600, 1000));
+        let television = laptop.on_screen((3840, 2160), 1.0);
+        assert_eq!(television.visible_fraction(), (0.0, 0.0, 1.0, 1.0));
+        let share = |view: &View| view.scaled_size().1 / view.window.1;
+        assert!(about(share(&laptop), share(&television)), "the picture took another share of the screen");
+        assert_eq!(television.mode(), FitMode::Fit);
+    }
+
+    /// The other screen is worked out from the laptop's framing, not stored:
+    /// on the same screen it is the framing itself.
+    #[test]
+    fn on_its_own_screen_a_framing_is_itself() {
+        let mut laptop = view((4000, 3000), (1600, 1000));
+        laptop.zoom_at(3.0, (900.0, 200.0));
+        let again = laptop.on_screen((1600, 1000), 1.0);
+        assert!(about(again.scale, laptop.scale) && about(again.offset.0, laptop.offset.0) && about(again.offset.1, laptop.offset.1));
     }
 }

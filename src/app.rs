@@ -15,7 +15,8 @@ use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, NamedKey};
-use winit::window::{Window, WindowId};
+use winit::monitor::MonitorHandle;
+use winit::window::{Fullscreen, Window, WindowId};
 
 use moxcms::ColorProfile;
 
@@ -26,12 +27,13 @@ use crate::config::{Config, Opening, Wheel};
 use crate::folder::Folder;
 use crate::format::Format;
 use crate::gpu::Renderer;
-use crate::gpu::{Overlay, Painted, Pane, Slot};
+use crate::gpu::{Overlay, Painted, Pane, Screen, Slot};
 use crate::histogram::Histogram;
 use crate::image_source::{self, Depth, Fidelity, LoadedImage, Orientation};
 use crate::interface::{Action, Interface, Status};
 use crate::loader::{Asked, Decoded, Loader, Request};
 use crate::minimap::Thumbnail;
+use crate::slideshow::{self, Shuffle};
 use crate::startup;
 use crate::vector::VectorImage;
 use crate::view::{FitMode, View};
@@ -281,6 +283,79 @@ impl Pixels {
     }
 }
 
+/// A slideshow, while one runs.
+struct Slideshow {
+    order: SlideOrder,
+    clock: slideshow::Clock,
+    /// Whether the show put the window into full screen, and so takes it out
+    /// again when it stops. A window that was full screen already is left as
+    /// it was found.
+    made_fullscreen: bool,
+}
+
+/// Which way a slideshow walks the folder.
+enum SlideOrder {
+    /// The folder's own order, round and round.
+    Folder,
+    /// A shuffled deck, dealt again every round.
+    Shuffled(Shuffle),
+}
+
+impl SlideOrder {
+    fn shuffled(&self) -> bool {
+        matches!(self, Self::Shuffled(_))
+    }
+}
+
+/// The picture shown again on another display, for the people in front of it.
+///
+/// A window of its own with a swapchain of its own on the same device (ADR
+/// 0032): full screen on that display, with no chrome, no pointer and no
+/// button on the taskbar, and never the one with the keyboard. What it shows
+/// is worked out from the main window every time, so the two cannot drift.
+struct Presentation {
+    window: Arc<Window>,
+    /// Which display it is on, so the next press can move it to the one after.
+    monitor: MonitorHandle,
+    /// What its last frame showed. A change anywhere that leaves this the same
+    /// — the toolbar coming down at the laptop, a toast fading — draws nothing
+    /// on the television.
+    drawn: Option<Shot>,
+    /// When its display was last asked about HDR, for the same watch the main
+    /// window keeps.
+    checked_at: Option<Instant>,
+}
+
+/// What one frame of the other display shows: everything that, changed,
+/// would make it look different.
+#[derive(PartialEq)]
+struct Shot {
+    /// The renderer's count of changes to the pictures themselves.
+    generation: u64,
+    size: (u32, u32),
+    panes: Vec<Planned>,
+}
+
+/// One pane, worked out before anything is drawn into it.
+#[derive(Clone, Copy, PartialEq)]
+struct Planned {
+    slot: Slot,
+    rect: compare::Rect,
+    view: View,
+    orientation: Orientation,
+}
+
+impl Planned {
+    fn pane(&self) -> Pane<'_> {
+        Pane {
+            slot: self.slot,
+            rect: self.rect,
+            view: &self.view,
+            orientation: self.orientation,
+        }
+    }
+}
+
 struct App {
     /// The files to open once the window exists.
     initial: Vec<PathBuf>,
@@ -394,6 +469,13 @@ struct App {
     shown_once: bool,
     /// The comparison, while two pictures are up.
     comparing: Option<Comparison>,
+    /// The slideshow, while one runs.
+    slideshow: Option<Slideshow>,
+    /// The other display, while the picture is shown there too.
+    presentation: Option<Presentation>,
+    /// Whether the pointer was hidden for a slideshow. It comes back the
+    /// moment it moves; kept so a move that finds it showing asks nothing.
+    cursor_hidden: bool,
 }
 
 /// One laid-out interface frame, held between the layout and the draw.
@@ -439,6 +521,9 @@ impl App {
             shown_once: false,
             idle_deadline: None,
             comparing: None,
+            slideshow: None,
+            presentation: None,
+            cursor_hidden: false,
         }
     }
 
@@ -455,6 +540,12 @@ impl App {
     /// here blocks on a full decode, so the window keeps answering the user
     /// while a 60-megapixel photo is still being unpacked.
     fn show(&mut self, path: &Path) {
+        // Another picture is on its way, and a slideshow counts from its
+        // arrival rather than from now: see `slideshow::Clock`.
+        if let Some(show) = self.slideshow.as_mut() {
+            show.clock.stepped();
+        }
+
         // The name box belongs to the file whose name is in it. The picture
         // can change under it without a key being pressed — the toolbar, the
         // wheel, a dropped file — and a box left standing would put that name
@@ -670,6 +761,20 @@ impl App {
         // at, and `Ctrl+C` would copy the wrong one.
         self.pasted = None;
 
+        // The whole picture is up, so a slideshow's count starts. Not for the
+        // embedded thumbnail: a slide's time is for the picture, not for the
+        // stand-in a second before it.
+        if loaded.fidelity == Fidelity::Full {
+            let hold = self
+                .shown
+                .as_ref()
+                .and_then(|shown| shown.player.as_ref())
+                .map_or(Duration::ZERO, Player::cycle);
+            if let Some(show) = self.slideshow.as_mut() {
+                show.clock.arrived(Instant::now(), hold);
+            }
+        }
+
         // If the panel is already open — the user stepped to this image with
         // the histogram up — the new picture has to be counted for itself.
         self.count_if_wanted();
@@ -701,8 +806,20 @@ impl App {
             return;
         };
 
-        let (wanted_width, wanted_height) = shown.view.scaled_size();
-        let (wanted_width, wanted_height) = (wanted_width.round().max(1.0) as u32, wanted_height.round().max(1.0) as u32);
+        // Drawn for the larger of the two screens when the picture is on
+        // another display too: a television several times the laptop's size
+        // would otherwise show an icon drawn for the laptop, enlarged.
+        let mut wanted = shown.view.scaled_size();
+        if let (Some(presentation), Some(second)) = (
+            self.presentation.as_ref(),
+            self.renderer.as_ref().and_then(|renderer| renderer.size(Screen::Second)),
+        ) {
+            let there = shown.view.on_screen(second, presentation.window.scale_factor() as f32).scaled_size();
+            if there.0 > wanted.0 {
+                wanted = there;
+            }
+        }
+        let (wanted_width, wanted_height) = (wanted.0.round().max(1.0) as u32, wanted.1.round().max(1.0) as u32);
         if !worth_redrawing(shown.rasterised_at.0, wanted_width) {
             return;
         }
@@ -741,7 +858,12 @@ impl App {
                 self.fit_to_area();
                 self.refresh();
             }
-            None => self.start_comparing(layout),
+            // A slideshow walks the folder on a clock and a comparison walks
+            // it by hand against a pinned picture: one at a time.
+            None => {
+                self.stop_slideshow();
+                self.start_comparing(layout);
+            }
         }
     }
 
@@ -934,7 +1056,7 @@ impl App {
     /// and during a blink, which gives the whole window to each in turn.
     fn pane_rects(&self) -> Option<(compare::Split, [compare::Rect; 2])> {
         let comparison = self.comparing.as_ref().filter(|comparison| comparison.layout == Layout::Side)?;
-        let window = self.renderer.as_ref()?.size();
+        let window = self.renderer.as_ref()?.size(Screen::Main)?;
         let gutter = self.gutter();
         let split = compare::split_for(comparison.pinned.size, window, gutter);
         Some((split, compare::panes(window, split, gutter)))
@@ -945,7 +1067,7 @@ impl App {
     fn picture_area(&self) -> (u32, u32) {
         match self.pane_rects() {
             Some((_, [_, current])) => (current.2, current.3),
-            None => self.renderer.as_ref().map_or((1, 1), Renderer::size),
+            None => self.window_size(),
         }
     }
 
@@ -1029,6 +1151,19 @@ impl App {
         let Some(folder) = &self.folder else {
             return;
         };
+        // A shuffled show's next picture is not beside this one in the
+        // folder: the deck says which it is, and the one before, for the
+        // left arrow.
+        if let Some(SlideOrder::Shuffled(shuffle)) = self.slideshow.as_ref().map(|show| &show.order) {
+            let walks = |path: &Path| folder.walks(path);
+            let wanted: Vec<PathBuf> = std::iter::once(folder.current())
+                .chain(shuffle.upcoming(walks))
+                .chain(shuffle.before(walks))
+                .map(Path::to_path_buf)
+                .collect();
+            self.loader.prefetch(&wanted);
+            return;
+        }
         self.loader.prefetch(&folder.neighbourhood(Loader::radius()));
     }
 
@@ -1064,6 +1199,12 @@ impl App {
                 eprintln!("nitid: {}: {error}", path.display());
                 let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("that file");
                 self.interface.toast(format!("{name} will not open"), Instant::now());
+                // A slideshow gives the failure its interval, with the
+                // message up, rather than skipping at once: a folder of files
+                // that will not open would otherwise race through them all.
+                if let Some(show) = self.slideshow.as_mut() {
+                    show.clock.arrived(Instant::now(), Duration::ZERO);
+                }
                 self.request_redraw();
             }
         }
@@ -1093,6 +1234,11 @@ impl App {
         if size.width > 0 && size.height > 0 {
             self.config.placement.size = Some((size.width, size.height));
         }
+    }
+
+    /// The main window's drawing surface, in physical pixels.
+    fn window_size(&self) -> (u32, u32) {
+        self.renderer.as_ref().and_then(|renderer| renderer.size(Screen::Main)).unwrap_or((1, 1))
     }
 
     /// Physical pixels per logical pixel on the monitor showing the window.
@@ -1128,6 +1274,10 @@ impl App {
         // pointer has to be told: the toolbar's own rule only answers to
         // where the pointer is.
         self.interface.set_chrome(self.config.appearance);
+        // A show that is running takes the new pace at once.
+        if let Some(show) = self.slideshow.as_mut() {
+            show.clock.set_interval(Duration::from_secs(u64::from(self.config.slideshow.interval)));
+        }
         self.config.save();
         self.request_redraw();
     }
@@ -1139,20 +1289,541 @@ impl App {
     }
 
     /// Step through the folder, if a step is possible.
+    ///
+    /// During a slideshow the arrow keys walk the show: through the shuffled
+    /// deck when it is shuffled, and round the folder's ends whatever the
+    /// setting says, because a show for a room goes on rather than stopping
+    /// at the last photograph.
     fn navigate(&mut self, step: Step) {
         let Some(folder) = self.folder.as_mut() else {
             return;
         };
-        let next = match step {
-            Step::Next => folder.next(),
-            Step::Previous => folder.previous(),
-            Step::First => folder.first(),
-            Step::Last => folder.last(),
+        let showing = self.slideshow.is_some();
+        let next = match (step, self.slideshow.as_mut().map(|show| &mut show.order)) {
+            (Step::Next, Some(SlideOrder::Shuffled(shuffle))) => shuffle.next(|path| folder.walks(path), || folder.walked()),
+            (Step::Previous, Some(SlideOrder::Shuffled(shuffle))) => shuffle.previous(|path| folder.walks(path)),
+            (Step::Next, _) => match folder.next().map(Path::to_path_buf) {
+                None if showing => folder.first().map(Path::to_path_buf),
+                next => next,
+            },
+            (Step::Previous, _) => match folder.previous().map(Path::to_path_buf) {
+                None if showing => folder.last().map(Path::to_path_buf),
+                previous => previous,
+            },
+            (Step::First, _) => folder.first().map(Path::to_path_buf),
+            (Step::Last, _) => folder.last().map(Path::to_path_buf),
         };
-        let Some(next) = next.map(Path::to_path_buf) else {
+        let Some(next) = next else {
             return;
         };
+        // A shuffle names a file rather than moving the folder's cursor, and
+        // the cursor is what the status line counts and the next step
+        // starts from.
+        folder.go_to(&next);
         self.show(&next);
+    }
+
+    /// `S` and `Shift+S`: a slideshow in the folder's order or a shuffled
+    /// one. The same key again stops it and the other switches the order —
+    /// the way `V` and `Shift+V` treat a comparison.
+    fn toggle_slideshow(&mut self, shuffled: bool) {
+        match self.slideshow.as_ref().map(|show| show.order.shuffled()) {
+            Some(running) if running == shuffled => self.stop_slideshow(),
+            Some(_) => {
+                let order = self.slide_order(shuffled);
+                if let Some(show) = self.slideshow.as_mut() {
+                    show.order = order;
+                }
+                self.interface
+                    .toast(if shuffled { "slideshow: shuffled" } else { "slideshow: in folder order" }, Instant::now());
+                self.prefetch_neighbours();
+                self.request_redraw();
+            }
+            None => self.start_slideshow(shuffled),
+        }
+    }
+
+    fn slide_order(&self, shuffled: bool) -> SlideOrder {
+        match (shuffled, self.folder.as_ref()) {
+            (true, Some(folder)) => SlideOrder::Shuffled(Shuffle::new(folder.current(), folder.walked(), slideshow::seed())),
+            _ => SlideOrder::Folder,
+        }
+    }
+
+    fn start_slideshow(&mut self, shuffled: bool) {
+        let walked = self.folder.as_ref().map_or(0, Folder::len);
+        let pasted = self.shown.as_ref().is_none_or(|shown| shown.pasted);
+        if walked < 2 || pasted {
+            self.interface.toast("nothing here to show one after another", Instant::now());
+            self.request_redraw();
+            return;
+        }
+
+        // Both want the arrow keys and the whole window.
+        self.stop_comparing(Leave::Here);
+        self.cropping = None;
+
+        // Full screen, unless the picture is on another display already: then
+        // the window at the laptop stays as it is, which is the point of
+        // putting it on the other one.
+        let mut made_fullscreen = false;
+        if self.presentation.is_none()
+            && let Some(window) = self.window.as_ref()
+            && window.fullscreen().is_none()
+        {
+            window.set_fullscreen(Some(Fullscreen::Borderless(None)));
+            made_fullscreen = true;
+        }
+
+        let interval = self.config.slideshow.interval;
+        let mut clock = slideshow::Clock::new(Duration::from_secs(u64::from(interval)));
+        // The picture on screen is the first slide; if it is already whole,
+        // its count starts now.
+        if let Some(shown) = self.shown.as_ref()
+            && shown.fidelity == Fidelity::Full
+        {
+            clock.arrived(Instant::now(), shown.player.as_ref().map_or(Duration::ZERO, Player::cycle));
+        }
+        let order = self.slide_order(shuffled);
+        self.slideshow = Some(Slideshow { order, clock, made_fullscreen });
+
+        self.interface.toast(
+            format!(
+                "{}: {} a picture · Space pauses · Esc stops",
+                if shuffled { "shuffled slideshow" } else { "slideshow" },
+                slideshow::interval_text(interval)
+            ),
+            Instant::now(),
+        );
+        self.hide_cursor();
+        self.prefetch_neighbours();
+        self.request_redraw();
+    }
+
+    /// Stop the show, and give back the window as the show found it.
+    fn stop_slideshow(&mut self) {
+        let Some(show) = self.slideshow.take() else {
+            return;
+        };
+        if show.made_fullscreen
+            && let Some(window) = self.window.as_ref()
+            && window.fullscreen().is_some()
+        {
+            window.set_fullscreen(None);
+        }
+        self.show_cursor();
+        self.interface.toast("slideshow stopped", Instant::now());
+        // The cache was holding the shuffle's next picture; the arrow keys
+        // want the folder's neighbours again.
+        self.prefetch_neighbours();
+        self.request_redraw();
+    }
+
+    fn pause_slideshow(&mut self) {
+        let Some(show) = self.slideshow.as_mut() else {
+            return;
+        };
+        let paused = show.clock.toggle_paused(Instant::now());
+        self.interface
+            .toast(if paused { "slideshow paused" } else { "slideshow goes on" }, Instant::now());
+        self.request_redraw();
+    }
+
+    /// `Up` and `Down` during a show: longer or shorter on each picture.
+    ///
+    /// Written to the settings, so the next show runs at the pace this one
+    /// was left at — the pace someone chose while watching is a better
+    /// default than one chosen in a dialog.
+    fn change_interval(&mut self, longer: bool) {
+        let Some(show) = self.slideshow.as_mut() else {
+            return;
+        };
+        let current = self.config.slideshow.interval;
+        let seconds = if longer { slideshow::longer(current) } else { slideshow::shorter(current) };
+        self.config.slideshow.interval = seconds;
+        show.clock.set_interval(Duration::from_secs(u64::from(seconds)));
+        self.config.save();
+        self.interface.toast(format!("{} a picture", slideshow::interval_text(seconds)), Instant::now());
+        self.request_redraw();
+    }
+
+    /// Move the show on, when its time has come and nothing is in the way.
+    fn advance_slideshow(&mut self, now: Instant) {
+        // A box over the picture is about this picture: a name being typed,
+        // a format being chosen, a crop being framed. The count waits for as
+        // long as one is up.
+        let busy = self.interface.renaming() || self.interface.saving() || self.interface.cleaning() || self.cropping.is_some();
+        let Some(show) = self.slideshow.as_mut() else {
+            return;
+        };
+        if busy {
+            show.clock.hold_still(now);
+            return;
+        }
+        if !show.clock.is_due(now) {
+            return;
+        }
+        // Restarted before the step, so a step that goes nowhere — a filter
+        // that left one picture to walk — waits an interval before trying
+        // again rather than waking the loop at once, for ever.
+        show.clock.hold_still(now);
+        self.navigate(Step::Next);
+        self.hide_cursor();
+    }
+
+    /// Hide the pointer over a slideshow in the window itself. Not when the
+    /// show is on another display: the person at the laptop is using it.
+    fn hide_cursor(&mut self) {
+        if self.slideshow.is_none() || self.presentation.is_some() || self.cursor_hidden {
+            return;
+        }
+        if let Some(window) = self.window.as_ref() {
+            window.set_cursor_visible(false);
+            self.cursor_hidden = true;
+        }
+    }
+
+    fn show_cursor(&mut self) {
+        if !self.cursor_hidden {
+            return;
+        }
+        if let Some(window) = self.window.as_ref() {
+            window.set_cursor_visible(true);
+        }
+        self.cursor_hidden = false;
+    }
+
+    /// What goes where in a window `window` pixels big: one pane for a single
+    /// picture, two for a comparison side by side, and the one a blink has up
+    /// at `now`.
+    ///
+    /// `mirrored` is for the other display: each picture is framed from the
+    /// main window's framing — the same part, at the same share of the screen
+    /// (`View::on_screen`) — rather than taken as it stands. One function for
+    /// both, so the television cannot come to lay out a comparison the laptop
+    /// does not.
+    fn plan(&self, window: (u32, u32), scale_factor: f32, now: Instant, mirrored: bool) -> Vec<Planned> {
+        let Some(shown) = self.shown.as_ref() else {
+            return Vec::new();
+        };
+        let whole = (0, 0, window.0, window.1);
+        let framed = |view: &View, rect: compare::Rect| if mirrored { view.on_screen((rect.2, rect.3), scale_factor) } else { *view };
+        let current = |rect| Planned {
+            slot: Slot::Main,
+            rect,
+            view: framed(&shown.view, rect),
+            orientation: shown.orientation.then(shown.turn),
+        };
+        let Some(comparison) = self.comparing.as_ref() else {
+            return vec![current(whole)];
+        };
+
+        // The pinned picture is framed from the one being steered, every
+        // frame: the two can never drift apart, because there is only one
+        // framing and the other is worked out from it.
+        let pinned_view = shown.view.matched(comparison.pinned.size);
+        let pinned = |rect| Planned {
+            slot: Slot::Pinned,
+            rect,
+            view: framed(&pinned_view, rect),
+            orientation: comparison.pinned.orientation(),
+        };
+        match comparison.layout {
+            Layout::Side => {
+                let gutter = (compare::GUTTER * scale_factor).round() as u32;
+                let split = compare::split_for(comparison.pinned.size, window, gutter);
+                let [left, right] = compare::panes(window, split, gutter);
+                vec![pinned(left), current(right)]
+            }
+            Layout::Blink => match comparison.showing(now) {
+                Which::Pinned => vec![pinned(whole)],
+                Which::Current => vec![current(whole)],
+            },
+        }
+    }
+
+    /// What the other display should show now, if it is up.
+    fn presentation_shot(&self, now: Instant) -> Option<Shot> {
+        let presentation = self.presentation.as_ref()?;
+        let renderer = self.renderer.as_ref()?;
+        let size = renderer.size(Screen::Second)?;
+        let scale_factor = presentation.window.scale_factor() as f32;
+        Some(Shot {
+            generation: renderer.generation(),
+            size,
+            panes: self.plan(size, scale_factor, now, true),
+        })
+    }
+
+    /// `D`: show the picture on another display, move it on to the next one,
+    /// or take it away after the last.
+    fn present(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        let here = window.current_monitor();
+        let others: Vec<MonitorHandle> = window
+            .available_monitors()
+            .filter(|monitor| second_screen_here() || Some(monitor) != here.as_ref())
+            .collect();
+        let showing_on = self.presentation.as_ref().map(|presentation| presentation.monitor.clone());
+
+        match (next_display(&others, showing_on.as_ref()), showing_on.is_some()) {
+            (Some(monitor), true) => self.move_presentation(monitor),
+            (Some(monitor), false) => self.open_presentation(event_loop, monitor),
+            (None, true) => {
+                self.close_presentation();
+                self.interface.toast("the other display is off", Instant::now());
+            }
+            (None, false) => self.interface.toast("there is no other display", Instant::now()),
+        }
+        self.request_redraw();
+    }
+
+    fn open_presentation(&mut self, event_loop: &ActiveEventLoop, monitor: MonitorHandle) {
+        let attributes = Window::default_attributes()
+            .with_title("nitid")
+            .with_visible(false)
+            // The keyboard stays with the person at the laptop.
+            .with_active(false)
+            .with_window_icon(crate::icon::small());
+        // On another display, the whole of it. Under the test lever, a plain
+        // window beside this one, so both can be seen on the one display a
+        // laptop on its own has.
+        let attributes = match second_screen_here() {
+            false => attributes.with_fullscreen(Some(Fullscreen::Borderless(Some(monitor.clone())))),
+            true => attributes.with_inner_size(LogicalSize::new(640, 400)),
+        };
+        // One viewer, one button on the taskbar: the other display is a part
+        // of this window, not a second program to switch to.
+        #[cfg(windows)]
+        let attributes = {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            attributes.with_skip_taskbar(true)
+        };
+        let window = match event_loop.create_window(attributes) {
+            Ok(window) => Arc::new(window),
+            Err(error) => {
+                self.report(anyhow::Error::new(error).context("opening a window on the other display"));
+                return;
+            }
+        };
+        // Over the television the pointer is in the picture and nowhere else.
+        window.set_cursor_visible(false);
+
+        let size = window.inner_size();
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        if let Err(error) = renderer.open_second(window.clone(), (size.width, size.height)) {
+            self.report(error);
+            return;
+        }
+        let hdr = renderer.is_hdr(Screen::Second);
+        startup::milestone(if hdr { "other display opened, in HDR" } else { "other display opened" });
+        self.interface
+            .toast(format!("{}{}", self.display_name(&monitor), if hdr { " · HDR" } else { "" }), Instant::now());
+        self.presentation = Some(Presentation {
+            window: window.clone(),
+            monitor,
+            drawn: None,
+            checked_at: None,
+        });
+        // The show at the laptop gives the window back: with the picture on
+        // the television, the laptop is where the person works.
+        if let Some(show) = self.slideshow.as_mut()
+            && show.made_fullscreen
+        {
+            show.made_fullscreen = false;
+            if let Some(main) = self.window.as_ref() {
+                main.set_fullscreen(None);
+            }
+        }
+        self.show_cursor();
+
+        window.set_visible(true);
+        window.request_redraw();
+        if let Some(main) = self.window.as_ref() {
+            main.focus_window();
+        }
+        // A vector picture is drawn again for the larger screen.
+        self.rerasterise_if_needed();
+    }
+
+    fn move_presentation(&mut self, monitor: MonitorHandle) {
+        let name = self.display_name(&monitor);
+        let Some(presentation) = self.presentation.as_mut() else {
+            return;
+        };
+        if !second_screen_here() {
+            presentation.window.set_fullscreen(Some(Fullscreen::Borderless(Some(monitor.clone()))));
+        }
+        presentation.monitor = monitor;
+        presentation.drawn = None;
+        self.interface.toast(name, Instant::now());
+    }
+
+    /// Take the picture off the other display.
+    fn close_presentation(&mut self) {
+        if self.presentation.is_none() {
+            return;
+        }
+        // The swapchain first: it draws into the window, and a surface
+        // outliving its window is the driver's undefined behaviour.
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.close_second();
+        }
+        self.presentation = None;
+        if let Some(main) = self.window.as_ref() {
+            main.focus_window();
+        }
+        self.request_redraw();
+    }
+
+    /// A display the way the toast names it: its place in the system's list,
+    /// and its size, which is how a person tells a television from a monitor.
+    fn display_name(&self, monitor: &MonitorHandle) -> String {
+        let all: Vec<MonitorHandle> = self.window.as_ref().map(|window| window.available_monitors().collect()).unwrap_or_default();
+        let place = all.iter().position(|other| other == monitor).map_or(0, |index| index + 1);
+        let size = monitor.size();
+        format!("on display {place} of {} · {}×{}", all.len(), size.width, size.height)
+    }
+
+    /// Close the other display when it is not another display any more:
+    /// unplugged, so Windows moved its window onto the laptop, or the main
+    /// window dragged onto it. A full-screen picture over the person's own
+    /// screen is the one thing it must never become.
+    fn check_presentation_display(&mut self) {
+        let (Some(presentation), Some(window)) = (self.presentation.as_ref(), self.window.as_ref()) else {
+            return;
+        };
+        if second_screen_here() {
+            return;
+        }
+        let (there, here) = (presentation.window.current_monitor(), window.current_monitor());
+        if there.is_some() && there == here {
+            self.close_presentation();
+            self.interface
+                .toast("the other display is off: both windows were on one display", Instant::now());
+        }
+    }
+
+    /// An event for the other display's window.
+    fn presentation_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
+        match event {
+            // Alt+F4 over the television, or the system closing it.
+            WindowEvent::CloseRequested | WindowEvent::Destroyed => self.close_presentation(),
+            WindowEvent::Resized(size) => {
+                if let Some(renderer) = self.renderer.as_mut() {
+                    renderer.resize(Screen::Second, (size.width, size.height));
+                }
+                self.forget_presentation_frame();
+                self.check_presentation_display();
+            }
+            WindowEvent::Moved(_) | WindowEvent::Focused(true) | WindowEvent::ScaleFactorChanged { .. } => {
+                // Asked whether or not the display changed: a move to another
+                // display of the same kind still needs a frame drawn for it.
+                if let Some(renderer) = self.renderer.as_mut() {
+                    renderer.follow_display(Screen::Second);
+                }
+                self.forget_presentation_frame();
+                self.check_presentation_display();
+            }
+            WindowEvent::RedrawRequested => self.draw_presentation(),
+            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
+            // Keys pressed with the television in front — someone clicked it —
+            // do what they do at the laptop.
+            WindowEvent::KeyboardInput { event, .. } if event.state.is_pressed() => self.key_pressed(&event, event_loop),
+            WindowEvent::KeyboardInput { event, .. } if is_loupe(&event.logical_key) => self.release_loupe(),
+            _ => {}
+        }
+    }
+
+    /// Its next frame has to be drawn whatever it shows: the window changed.
+    fn forget_presentation_frame(&mut self) {
+        if let Some(presentation) = self.presentation.as_mut() {
+            presentation.drawn = None;
+            presentation.window.request_redraw();
+        }
+    }
+
+    fn draw_presentation(&mut self) {
+        let Some(shot) = self.presentation_shot(Instant::now()) else {
+            return;
+        };
+        let panes: Vec<Pane<'_>> = shot.panes.iter().map(Planned::pane).collect();
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        if let Err(error) = renderer.render(Screen::Second, &panes, None) {
+            // The other display failing is not a reason to end the viewer at
+            // the laptop.
+            self.close_presentation();
+            self.report(error.context("drawing on the other display"));
+            return;
+        }
+        drop(panes);
+        if let Some(presentation) = self.presentation.as_mut() {
+            presentation.drawn = Some(shot);
+        }
+    }
+
+    /// Ask the other display for a frame when what it shows has changed.
+    ///
+    /// Asked here, where the loop settles, rather than after the main
+    /// window's frame: a laptop window minimised while the show goes on draws
+    /// no frames, and the television must go on regardless.
+    fn offer_presentation_frame(&mut self, now: Instant) {
+        let Some(shot) = self.presentation_shot(now) else {
+            return;
+        };
+        if let Some(presentation) = self.presentation.as_ref()
+            && presentation.drawn.as_ref() != Some(&shot)
+        {
+            presentation.window.request_redraw();
+        }
+    }
+
+    /// One key, from either window.
+    fn key_pressed(&mut self, event: &winit::event::KeyEvent, event_loop: &ActiveEventLoop) {
+        // A chord is answered here rather than in `handle_key`, which
+        // knows nothing about modifiers: `Ctrl+C` and `C` are
+        // different keys to a person and must be to the viewer.
+        // The name box owns the keyboard while it is up. Without
+        // this, typing "gull.jpg" would step to the next picture on
+        // the "g", turn it on the "r", and delete nothing only by
+        // luck. Escape is left to egui, which the box watches for.
+        if self.interface.renaming() || self.interface.saving() || self.interface.cleaning() {
+            return;
+        }
+        match route_for(self.modifiers) {
+            // Ctrl and Alt together, decided before either alone: the
+            // copy-as key is the one chord with two modifiers, and a
+            // branch that asked about Alt first would swallow it.
+            Route::DoubleChord => {
+                if let Some(chord) = double_chord_for(&event.logical_key) {
+                    self.handle_double_chord(chord);
+                }
+            }
+            // Alt and a digit hand the picture to a program. The
+            // digits belong to sorting under Ctrl, so the programs
+            // take a modifier of their own rather than a gesture
+            // that is already spoken for. Read from the physical key
+            // for the same reason sorting is.
+            Route::Program => {
+                if let Some(digit) = digit_key(&event.physical_key) {
+                    self.open_in_program(Some(digit));
+                }
+            }
+            // A digit sorts the file into a folder; Shift makes it a
+            // copy. Asked of the physical key, because Ctrl+Shift+1
+            // does not deliver the character "1" on any layout.
+            Route::Chord => match digit_key(&event.physical_key) {
+                Some(digit) => self.sort_current(digit, self.modifiers.shift_key()),
+                None => self.handle_chord(&event.logical_key),
+            },
+            Route::Bare => self.handle_key(&event.logical_key, event_loop),
+        }
     }
 
     fn cursor_position(&self) -> (f32, f32) {
@@ -1195,7 +1866,21 @@ impl App {
             // The right-hand picture beat the pinned one: it becomes the one
             // to beat, and the walk goes on to the next.
             Key::Named(NamedKey::Enter) if self.comparing.is_some() => self.pin_current(),
+            // The show is a mode too, and so is the other display — left one
+            // at a time, the show first, because it is what is moving.
+            Key::Named(NamedKey::Escape) if self.slideshow.is_some() => self.stop_slideshow(),
+            Key::Named(NamedKey::Escape) if self.presentation.is_some() => {
+                self.close_presentation();
+                self.interface.toast("the other display is off", Instant::now());
+            }
             Key::Named(NamedKey::Escape) => event_loop.exit(),
+            // During a show the space bar is the show's pause, which is what
+            // a person watching one reaches for.
+            Key::Named(NamedKey::Space) if self.slideshow.is_some() => self.pause_slideshow(),
+            // Up for longer on each picture, down for shorter: the arrows
+            // nothing else in the viewer uses, and only during a show.
+            Key::Named(NamedKey::ArrowUp) => self.change_interval(true),
+            Key::Named(NamedKey::ArrowDown) => self.change_interval(false),
             // On an animated image the space bar is its pause; everywhere
             // else it steps to the next file, as it always has.
             Key::Named(NamedKey::Space) => match self.shown.as_mut().and_then(|shown| shown.player.as_mut()) {
@@ -1293,6 +1978,13 @@ impl App {
                 // `R` — the same comparison, shown one over the other.
                 "v" => self.compare(Layout::Side),
                 "V" => self.compare(Layout::Blink),
+                // A slideshow, in the folder's order or shuffled — Shift for
+                // the other way of going through the same folder, as it is on
+                // `V`.
+                "s" => self.toggle_slideshow(false),
+                "S" => self.toggle_slideshow(true),
+                // The picture on another display: a television, a projector.
+                "d" | "D" => self.present(event_loop),
                 // The colour under the cursor. A mode, so it can be pointed
                 // about the picture and clicked with one hand.
                 "c" | "C" => self.toggle_picking(),
@@ -2762,6 +3454,8 @@ impl App {
 
     /// Put a picture with no file behind it on screen.
     fn show_pasted(&mut self, image: crate::image_source::DecodedImage) {
+        // The folder goes with a paste, and a show has nothing left to walk.
+        self.stop_slideshow();
         let scale_factor = self.scale_factor();
         let area = self.picture_area();
         let Some(renderer) = self.renderer.as_mut() else {
@@ -3029,7 +3723,7 @@ impl App {
     /// on the events that can precede a change rather than on every redraw.
     /// The viewer's idle loop stays asleep either way.
     fn follow_display(&mut self) -> bool {
-        let changed = self.renderer.as_mut().is_some_and(Renderer::follow_display);
+        let changed = self.renderer.as_mut().is_some_and(|renderer| renderer.follow_display(Screen::Main));
         if changed {
             // The interface is composited by a pipeline built against the
             // format it writes, and encoded by a rule that depends on the
@@ -3056,7 +3750,7 @@ impl App {
     /// the query costs. On a standard-range surface, which is where an SDR
     /// display leaves it, nothing here runs and the loop sleeps as before.
     fn watch_the_display(&mut self) {
-        let watching = self.renderer.as_ref().is_some_and(Renderer::is_hdr);
+        let watching = self.renderer.as_ref().is_some_and(|renderer| renderer.is_hdr(Screen::Main));
         let now = Instant::now();
         if !display_check_due(watching, self.display_checked_at, now) {
             return;
@@ -3068,18 +3762,39 @@ impl App {
         }
     }
 
+    /// The same watch, for the other display: it can be switched out of HDR
+    /// as silently as this one.
+    fn watch_the_other_display(&mut self) {
+        let watching = self.renderer.as_ref().is_some_and(|renderer| renderer.is_hdr(Screen::Second));
+        let now = Instant::now();
+        let Some(presentation) = self.presentation.as_mut() else {
+            return;
+        };
+        if !display_check_due(watching, presentation.checked_at, now) {
+            return;
+        }
+        presentation.checked_at = Some(now);
+        if self.renderer.as_mut().is_some_and(|renderer| renderer.follow_display(Screen::Second)) {
+            self.forget_presentation_frame();
+        }
+    }
+
     /// How long the loop may sleep with nothing else pending.
     ///
     /// `Wait` — indefinitely — unless the display is being watched, in which
     /// case the next check bounds it.
     fn idle_until(&self) -> ControlFlow {
-        let watching = self.renderer.as_ref().is_some_and(Renderer::is_hdr);
+        let watching = self.renderer.as_ref().is_some_and(|renderer| renderer.is_hdr(Screen::Main));
         let display = display_watch_deadline(watching, self.display_checked_at, Instant::now());
+        let other = self.presentation.as_ref().and_then(|presentation| {
+            let watching = self.renderer.as_ref().is_some_and(|renderer| renderer.is_hdr(Screen::Second));
+            display_watch_deadline(watching, presentation.checked_at, Instant::now())
+        });
         // A fading toast has to be drawn to be seen, so it is the one thing
         // the interface asks the loop to wake for — and only while one is up.
         // With no toast and no HDR watch this is still `Wait`, which is the
         // promise a still picture rests on.
-        match soonest(display, self.toast_deadline) {
+        match soonest(soonest(display, other), self.toast_deadline) {
             Some(due) => ControlFlow::WaitUntil(due),
             None => ControlFlow::Wait,
         }
@@ -3129,7 +3844,7 @@ impl App {
                 let (frame, count) = player.position();
                 (frame, count, player.paused())
             }),
-            hdr: self.renderer.as_ref().is_some_and(Renderer::is_hdr),
+            hdr: self.renderer.as_ref().is_some_and(|renderer| renderer.is_hdr(Screen::Main)),
             locked: self.zoom_locked,
             backdrop: self.renderer.as_ref().and_then(|renderer| renderer.backdrop().name()),
             metadata: self.shown.as_ref().map(|shown| shown.metadata.clone()).unwrap_or_default(),
@@ -3150,6 +3865,12 @@ impl App {
             mark: self.shown.as_ref().map(|shown| shown.mark).unwrap_or_default(),
             filtered: self.folder.as_ref().is_some_and(crate::folder::Folder::is_filtered),
             compared: self.compared(),
+            slideshow: self.slideshow.as_ref().map(|show| crate::interface::Showing {
+                shuffled: show.order.shuffled(),
+                paused: show.clock.paused(),
+                interval: self.config.slideshow.interval,
+            }),
+            presenting: self.presentation.is_some(),
         }
     }
 
@@ -3159,7 +3880,7 @@ impl App {
         let comparison = self.comparing.as_ref()?;
         let shown = self.shown.as_ref()?;
         let scale = self.scale_factor().max(0.01);
-        let window = self.renderer.as_ref().map_or((1, 1), Renderer::size);
+        let window = self.window_size();
         let to_points = |(left, top, width, height): (u32, u32, u32, u32)| {
             egui::Rect::from_min_size(
                 egui::pos2(left as f32 / scale, top as f32 / scale),
@@ -3348,57 +4069,22 @@ impl App {
 
         // Worked out before the renderer is borrowed, because both ask
         // `self` about the window.
-        let window = self.renderer.as_ref().map_or((1, 1), Renderer::size);
-        let rects = self.pane_rects().map(|(_, rects)| rects);
         let now = Instant::now();
         // What a blink shows this frame, noted so a wake-up that finds the
         // same picture still due does not draw it again.
-        let showing = self.comparing.as_mut().map(|comparison| {
-            let showing = comparison.showing(now);
-            comparison.drawn = Some(showing);
-            showing
-        });
-
-        let Some(renderer) = self.renderer.as_mut() else {
-            return;
-        };
+        if let Some(comparison) = self.comparing.as_mut() {
+            comparison.drawn = Some(comparison.showing(now));
+        }
         // What goes where. With no image open there are no panes and the pass
         // still clears to the background, so the window is never a hole
         // showing whatever was behind it. The orientation is what the file
         // asks for, then what the user asked for on top of it.
-        let pinned_view;
-        let panes: Vec<Pane<'_>> = match (self.shown.as_ref(), self.comparing.as_ref()) {
-            (None, _) => Vec::new(),
-            (Some(shown), None) => vec![Pane {
-                slot: Slot::Main,
-                rect: (0, 0, window.0, window.1),
-                view: &shown.view,
-                orientation: shown.orientation.then(shown.turn),
-            }],
-            (Some(shown), Some(comparison)) => {
-                // The pinned picture is framed from the one being steered,
-                // every frame: the two can never drift apart, because there is
-                // only one framing and the other is worked out from it.
-                pinned_view = shown.view.matched(comparison.pinned.size);
-                let pinned = |rect| Pane {
-                    slot: Slot::Pinned,
-                    rect,
-                    view: &pinned_view,
-                    orientation: comparison.pinned.orientation(),
-                };
-                let current = |rect| Pane {
-                    slot: Slot::Main,
-                    rect,
-                    view: &shown.view,
-                    orientation: shown.orientation.then(shown.turn),
-                };
-                match (rects, showing) {
-                    (Some([left, right]), _) => vec![pinned(left), current(right)],
-                    (None, Some(Which::Pinned)) => vec![pinned((0, 0, window.0, window.1))],
-                    (None, _) => vec![current((0, 0, window.0, window.1))],
-                }
-            }
+        let planned = self.plan(self.window_size(), self.scale_factor(), now, false);
+
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
         };
+        let panes: Vec<Pane<'_>> = planned.iter().map(Planned::pane).collect();
         let carries_image = !panes.is_empty();
 
         // The interface's place on the GPU is built here, the first time
@@ -3420,7 +4106,7 @@ impl App {
             _ => None,
         };
 
-        if let Err(error) = renderer.render(&panes, interface) {
+        if let Err(error) = renderer.render(Screen::Main, &panes, interface) {
             self.failure = Some(error);
             event_loop.exit();
             return;
@@ -3507,7 +4193,9 @@ fn handled(key: &Key) -> bool {
             | NamedKey::Backspace
             | NamedKey::Home
             | NamedKey::End
-            | NamedKey::F11,
+            | NamedKey::F11
+            | NamedKey::ArrowUp
+            | NamedKey::ArrowDown,
         ) => true,
         Key::Character(character) => matches!(
             character.as_str(),
@@ -3550,6 +4238,10 @@ fn handled(key: &Key) -> bool {
                 | "M"
                 | "v"
                 | "V"
+                | "s"
+                | "S"
+                | "d"
+                | "D"
         ),
         _ => false,
     }
@@ -4000,6 +4692,31 @@ fn frame_arriving(previous: Option<Previous>, image: (u32, u32), window: (u32, u
     fresh()
 }
 
+/// Whether the other display may be this one: a plain window beside the main
+/// one rather than the whole of another display.
+///
+/// Only ever set by `NITID_SECOND_SCREEN_HERE=1`, which is how the second
+/// swapchain is exercised on a machine with one display — what a test runner
+/// has, and a laptop on its own. Nothing in normal use sets it.
+fn second_screen_here() -> bool {
+    std::env::var_os("NITID_SECOND_SCREEN_HERE").is_some_and(|value| value != "0")
+}
+
+/// Where `D` puts the picture, given the displays other than the window's
+/// and the one it is showing on now, if any.
+///
+/// The first other display, then each after it in turn, then none — off. With
+/// two displays that is a plain toggle, and with three every one of them is a
+/// press away without a menu. `None` with nothing showing means there is no
+/// other display at all. A display the picture is on that is no longer among
+/// the others — the main window was dragged onto it — starts the walk again.
+fn next_display<T: PartialEq + Clone>(others: &[T], showing_on: Option<&T>) -> Option<T> {
+    match showing_on.and_then(|on| others.iter().position(|other| other == on)) {
+        Some(index) => others.get(index + 1).cloned(),
+        None => others.first().cloned(),
+    }
+}
+
 /// The earlier of two deadlines, when there is one.
 fn soonest(left: Option<Instant>, right: Option<Instant>) -> Option<Instant> {
     match (left, right) {
@@ -4082,6 +4799,7 @@ impl ApplicationHandler<Event> for App {
         // last of five.
         self.open_dropped();
         self.watch_the_display();
+        self.watch_the_other_display();
 
         // The idle gate's window has run out: quit so it can read what the
         // still picture cost. Checked here because this is where the loop
@@ -4118,13 +4836,24 @@ impl ApplicationHandler<Event> for App {
         }
         let blink_due = blink.map(|comparison| comparison.blink.next_flip(now));
 
+        // The slideshow is the third clock, bounded the same way: one wake
+        // for the next slide, none while it is paused or waiting for a
+        // picture to arrive.
+        self.advance_slideshow(now);
+
+        // Last, after everything above has had its chance to change the
+        // picture: the other display draws only if what it shows moved.
+        self.offer_presentation_frame(now);
+
         // Whichever comes first: the animation's next frame, the blink's next
-        // flip, or the check on the display. The gate's deadline is among
-        // them too, or a viewer that is genuinely idle — which is what it is
-        // measuring — would sleep straight past it and never quit.
+        // flip, the next slide, or the check on the display. The gate's
+        // deadline is among them too, or a viewer that is genuinely idle —
+        // which is what it is measuring — would sleep straight past it and
+        // never quit.
         let wakes = [
             self.shown.as_ref().and_then(|shown| shown.player.as_ref()).and_then(Player::wake_at),
             blink_due,
+            self.slideshow.as_ref().and_then(|show| show.clock.due()),
             self.idle_deadline,
         ];
         let flow = wakes.into_iter().flatten().fold(self.idle_until(), |flow, due| match flow {
@@ -4237,7 +4966,11 @@ impl ApplicationHandler<Event> for App {
         window.request_redraw();
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        if self.presentation.as_ref().is_some_and(|presentation| presentation.window.id() == id) {
+            return self.presentation_event(event_loop, event);
+        }
+
         // The interface sees every event first, and says whether it wants one.
         // A click on the status line is the interface's; a click on the
         // photograph is the viewer's.
@@ -4269,13 +5002,13 @@ impl ApplicationHandler<Event> for App {
 
             WindowEvent::Resized(size) => {
                 if let Some(renderer) = self.renderer.as_mut() {
-                    renderer.resize((size.width, size.height));
+                    renderer.resize(Screen::Main, (size.width, size.height));
                 }
                 // After the surface, because the area is worked out from it:
                 // a pane is half of the window as it is now.
                 self.fit_to_area();
                 if let (Some(overlay), Some(renderer)) = (self.overlay.as_mut(), self.renderer.as_ref()) {
-                    overlay.resize(renderer.size());
+                    overlay.resize(renderer.size(Screen::Main).unwrap_or((1, 1)));
                 }
                 self.follow_display();
                 self.request_redraw();
@@ -4290,6 +5023,7 @@ impl ApplicationHandler<Event> for App {
                 if self.follow_display() {
                     self.request_redraw();
                 }
+                self.check_presentation_display();
             }
 
             // A key let go while another window is in front sends its release
@@ -4309,46 +5043,7 @@ impl ApplicationHandler<Event> for App {
 
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
 
-            WindowEvent::KeyboardInput { event, .. } if event.state.is_pressed() && !claimed => {
-                // A chord is answered here rather than in `handle_key`, which
-                // knows nothing about modifiers: `Ctrl+C` and `C` are
-                // different keys to a person and must be to the viewer.
-                // The name box owns the keyboard while it is up. Without
-                // this, typing "gull.jpg" would step to the next picture on
-                // the "g", turn it on the "r", and delete nothing only by
-                // luck. Escape is left to egui, which the box watches for.
-                if self.interface.renaming() || self.interface.saving() || self.interface.cleaning() {
-                    return;
-                }
-                match route_for(self.modifiers) {
-                    // Ctrl and Alt together, decided before either alone: the
-                    // copy-as key is the one chord with two modifiers, and a
-                    // branch that asked about Alt first would swallow it.
-                    Route::DoubleChord => {
-                        if let Some(chord) = double_chord_for(&event.logical_key) {
-                            self.handle_double_chord(chord);
-                        }
-                    }
-                    // Alt and a digit hand the picture to a program. The
-                    // digits belong to sorting under Ctrl, so the programs
-                    // take a modifier of their own rather than a gesture
-                    // that is already spoken for. Read from the physical key
-                    // for the same reason sorting is.
-                    Route::Program => {
-                        if let Some(digit) = digit_key(&event.physical_key) {
-                            self.open_in_program(Some(digit));
-                        }
-                    }
-                    // A digit sorts the file into a folder; Shift makes it a
-                    // copy. Asked of the physical key, because Ctrl+Shift+1
-                    // does not deliver the character "1" on any layout.
-                    Route::Chord => match digit_key(&event.physical_key) {
-                        Some(digit) => self.sort_current(digit, self.modifiers.shift_key()),
-                        None => self.handle_chord(&event.logical_key),
-                    },
-                    Route::Bare => self.handle_key(&event.logical_key, event_loop),
-                }
-            }
+            WindowEvent::KeyboardInput { event, .. } if event.state.is_pressed() && !claimed => self.key_pressed(&event, event_loop),
 
             // The loupe is the one key that does something on the way up: it
             // is held rather than toggled, so the release is what gives the
@@ -4440,6 +5135,8 @@ impl ApplicationHandler<Event> for App {
             WindowEvent::CursorMoved { position, .. } => {
                 let delta = ((position.x - self.cursor.x) as f32, (position.y - self.cursor.y) as f32);
                 self.cursor = position;
+                // Hidden for a slideshow, and back the moment it is reached for.
+                self.show_cursor();
                 // The toolbar comes back when the pointer reaches for it. egui
                 // lays out in logical points, so the reveal band is measured
                 // there too — on a scaled display the physical pixel count
@@ -5220,6 +5917,8 @@ mod tests {
             Key::Named(NamedKey::Space),
             Key::Named(NamedKey::F11),
             Key::Named(NamedKey::Escape),
+            Key::Named(NamedKey::ArrowUp),
+            Key::Named(NamedKey::ArrowDown),
             Key::Character("0".into()),
             Key::Character("1".into()),
             Key::Character("+".into()),
@@ -5583,5 +6282,79 @@ mod tests {
         let due = display_watch_deadline(true, Some(checked), now).expect("an HDR surface should be watched");
         assert_eq!(due, checked + DISPLAY_WATCH_INTERVAL);
         assert!(due > now, "the deadline is in the past, so the loop would spin");
+    }
+
+    /// `D` walks the other displays one by one and then turns the picture
+    /// off; with two displays that is a toggle.
+    #[test]
+    fn the_display_key_walks_the_other_displays_then_turns_off() {
+        // Two displays: the window's, and one other.
+        let one = ["tv"];
+        assert_eq!(next_display(&one, None), Some("tv"));
+        assert_eq!(next_display(&one, Some(&"tv")), None, "a second press did not turn it off");
+
+        // Three: each in turn, then off.
+        let two = ["tv", "projector"];
+        assert_eq!(next_display(&two, None), Some("tv"));
+        assert_eq!(next_display(&two, Some(&"tv")), Some("projector"));
+        assert_eq!(next_display(&two, Some(&"projector")), None);
+
+        // One display: nothing to show it on.
+        let none: [&str; 0] = [];
+        assert_eq!(next_display(&none, None), None);
+
+        // Showing on a display that is not among the others any more — the
+        // window was dragged onto it — starts again from the first.
+        assert_eq!(next_display(&two, Some(&"laptop")), Some("tv"));
+        assert_eq!(next_display(&none, Some(&"laptop")), None);
+    }
+
+    /// The other display draws only when what it shows changed: the same
+    /// shot twice asks for nothing, and each part of it is noticed.
+    #[test]
+    fn the_other_display_notices_every_part_of_what_it_shows() {
+        let view = View::new((4000, 3000), (1920, 1080), 1.0);
+        let pane = Planned {
+            slot: Slot::Main,
+            rect: (0, 0, 1920, 1080),
+            view,
+            orientation: Orientation::Normal,
+        };
+        let shot = |generation, size, pane| Shot {
+            generation,
+            size,
+            panes: vec![pane],
+        };
+        let base = shot(1, (1920, 1080), pane);
+        assert!(base == shot(1, (1920, 1080), pane), "an unchanged shot asked for a frame");
+
+        let mut zoomed = view;
+        zoomed.zoom_at(1.0, (100.0, 100.0));
+        let mut panned = view;
+        panned.zoom_at(10.0, (960.0, 540.0));
+        let mut panned_too = panned;
+        panned_too.pan((40.0, 40.0));
+        assert!(base != shot(2, (1920, 1080), pane), "a new picture went unnoticed");
+        assert!(base != shot(1, (3840, 2160), pane), "a new size went unnoticed");
+        assert!(base != shot(1, (1920, 1080), Planned { view: zoomed, ..pane }), "a zoom went unnoticed");
+        assert!(
+            shot(1, (1920, 1080), Planned { view: panned, ..pane }) != shot(1, (1920, 1080), Planned { view: panned_too, ..pane }),
+            "a pan went unnoticed"
+        );
+        assert!(
+            base != shot(
+                1,
+                (1920, 1080),
+                Planned {
+                    orientation: Orientation::Rotate90,
+                    ..pane
+                }
+            ),
+            "a turn went unnoticed"
+        );
+        assert!(
+            base != shot(1, (1920, 1080), Planned { slot: Slot::Pinned, ..pane }),
+            "a blink flipping went unnoticed"
+        );
     }
 }

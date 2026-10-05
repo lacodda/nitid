@@ -256,6 +256,12 @@ impl Player {
         &self.animation.frames[self.index].image
     }
 
+    /// How long one pass through every frame takes: what a slideshow lets an
+    /// animation finish before it moves on.
+    pub fn cycle(&self) -> Duration {
+        self.animation.frames.iter().map(|frame| frame.delay).sum()
+    }
+
     /// Where playback stands, for the title: frame number (from one) and count.
     pub fn position(&self) -> (usize, usize) {
         (self.index + 1, self.animation.frames.len())
@@ -374,5 +380,15 @@ mod tests {
         assert_eq!(normalise_delay(Duration::ZERO), DELAY_DEFAULT);
         assert_eq!(normalise_delay(Duration::from_millis(10)), DELAY_DEFAULT);
         assert_eq!(normalise_delay(Duration::from_millis(11)), Duration::from_millis(11));
+    }
+
+    /// A cycle is every frame's delay once, whichever frame is up.
+    #[test]
+    fn a_cycle_is_every_frame_once() {
+        let start = Instant::now();
+        let mut player = Player::new(animation(&[100, 300, 50]), start);
+        assert_eq!(player.cycle(), Duration::from_millis(450));
+        player.advance_to(start + Duration::from_millis(100));
+        assert_eq!(player.cycle(), Duration::from_millis(450), "the cycle depended on the frame that was up");
     }
 }

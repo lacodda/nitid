@@ -1,4 +1,4 @@
-//! The GPU side: device, swapchain, and the single pass that draws the image.
+//! The GPU side: device, swapchains, and the single pass that draws the image.
 //!
 //! nitid configures its own surface rather than delegating to a GUI framework,
 //! because HDR output needs a surface format and colour space a framework
@@ -401,27 +401,109 @@ pub struct Pane<'a> {
     pub orientation: Orientation,
 }
 
-/// Device, surface, pipeline, and the texture being shown.
-pub struct Renderer {
+/// Which of the viewer's windows a call is about.
+///
+/// `Main` is the window with the chrome, the keyboard and the person at it.
+/// `Second` is the same picture on another display, for the people in front
+/// of that one — a television across the room, a projector. Each has its own
+/// swapchain on the one device; see
+/// `docs/adr/0032-a-second-display-is-a-second-swapchain-on-one-device.md`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Screen {
+    Main,
+    Second,
+}
+
+/// One window's swapchain: its surface, how it is configured, and what that
+/// configuration asks the shader to write.
+struct Swapchain {
     surface: wgpu::Surface<'static>,
+    config: wgpu::SurfaceConfiguration,
+    /// The format and colour space the swapchain is configured with. Two
+    /// screens can disagree — a television in HDR beside a laptop that is not
+    /// — which is why this belongs to the swapchain and not to the device.
+    output: Output,
+}
+
+impl Swapchain {
+    /// Configure `surface` for the display it is on, as that display is now.
+    fn new(surface: wgpu::Surface<'static>, adapter: &wgpu::Adapter, device: &wgpu::Device, size: (u32, u32)) -> (Self, Option<f32>) {
+        let capabilities = surface.get_capabilities(adapter);
+        let headroom = surface.display_hdr_info(adapter).tone_map_headroom();
+        let output = hdr::choose(&capabilities, headroom);
+        let config = configure(&capabilities, output, size);
+        surface.configure(device, &config);
+        (Self { surface, config, output }, headroom)
+    }
+
+    fn size(&self) -> (u32, u32) {
+        (self.config.width, self.config.height)
+    }
+
+    fn resize(&mut self, device: &wgpu::Device, size: (u32, u32)) {
+        if size.0 == 0 || size.1 == 0 || self.size() == size {
+            return;
+        }
+        self.config.width = size.0;
+        self.config.height = size.1;
+        self.surface.configure(device, &self.config);
+    }
+
+    /// Ask the display what it is doing now, and follow it. `Some` — with the
+    /// headroom the display reported — when the swapchain was reconfigured.
+    fn follow(&mut self, adapter: &wgpu::Adapter, device: &wgpu::Device) -> Option<Option<f32>> {
+        let capabilities = self.surface.get_capabilities(adapter);
+        let headroom = self.surface.display_hdr_info(adapter).tone_map_headroom();
+        let output = hdr::choose(&capabilities, headroom);
+        if output == self.output {
+            return None;
+        }
+        self.output = output;
+        self.config = configure(&capabilities, output, self.size());
+        self.surface.configure(device, &self.config);
+        Some(headroom)
+    }
+}
+
+/// Device, swapchains, and the pictures being shown.
+pub struct Renderer {
+    /// Kept so a second window can be given a surface of its own on the same
+    /// device: a surface comes from the instance, and a device from another
+    /// instance could not draw the pictures already resident on this one.
+    instance: wgpu::Instance,
     /// Kept so the display's live HDR state can be asked again: the Windows
     /// HDR toggle moves while the viewer is open, and both the query and the
     /// surface capabilities need the adapter.
     adapter: wgpu::Adapter,
+    pictures: Pictures,
+    main: Swapchain,
+    /// The other display's, while the picture is being shown there.
+    second: Option<Swapchain>,
+}
+
+/// Everything that draws a picture and does not depend on a window: the
+/// device, the pictures resident on it, and the viewing choices that apply to
+/// every screen.
+///
+/// Its own type so that a test can have one. A `Renderer` needs a window for
+/// its swapchain and nothing in the suite can hold a window, which is why
+/// `set_image` and the colour uniform's rewrite went untested for twenty
+/// versions — the gap `write_colour` used to confess. This needs a device and
+/// nothing else.
+struct Pictures {
     device: wgpu::Device,
     queue: wgpu::Queue,
-    config: wgpu::SurfaceConfiguration,
-    /// The format and colour space the swapchain is configured with, and what
-    /// the pipeline was built to write.
-    output: Output,
-    pipeline: wgpu::RenderPipeline,
-    /// Kept so the pipeline can be rebuilt when the surface format changes:
-    /// a render pipeline is bound to the format of the target it writes.
+    /// Kept so a pipeline can be built for a format that turns up later: a
+    /// render pipeline is bound to the format of the target it writes.
     shader: wgpu::ShaderModule,
     pipeline_layout: wgpu::PipelineLayout,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     curve_sampler: wgpu::Sampler,
+    /// One pipeline per target format in use, built the first time a screen
+    /// asks for it. Two screens can want two, and a format comes back when
+    /// HDR is switched off and on again, so they are kept rather than rebuilt.
+    pipelines: Vec<(wgpu::TextureFormat, wgpu::RenderPipeline)>,
     /// What shows through a transparent pixel. It outlives any one image and
     /// has to be restated whenever a picture's uniform is rewritten.
     backdrop: Backdrop,
@@ -448,6 +530,27 @@ pub struct Renderer {
     main: Option<Resident>,
     /// The picture held beside it while two are compared.
     pinned: Option<Resident>,
+    /// The output every picture's colour uniform is written for right now.
+    ///
+    /// The uniform says how to encode for a surface, and two screens can have
+    /// two surfaces. Rather than a uniform per picture per screen, each one is
+    /// rewritten for the screen about to be drawn ([`encode_for`]), which is an
+    /// eighty-byte write and only happens when the screens differ. The order is
+    /// what makes it right: a queued write lands before the submit that
+    /// follows it, so each screen's frame reads the encoding written for it.
+    ///
+    /// [`encode_for`]: Self::encode_for
+    encoded_for: Output,
+    /// Counts changes to what the pictures look like: a new picture, a new
+    /// frame of an animation, another backdrop. Not a change of encoding,
+    /// which is how a picture is written to one screen rather than what it
+    /// is — counting that would have the two screens ask each other for
+    /// frames for ever.
+    ///
+    /// The second screen draws only when this or its framing has moved, so a
+    /// television showing a still photograph costs nothing while the person at
+    /// the laptop hovers over the toolbar.
+    generation: u64,
 }
 
 /// Decide how an image is cut up, and refuse the result if it still would not
@@ -531,13 +634,293 @@ impl Renderer {
 
         crate::startup::milestone("device created");
 
-        let capabilities = surface.get_capabilities(&adapter);
-        let headroom = surface.display_hdr_info(&adapter).tone_map_headroom();
-        let output = hdr::choose(&capabilities, headroom);
-        report(output, headroom);
-        let config = configure(&capabilities, output, size);
-        surface.configure(&device, &config);
+        let (main, headroom) = Swapchain::new(surface, &adapter, &device, size);
+        report(main.output, headroom);
 
+        let mut pictures = Pictures::new(device, queue, wide_textures, main.output);
+        crate::startup::milestone("shader compiled");
+        // Built now rather than on the first frame, so the first frame is not
+        // the one that pays for it.
+        pictures.pipeline_for(main.output.format);
+
+        Ok(Self {
+            instance,
+            adapter,
+            pictures,
+            main,
+            second: None,
+        })
+    }
+
+    fn swapchain(&self, screen: Screen) -> Option<&Swapchain> {
+        match screen {
+            Screen::Main => Some(&self.main),
+            Screen::Second => self.second.as_ref(),
+        }
+    }
+
+    /// The drawing surface size in physical pixels. `None` for a second
+    /// screen that is not up.
+    pub fn size(&self, screen: Screen) -> Option<(u32, u32)> {
+        self.swapchain(screen).map(Swapchain::size)
+    }
+
+    /// What shows through a transparent pixel.
+    pub fn backdrop(&self) -> Backdrop {
+        self.pictures.backdrop
+    }
+
+    /// Change what shows through a transparent pixel.
+    ///
+    /// Only the uniform is rewritten: the pixels, the pipeline and the
+    /// textures are all untouched, so this costs one 32-byte write and the
+    /// redraw the caller was going to ask for anyway.
+    pub fn set_backdrop(&mut self, backdrop: Backdrop) {
+        self.pictures.set_backdrop(backdrop);
+    }
+
+    /// Whether the clipping zebra is showing.
+    pub fn zebra(&self) -> bool {
+        self.pictures.zebra
+    }
+
+    /// Move the lines the zebra judges by.
+    ///
+    /// Costs the same one uniform write the zebra itself does, so a
+    /// photographer can drag the threshold and watch the marking follow.
+    pub fn set_thresholds(&mut self, thresholds: Thresholds) {
+        self.pictures.set_thresholds(thresholds);
+    }
+
+    /// Show or hide the clipping zebra.
+    ///
+    /// Costs the same as the backdrop does — one uniform write — because the
+    /// marking happens in the shader that was going to run anyway. Nothing is
+    /// re-decoded and no pixels are touched, which is what lets it be turned
+    /// on to check a highlight and off again without a pause.
+    pub fn set_zebra(&mut self, zebra: bool) {
+        self.pictures.set_zebra(zebra);
+    }
+
+    /// Point an existing interface layer at the main surface as it is now.
+    ///
+    /// Called after `follow_display` reports a change: the layer's compositing
+    /// pipeline is bound to the format it writes, exactly like the image one.
+    pub fn follow_interface(&self, overlay: &mut Overlay) {
+        overlay.follow_surface(&self.pictures.device, &self.pictures.queue, self.main.output);
+    }
+
+    /// Build the interface layer for this device and the main surface.
+    ///
+    /// Handed out rather than held here because the interface belongs to the
+    /// application — what it draws is the viewer's business, and this module's
+    /// business is only that it reaches the screen correctly encoded. Only the
+    /// main window has one: the other display shows the picture and nothing
+    /// else.
+    pub fn interface(&self) -> Overlay {
+        Overlay::new(&self.pictures.device, self.main.output, self.main.size())
+    }
+
+    /// Reconfigure a swapchain after its window changed size.
+    pub fn resize(&mut self, screen: Screen, size: (u32, u32)) {
+        let swapchain = match screen {
+            Screen::Main => &mut self.main,
+            Screen::Second => match self.second.as_mut() {
+                Some(second) => second,
+                None => return,
+            },
+        };
+        swapchain.resize(&self.pictures.device, size);
+    }
+
+    /// Whether a screen's surface is currently configured for high dynamic
+    /// range. False for a second screen that is not up.
+    ///
+    /// The viewer polls the display only in this state: it is the one that can
+    /// go stale without being announced, because turning HDR off in Windows
+    /// sends no event to anybody.
+    pub fn is_hdr(&self, screen: Screen) -> bool {
+        self.swapchain(screen).is_some_and(|swapchain| swapchain.output.is_hdr())
+    }
+
+    /// Ask a screen's display what it is doing now, and follow it.
+    ///
+    /// The HDR toggle in Windows moves while the viewer is open, and a window
+    /// dragged to another monitor lands on a display with its own answer. Both
+    /// arrive as ordinary window events rather than as anything the graphics
+    /// API announces, so the question is asked again at those moments instead
+    /// of being settled once at startup.
+    ///
+    /// Returns true when the swapchain was reconfigured, which is the caller's
+    /// cue to redraw: the frames already queued were encoded for the old
+    /// surface. The pictures' uniforms follow on that redraw, through the same
+    /// rewrite that serves two screens — `encode_for` sees the new output.
+    pub fn follow_display(&mut self, screen: Screen) -> bool {
+        let swapchain = match screen {
+            Screen::Main => &mut self.main,
+            Screen::Second => match self.second.as_mut() {
+                Some(second) => second,
+                None => return false,
+            },
+        };
+        let Some(headroom) = swapchain.follow(&self.adapter, &self.pictures.device) else {
+            return false;
+        };
+        if screen == Screen::Main {
+            report(swapchain.output, headroom);
+        }
+        true
+    }
+
+    /// Give another window a swapchain of its own on this device.
+    ///
+    /// The pictures are already resident here, so the other display shows
+    /// them without a second upload; only the surface is new, and it is
+    /// configured for its own display — which may be in HDR when the main one
+    /// is not.
+    pub fn open_second(&mut self, window: Arc<winit::window::Window>, size: (u32, u32)) -> Result<()> {
+        let surface = self
+            .instance
+            .create_surface(window)
+            .context("creating a drawing surface on the other display")?;
+        // A laptop with two graphics adapters can wire its external port to
+        // the one this device is not on. DXGI copies across on Windows, so
+        // this is not expected to refuse — but if it does, the answer is a
+        // message, not a swapchain the driver will reject on the first frame.
+        anyhow::ensure!(
+            self.adapter.is_surface_supported(&surface),
+            "the graphics adapter cannot draw to the other display"
+        );
+        let (second, _) = Swapchain::new(surface, &self.adapter, &self.pictures.device, size);
+        self.pictures.pipeline_for(second.output.format);
+        self.second = Some(second);
+        Ok(())
+    }
+
+    /// Let go of the other display's swapchain.
+    ///
+    /// Before its window goes: the surface is the window's, and a surface
+    /// outliving the window it draws into is a driver's undefined behaviour.
+    pub fn close_second(&mut self) {
+        self.second = None;
+    }
+
+    /// Upload a decoded image, replacing whatever was shown before.
+    ///
+    /// `transform` says how the image's colours reach the display. When it is
+    /// the identity the texture is created as sRGB and the hardware does the
+    /// decoding for free; when a real conversion is needed the raw values are
+    /// uploaded instead, because the shader has to apply the image's own tone
+    /// curves rather than assume sRGB.
+    pub fn set_image(&mut self, image: &DecodedImage, transform: &ColorTransform) {
+        self.pictures.set_image(image, transform);
+    }
+
+    /// Put a picture beside the main one, for a comparison.
+    pub fn set_pinned(&mut self, image: &DecodedImage, transform: &ColorTransform) {
+        self.pictures.set_pinned(image, transform);
+    }
+
+    /// Hold the picture that is up as the pinned one, and leave the main slot
+    /// empty for the next.
+    ///
+    /// A move rather than a second upload: the textures, the curves and the
+    /// colour state are already on the GPU and are exactly what the pinned
+    /// picture needs, so pinning a sixty-megapixel photograph costs nothing
+    /// at all rather than a full copy of it.
+    pub fn pin_main(&mut self) {
+        self.pictures.pin_main();
+    }
+
+    /// Let go of the pinned picture.
+    pub fn unpin(&mut self) {
+        self.pictures.unpin();
+    }
+
+    /// Write new pixels into the texture already on screen — the frame tick
+    /// of an animation. See [`Pictures::update_pixels`].
+    pub fn update_pixels(&mut self, image: &DecodedImage) -> bool {
+        self.pictures.update_pixels(image)
+    }
+
+    /// Counts changes to what the pictures look like; see
+    /// [`Pictures::generation`].
+    pub fn generation(&self) -> u64 {
+        self.pictures.generation
+    }
+
+    /// Draw one frame on one screen.
+    ///
+    /// A lost or outdated swapchain is reconfigured and the frame skipped: the
+    /// next redraw request paints it. Out of memory is fatal and propagates.
+    /// Asking for a second screen that is not up draws nothing.
+    ///
+    /// `panes` says what goes where: one covering the window for a single
+    /// picture, two for a comparison, none for an empty window — which still
+    /// clears to the background, so the window is never a hole showing
+    /// whatever was behind it.
+    pub fn render(&mut self, screen: Screen, panes: &[Pane<'_>], interface: Option<Painted<'_>>) -> Result<()> {
+        let swapchain = match screen {
+            Screen::Main => &mut self.main,
+            Screen::Second => match self.second.as_mut() {
+                Some(second) => second,
+                None => return Ok(()),
+            },
+        };
+        let device = &self.pictures.device;
+        let frame = match swapchain.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(frame) => frame,
+            // Suboptimal still presents; reconfiguring restores the fast path
+            // for the frames after this one.
+            wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
+                swapchain.surface.configure(device, &swapchain.config);
+                frame
+            }
+            wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
+                swapchain.surface.configure(device, &swapchain.config);
+                return Ok(());
+            }
+            // Nothing is on screen to draw for, or the frame simply is not
+            // ready: skip it and wait for the next redraw request.
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded | wgpu::CurrentSurfaceTexture::Validation => return Ok(()),
+        };
+        let (size, output) = (swapchain.size(), swapchain.output);
+
+        let target = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self.pictures.draw_into(&target, size, output, panes);
+
+        // The interface goes into the same encoder, so it and the picture it
+        // sits on reach the screen in one frame rather than as two.
+        let extra = match interface {
+            Some(interface) => interface.layer.draw(
+                &self.pictures.device,
+                &self.pictures.queue,
+                &mut encoder,
+                &target,
+                overlay::Frame {
+                    jobs: interface.jobs,
+                    textures: interface.textures,
+                    pixels_per_point: interface.pixels_per_point,
+                },
+            ),
+            None => Vec::new(),
+        };
+
+        self.pictures.queue.submit(extra.into_iter().chain(std::iter::once(encoder.finish())));
+        self.pictures.queue.present(frame);
+        // The other display draws only when what it shows has changed, and
+        // the report is how that is counted rather than assumed.
+        if screen == Screen::Second {
+            crate::startup::milestone("other display presented");
+        }
+        Ok(())
+    }
+}
+
+impl Pictures {
+    /// Everything a picture is drawn with, on `device`, with the uniforms of
+    /// pictures to come written for `output`.
+    fn new(device: wgpu::Device, queue: wgpu::Queue, wide_textures: bool, output: Output) -> Self {
         let tile_limit = tile_limit(&device);
         let layout = bind_group_layout(&device);
 
@@ -551,10 +934,6 @@ impl Renderer {
             bind_group_layouts: &[Some(&layout)],
             immediate_size: 0,
         });
-
-        crate::startup::milestone("shader compiled");
-
-        let pipeline = build_pipeline(&device, &pipeline_layout, &shader, output.format);
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("nitid image sampler"),
@@ -580,19 +959,15 @@ impl Renderer {
             ..Default::default()
         });
 
-        Ok(Self {
-            surface,
-            adapter,
+        Self {
             device,
             queue,
-            config,
-            output,
-            pipeline,
             shader,
             pipeline_layout,
             layout,
             sampler,
             curve_sampler,
+            pipelines: Vec::new(),
             backdrop: Backdrop::default(),
             zebra: false,
             thresholds: Thresholds::default(),
@@ -600,189 +975,108 @@ impl Renderer {
             tile_limit,
             main: None,
             pinned: None,
-        })
+            encoded_for: output,
+            generation: 0,
+        }
     }
 
-    /// The drawing surface size in physical pixels.
-    pub fn size(&self) -> (u32, u32) {
-        (self.config.width, self.config.height)
+    /// The pipeline that writes `format`, built the first time it is asked
+    /// for. Returned as an index so the caller can go on borrowing the rest.
+    fn pipeline_for(&mut self, format: wgpu::TextureFormat) -> usize {
+        if let Some(index) = self.pipelines.iter().position(|(built, _)| *built == format) {
+            return index;
+        }
+        let pipeline = build_pipeline(&self.device, &self.pipeline_layout, &self.shader, format);
+        self.pipelines.push((format, pipeline));
+        self.pipelines.len() - 1
     }
 
-    /// What shows through a transparent pixel.
-    pub fn backdrop(&self) -> Backdrop {
-        self.backdrop
-    }
-
-    /// Change what shows through a transparent pixel.
-    ///
-    /// Only the uniform is rewritten: the pixels, the pipeline and the
-    /// textures are all untouched, so this costs one 32-byte write and the
-    /// redraw the caller was going to ask for anyway.
-    pub fn set_backdrop(&mut self, backdrop: Backdrop) {
+    fn set_backdrop(&mut self, backdrop: Backdrop) {
         if self.backdrop == backdrop {
             return;
         }
         self.backdrop = backdrop;
+        self.changed();
         self.write_colour();
     }
 
-    /// Whether the clipping zebra is showing.
-    pub fn zebra(&self) -> bool {
-        self.zebra
-    }
-
-    /// Move the lines the zebra judges by.
-    ///
-    /// Costs the same one uniform write the zebra itself does, so a
-    /// photographer can drag the threshold and watch the marking follow.
-    pub fn set_thresholds(&mut self, thresholds: Thresholds) {
+    fn set_thresholds(&mut self, thresholds: Thresholds) {
         if self.thresholds == thresholds {
             return;
         }
         self.thresholds = thresholds;
+        self.changed();
         self.write_colour();
     }
 
-    /// Show or hide the clipping zebra.
-    ///
-    /// Costs the same as the backdrop does — one uniform write — because the
-    /// marking happens in the shader that was going to run anyway. Nothing is
-    /// re-decoded and no pixels are touched, which is what lets it be turned
-    /// on to check a highlight and off again without a pause.
-    pub fn set_zebra(&mut self, zebra: bool) {
+    fn set_zebra(&mut self, zebra: bool) {
         if self.zebra == zebra {
             return;
         }
         self.zebra = zebra;
+        self.changed();
         self.write_colour();
     }
 
-    /// Restate the colour uniform from what the renderer currently holds.
+    /// What the pictures look like has changed; see `generation`.
+    fn changed(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// Restate the colour uniform from what is held now, for the output it is
+    /// written for.
     ///
     /// The one place that builds it for the live state, so a caller cannot
-    /// write a uniform that disagrees with the renderer's own fields.
-    ///
-    /// **Not covered by a test, and measured to be so.** Making this write the
-    /// default backdrop while `set_backdrop` still stored the choice passed
-    /// every test and the whole gate: the status line would say "white" and
-    /// the screen would stay dark. `Renderer` needs a window, so nothing in
-    /// the suite can hold one and ask it what it wrote — the same gap as
-    /// `set_image`, recorded in the hub's backlog since v0.15.0. Splitting the
-    /// build from the write was tried and changed nothing, because the split
-    /// half is still a method on a `Renderer` no test can build. What does
-    /// cover it is opening the viewer and pressing `B`, which is part of the
-    /// release checklist rather than of `cargo test`.
-    ///
-    /// Every picture that is up is rewritten, each from its own transform and
-    /// depth: a backdrop chosen while two are compared belongs to both panes.
+    /// write a uniform that disagrees with the fields here. Every picture
+    /// that is up is rewritten, each from its own transform and depth: a
+    /// backdrop chosen while two are compared belongs to both panes.
     fn write_colour(&self) {
         for resident in [self.main.as_ref(), self.pinned.as_ref()].into_iter().flatten() {
-            let uniform = ColourUniform::new(&resident.transform, self.output, resident.depth, self.backdrop, self.zebra, self.thresholds);
+            let uniform = ColourUniform::new(
+                &resident.transform,
+                self.encoded_for,
+                resident.depth,
+                self.backdrop,
+                self.zebra,
+                self.thresholds,
+            );
             self.queue.write_buffer(&resident.colour, 0, bytemuck::bytes_of(&uniform));
         }
     }
 
-    /// Point an existing interface layer at the surface as it is now.
+    /// Write every picture's uniform for `output`, if it is not already.
     ///
-    /// Called after `follow_display` reports a change: the layer's compositing
-    /// pipeline is bound to the format it writes, exactly like the image one.
-    pub fn follow_interface(&self, overlay: &mut Overlay) {
-        overlay.follow_surface(&self.device, &self.queue, self.output);
-    }
-
-    /// Build the interface layer for this device and surface.
-    ///
-    /// Handed out rather than held here because the interface belongs to the
-    /// application — what it draws is the viewer's business, and this module's
-    /// business is only that it reaches the screen correctly encoded.
-    pub fn interface(&self) -> Overlay {
-        Overlay::new(&self.device, self.output, self.size())
-    }
-
-    /// Reconfigure the swapchain after the window changed size.
-    pub fn resize(&mut self, size: (u32, u32)) {
-        if size.0 == 0 || size.1 == 0 || self.size() == size {
+    /// Called before each screen's frame is recorded. The same picture needs
+    /// a different encoding on an sRGB surface, on one the shader encodes
+    /// for, and on an HDR one; with two screens of two kinds, the uniform is
+    /// rewritten every time the screen being drawn changes kind, and not at
+    /// all while it does not.
+    fn encode_for(&mut self, output: Output) {
+        if self.encoded_for == output {
             return;
         }
-        self.config.width = size.0;
-        self.config.height = size.1;
-        self.surface.configure(&self.device, &self.config);
-    }
-
-    /// Whether the surface is currently configured for high dynamic range.
-    ///
-    /// The viewer polls the display only in this state: it is the one that can
-    /// go stale without being announced, because turning HDR off in Windows
-    /// sends no event to anybody.
-    pub fn is_hdr(&self) -> bool {
-        self.output.is_hdr()
-    }
-
-    /// Ask the display what it is doing now, and follow it.
-    ///
-    /// The HDR toggle in Windows moves while the viewer is open, and a window
-    /// dragged to another monitor lands on a display with its own answer. Both
-    /// arrive as ordinary window events rather than as anything the graphics
-    /// API announces, so the question is asked again at those moments instead
-    /// of being settled once at startup.
-    ///
-    /// Returns true when the swapchain was reconfigured, which is the caller's
-    /// cue to redraw: the frames already queued were encoded for the old
-    /// surface.
-    pub fn follow_display(&mut self) -> bool {
-        let capabilities = self.surface.get_capabilities(&self.adapter);
-        let headroom = self.surface.display_hdr_info(&self.adapter).tone_map_headroom();
-        let output = hdr::choose(&capabilities, headroom);
-        if output == self.output {
-            return false;
-        }
-
-        report(output, headroom);
-        self.output = output;
-        self.config = configure(&capabilities, output, (self.config.width, self.config.height));
-        self.surface.configure(&self.device, &self.config);
-        // A pipeline is built against the format it writes, so the format
-        // changing means this one no longer applies.
-        self.pipeline = build_pipeline(&self.device, &self.pipeline_layout, &self.shader, output.format);
-        // The picture on screen was encoded for the surface that just went
-        // away; the uniform says how, so it is rewritten for the new one —
-        // through the same call the backdrop uses, so the two cannot come to
-        // disagree about what the live state is. `self.output` is already the
-        // new surface by here.
+        self.encoded_for = output;
         self.write_colour();
-        true
     }
 
-    /// Upload a decoded image, replacing whatever was shown before.
-    ///
-    /// `transform` says how the image's colours reach the display. When it is
-    /// the identity the texture is created as sRGB and the hardware does the
-    /// decoding for free; when a real conversion is needed the raw values are
-    /// uploaded instead, because the shader has to apply the image's own tone
-    /// curves rather than assume sRGB.
-    pub fn set_image(&mut self, image: &DecodedImage, transform: &ColorTransform) {
+    fn set_image(&mut self, image: &DecodedImage, transform: &ColorTransform) {
         self.main = self.resident(image, transform);
+        self.changed();
     }
 
-    /// Put a picture beside the main one, for a comparison.
-    pub fn set_pinned(&mut self, image: &DecodedImage, transform: &ColorTransform) {
+    fn set_pinned(&mut self, image: &DecodedImage, transform: &ColorTransform) {
         self.pinned = self.resident(image, transform);
+        self.changed();
     }
 
-    /// Hold the picture that is up as the pinned one, and leave the main slot
-    /// empty for the next.
-    ///
-    /// A move rather than a second upload: the textures, the curves and the
-    /// colour state are already on the GPU and are exactly what the pinned
-    /// picture needs, so pinning a sixty-megapixel photograph costs nothing
-    /// at all rather than a full copy of it.
-    pub fn pin_main(&mut self) {
+    fn pin_main(&mut self) {
         self.pinned = self.main.take();
+        self.changed();
     }
 
-    /// Let go of the pinned picture.
-    pub fn unpin(&mut self) {
+    fn unpin(&mut self) {
         self.pinned = None;
+        self.changed();
     }
 
     /// Build everything one picture needs on the GPU.
@@ -853,7 +1147,14 @@ impl Renderer {
         let curves_view = curves.create_view(&wgpu::TextureViewDescriptor::default());
         let colour = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("nitid colour"),
-            contents: bytemuck::bytes_of(&ColourUniform::new(transform, self.output, depth, self.backdrop, self.zebra, self.thresholds)),
+            contents: bytemuck::bytes_of(&ColourUniform::new(
+                transform,
+                self.encoded_for,
+                depth,
+                self.backdrop,
+                self.zebra,
+                self.thresholds,
+            )),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -963,7 +1264,7 @@ impl Renderer {
     /// the full `set_image`. False when nothing is up yet or the size does
     /// not match, in which case the caller's picture is wrong enough that a
     /// full `set_image` is the answer.
-    pub fn update_pixels(&mut self, image: &DecodedImage) -> bool {
+    fn update_pixels(&mut self, image: &DecodedImage) -> bool {
         let Some(upload) = &self.main else {
             return false;
         };
@@ -1006,6 +1307,7 @@ impl Renderer {
                 extent,
             );
         }
+        self.changed();
         true
     }
 
@@ -1029,68 +1331,22 @@ impl Renderer {
         );
     }
 
-    /// Draw one frame.
-    ///
-    /// A lost or outdated swapchain is reconfigured and the frame skipped: the
-    /// next redraw request paints it. Out of memory is fatal and propagates.
-    ///
-    /// `panes` says what goes where: one covering the window for a single
-    /// picture, two for a comparison, none for an empty window — which still
-    /// clears to the background, so the window is never a hole showing
-    /// whatever was behind it.
-    pub fn render(&mut self, panes: &[Pane<'_>], interface: Option<Painted<'_>>) -> Result<()> {
-        let frame = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(frame) => frame,
-            // Suboptimal still presents; reconfiguring restores the fast path
-            // for the frames after this one.
-            wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
-                self.surface.configure(&self.device, &self.config);
-                frame
-            }
-            wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
-                self.surface.configure(&self.device, &self.config);
-                return Ok(());
-            }
-            // Nothing is on screen to draw for, or the frame simply is not
-            // ready: skip it and wait for the next redraw request.
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded | wgpu::CurrentSurfaceTexture::Validation => return Ok(()),
-        };
-
-        let target = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = self.draw_into(&target, self.size(), panes);
-
-        // The interface goes into the same encoder, so it and the picture it
-        // sits on reach the screen in one frame rather than as two.
-        let extra = match interface {
-            Some(interface) => interface.layer.draw(
-                &self.device,
-                &self.queue,
-                &mut encoder,
-                &target,
-                overlay::Frame {
-                    jobs: interface.jobs,
-                    textures: interface.textures,
-                    pixels_per_point: interface.pixels_per_point,
-                },
-            ),
-            None => Vec::new(),
-        };
-
-        self.queue.submit(extra.into_iter().chain(std::iter::once(encoder.finish())));
-        self.queue.present(frame);
-        Ok(())
-    }
-
-    /// Record the image pass into a fresh encoder, drawing onto `target`.
+    /// Record the image pass for one screen into a fresh encoder, drawing onto
+    /// `target`, which is `size` pixels and wants `output`.
     ///
     /// Split out of `render` so a test can point the same code at a texture it
     /// reads back: the swapchain is the one thing an offscreen test cannot
     /// have, and everything worth checking — where each tile lands, what it
-    /// samples, how many draws it takes — is on this side of that line.
-    fn draw_into(&self, target: &wgpu::TextureView, size: (u32, u32), panes: &[Pane<'_>]) -> wgpu::CommandEncoder {
+    /// samples, how it is encoded for this screen — is on this side of that
+    /// line.
+    fn draw_into(&mut self, target: &wgpu::TextureView, size: (u32, u32), output: Output, panes: &[Pane<'_>]) -> wgpu::CommandEncoder {
+        self.encode_for(output);
+        let pipeline = self.pipeline_for(output.format);
+
         // Each picture's placement is written for the pane it is drawn in.
         // A tile has one placement buffer, so a picture can be in one pane of
-        // a frame and no more — which is all a comparison ever asks for.
+        // a frame and no more — which is all a comparison ever asks for. Two
+        // screens are two frames, each submitted before the next is written.
         debug_assert!(
             panes
                 .iter()
@@ -1130,7 +1386,7 @@ impl Renderer {
                 multiview_mask: None,
             });
 
-            pass.set_pipeline(&self.pipeline);
+            pass.set_pipeline(&self.pipelines[pipeline].1);
             for pane in panes {
                 if let Some(resident) = self.resident_in(pane.slot) {
                     draw_pane(&mut pass, pane.rect, size, resident.tiles.iter().map(|piece| &piece.bind_group));
@@ -3085,5 +3341,179 @@ mod tests {
         assert_eq!(tile_limit(&device), device_limit);
 
         unsafe { std::env::remove_var("NITID_TILE_LIMIT") };
+    }
+
+    /// A `Pictures` on whatever adapter the machine has, with nothing up and
+    /// uniforms written for `output` — what a renderer holds, without the
+    /// window a renderer needs.
+    fn headless(output: Output) -> Option<Pictures> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()?;
+        Some(Pictures::new(device, queue, false, output))
+    }
+
+    /// Draw the picture `pictures` has up onto a fresh one-row target that
+    /// wants `output`, through `draw_into` — the code a screen's frame runs —
+    /// and read back what landed, as stored: encoded on a plain surface,
+    /// linear light on the others.
+    fn draw_screen(pictures: &mut Pictures, output: Output, width: u32) -> Option<Vec<[f32; 4]>> {
+        let size = pictures.main.as_ref()?.size;
+        let view = View::new(size, (width, 1), 1.0);
+        let pane = Pane {
+            slot: Slot::Main,
+            rect: (0, 0, width, 1),
+            view: &view,
+            orientation: Orientation::Normal,
+        };
+        let extent = wgpu::Extent3d {
+            width,
+            height: 1,
+            depth_or_array_layers: 1,
+        };
+        let target = pictures.device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: output.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        let stride = if output.format == wgpu::TextureFormat::Rgba16Float { 8 } else { 4 };
+        let row_bytes = (width * stride).next_multiple_of(256);
+        let readback = pictures.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: u64::from(row_bytes),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = pictures.draw_into(&target_view, (width, 1), output, &[pane]);
+        encoder.copy_texture_to_buffer(
+            target.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row_bytes),
+                    rows_per_image: Some(1),
+                },
+            },
+            extent,
+        );
+        pictures.queue.submit(Some(encoder.finish()));
+        readback.map_async(wgpu::MapMode::Read, .., |_| {});
+        pictures
+            .device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            })
+            .ok()?;
+        let bytes = readback.slice(..).get_mapped_range().ok()?.to_vec();
+        Some(
+            (0..width as usize)
+                .map(|x| {
+                    let at = x * stride as usize;
+                    match output.format {
+                        wgpu::TextureFormat::Rgba16Float => {
+                            let halves: &[half::f16] = bytemuck::cast_slice(&bytes[at..at + 8]);
+                            [halves[0].to_f32(), halves[1].to_f32(), halves[2].to_f32(), halves[3].to_f32()]
+                        }
+                        format if format.is_srgb() => std::array::from_fn(|index| {
+                            let value = f32::from(bytes[at + index]) / 255.0;
+                            if index == 3 { value } else { srgb_to_linear(value) }
+                        }),
+                        _ => std::array::from_fn(|index| f32::from(bytes[at + index]) / 255.0),
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    fn grey(level: u8, width: u32) -> DecodedImage {
+        DecodedImage {
+            width,
+            height: 1,
+            depth: Depth::Eight,
+            pixels: [level, level, level, 255].repeat(width as usize),
+        }
+    }
+
+    /// One picture, two screens of two kinds, drawn in turn: each frame has
+    /// to be encoded for its own screen.
+    ///
+    /// The plain surface is the one where getting it wrong shows: the shader
+    /// encodes for it and the hardware encodes for an sRGB one, so a uniform
+    /// left over from the other screen either encodes twice or not at all.
+    /// Drawn sRGB, plain, sRGB: the last is what a laptop gets after the
+    /// television's frame, and it must not carry the television's encoding.
+    #[test]
+    fn a_picture_drawn_for_two_screens_is_encoded_for_each() {
+        let Some(mut pictures) = headless(srgb_surface()) else {
+            eprintln!("skipping: no device here");
+            return;
+        };
+        pictures.set_image(&grey(128, 4), &ColorTransform::identity());
+
+        let light = srgb_to_linear(128.0 / 255.0);
+        let first = draw_screen(&mut pictures, srgb_surface(), 4).expect("a frame for the sRGB screen");
+        let plain = draw_screen(&mut pictures, plain_surface(), 4).expect("a frame for the plain screen");
+        let again = draw_screen(&mut pictures, srgb_surface(), 4).expect("a second frame for the sRGB screen");
+
+        for (pixel, plain) in first.iter().zip(&plain) {
+            assert!((red_of(*pixel) - light).abs() < 0.01, "the sRGB screen showed {pixel:?}, not mid grey");
+            // Stored encoded on the plain surface, so decoded here to compare.
+            let shown = srgb_to_linear(red_of(*plain));
+            assert!((shown - light).abs() < 0.01, "the plain screen showed {shown}, not mid grey ({light})");
+        }
+        assert_eq!(first, again, "the sRGB screen's second frame was encoded for the other screen");
+    }
+
+    /// Writing a picture for another screen is not a change to the picture.
+    ///
+    /// The second screen redraws when the count moves, so a count that moved
+    /// on every re-encoding would have the two screens asking each other for
+    /// frames for as long as both are up — the idle promise spent on a
+    /// television showing a still photograph.
+    #[test]
+    fn encoding_for_a_screen_is_not_a_change_to_the_picture() {
+        let Some(mut pictures) = headless(srgb_surface()) else {
+            eprintln!("skipping: no device here");
+            return;
+        };
+        pictures.set_image(&grey(200, 2), &ColorTransform::identity());
+        let before = pictures.generation;
+
+        draw_screen(&mut pictures, plain_surface(), 2);
+        draw_screen(&mut pictures, srgb_surface(), 2);
+        assert_eq!(pictures.generation, before, "drawing for another screen counted as a new picture");
+
+        // What does change the picture is counted.
+        pictures.set_backdrop(Backdrop::White);
+        assert_ne!(pictures.generation, before, "a new backdrop went unnoticed");
+        let after_backdrop = pictures.generation;
+        pictures.set_backdrop(Backdrop::White);
+        assert_eq!(pictures.generation, after_backdrop, "the same backdrop again counted as a change");
+        pictures.set_image(&grey(10, 2), &ColorTransform::identity());
+        assert_ne!(pictures.generation, after_backdrop, "a new picture went unnoticed");
+    }
+
+    /// A pipeline per format, built once: the second screen in HDR and the
+    /// laptop in SDR each get theirs, and switching back reuses the first.
+    #[test]
+    fn a_pipeline_is_built_once_per_format() {
+        let Some(mut pictures) = headless(srgb_surface()) else {
+            eprintln!("skipping: no device here");
+            return;
+        };
+        let srgb = pictures.pipeline_for(srgb_surface().format);
+        let hdr = pictures.pipeline_for(hdr_surface().format);
+        assert_ne!(srgb, hdr);
+        assert_eq!(pictures.pipeline_for(srgb_surface().format), srgb);
+        assert_eq!(pictures.pipelines.len(), 2);
     }
 }

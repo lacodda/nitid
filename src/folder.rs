@@ -212,6 +212,34 @@ impl Folder {
         }
     }
 
+    /// The pictures the arrow keys walk, in the folder's order: the whole
+    /// listing, or what the filter admits of it.
+    ///
+    /// What a shuffled slideshow deals a round from, so that a show started
+    /// with the filter up shows the marked pictures and nothing else — the same
+    /// answer to "what am I browsing" the arrow keys give.
+    pub fn walked(&self) -> Vec<PathBuf> {
+        match &self.shown {
+            Some(shown) => shown.iter().map(|&index| self.entries[index].clone()).collect(),
+            None => self.entries.clone(),
+        }
+    }
+
+    /// Whether the arrow keys could land on `path` now: still listed, and
+    /// admitted by the filter if one is up.
+    ///
+    /// Asked of a picture a shuffle dealt some time ago, which may have been
+    /// deleted, moved or filtered out since.
+    pub fn walks(&self, path: &Path) -> bool {
+        let Some(index) = self.entries.iter().position(|entry| entry == path) else {
+            return false;
+        };
+        match &self.shown {
+            Some(shown) => shown.binary_search(&index).is_ok(),
+            None => true,
+        }
+    }
+
     /// The current image and `radius` neighbours either side of it.
     ///
     /// Wraps like the navigation does, so the last image of a folder counts
@@ -904,5 +932,28 @@ mod tests {
         assert_eq!(folder.current().file_name().unwrap(), "c.png");
         assert_eq!(folder.position(), 0, "the surviving picture did not read as the first of the walk");
         assert!(folder.next().is_none(), "a walk of one picture reported somewhere to go");
+    }
+
+    /// A shuffle deals from what the arrow keys walk and lands only where
+    /// they could: a filter narrows both, and a file that went is in neither.
+    #[test]
+    fn a_shuffle_is_told_what_the_arrow_keys_walk() {
+        let (dir, _) = folder_with(&["a.png", "b.png", "c.png", "d.png"]);
+        let mut folder = Folder::open(&dir.path().join("a.png"), Order::Name, true).unwrap();
+        let name = |path: &PathBuf| path.file_name().unwrap().to_string_lossy().into_owned();
+
+        assert_eq!(folder.walked().iter().map(name).collect::<Vec<_>>(), ["a.png", "b.png", "c.png", "d.png"]);
+        assert!(folder.walks(&dir.path().join("c.png")));
+
+        folder.show_only(named(&["b.png", "d.png"]));
+        assert_eq!(folder.walked().iter().map(name).collect::<Vec<_>>(), ["b.png", "d.png"]);
+        assert!(!folder.walks(&dir.path().join("c.png")), "a picture the filter leaves out was walkable");
+        assert!(folder.walks(&dir.path().join("d.png")));
+
+        folder.show_all();
+        folder.go_to(&dir.path().join("c.png"));
+        folder.remove_current();
+        assert!(!folder.walks(&dir.path().join("c.png")), "a removed picture was walkable");
+        assert!(!folder.walks(&dir.path().join("never-there.png")));
     }
 }

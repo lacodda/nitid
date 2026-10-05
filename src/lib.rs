@@ -48,6 +48,7 @@ mod scrub;
 // compile.
 #[cfg(windows)]
 mod single;
+mod slideshow;
 mod startup;
 mod theme;
 mod tiles;

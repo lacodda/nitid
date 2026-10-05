@@ -135,6 +135,22 @@ pub struct Status {
     pub filtered: bool,
     /// The comparison, while two pictures are up.
     pub compared: Option<Compared>,
+    /// The slideshow, while one runs.
+    pub slideshow: Option<Showing>,
+    /// Whether the picture is on another display as well.
+    ///
+    /// Said at the laptop because nothing else there says it: the television
+    /// is behind the person reading the status line.
+    pub presenting: bool,
+}
+
+/// What the status line says about a slideshow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Showing {
+    pub shuffled: bool,
+    pub paused: bool,
+    /// Seconds a picture.
+    pub interval: u32,
 }
 
 /// What the interface says about a comparison, worked out by the application.
@@ -384,6 +400,7 @@ pub enum Section {
     Gestures,
     Appearance,
     Opening,
+    Slideshow,
     Tools,
     Sending,
     Files,
@@ -392,10 +409,11 @@ pub enum Section {
 
 impl Section {
     /// The sections down the left of the dialog, in the order they are shown.
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::Gestures,
         Self::Appearance,
         Self::Opening,
+        Self::Slideshow,
         Self::Tools,
         Self::Sending,
         Self::Files,
@@ -408,6 +426,7 @@ impl Section {
             Self::Gestures => "Gestures",
             Self::Appearance => "View",
             Self::Opening => "Opening",
+            Self::Slideshow => "Slideshow",
             Self::Tools => "Colour",
             Self::Sending => "Sending",
             Self::Files => "Files",
@@ -953,6 +972,9 @@ impl Interface {
             )
             // The box itself, and every keystroke in it.
             + &format!("|{:?}", self.renaming)
+            // A show starting, pausing, changing pace or order, and the other
+            // display coming and going.
+            + &format!("|{:?}|{}", status.slideshow, status.presenting)
             // The crop box, rounded to a tenth of a point. This is what makes
             // a crop drag ask for frames: nothing else in the digest moves
             // while the box is dragged, so without it the box would be drawn
@@ -1363,6 +1385,25 @@ fn status_line(ui: &mut egui::Ui, status: &Status) -> Option<Action> {
                 // the file name changes length.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(monospace(format!("{:.0}%", status.scale * 100.0)));
+                    // A show changes what the window does by itself, so it
+                    // says so — and what pace it is going at, which is the
+                    // one thing about it a person adjusts.
+                    if let Some(show) = status.slideshow {
+                        separator(ui);
+                        let pace = crate::slideshow::interval_text(show.interval);
+                        let word = match (show.paused, show.shuffled) {
+                            (true, _) => "slideshow paused".to_string(),
+                            (false, false) => format!("slideshow · {pace}"),
+                            (false, true) => format!("shuffled · {pace}"),
+                        };
+                        ui.label(egui::RichText::new(word).strong())
+                            .on_hover_text("A slideshow  (Space pauses, ↑ ↓ change the pace, Esc stops)");
+                    }
+                    if status.presenting {
+                        separator(ui);
+                        ui.label(egui::RichText::new("on the other display").strong())
+                            .on_hover_text("The picture is on another display too  (D for the next one or to stop)");
+                    }
                     // A comparison changes what the arrow keys and the zoom
                     // do, so it says so where the zoom is read.
                     if let Some(compared) = &status.compared {
@@ -2495,6 +2536,7 @@ fn settings_dialog(ui: &mut egui::Ui, config: &mut Config, section: &mut Section
                                 Section::Programs => programs_section(ui, &mut config.programs),
                                 Section::Appearance => appearance_section(ui, &mut config.appearance),
                                 Section::Opening => opening_section(ui, &mut config.behaviour),
+                                Section::Slideshow => slideshow_section(ui, &mut config.slideshow),
                                 Section::Tools => tools_section(ui, &mut config.tools),
                                 Section::Sending => sending_section(ui, &mut config.sending),
                             };
@@ -2738,6 +2780,69 @@ fn opening_section(ui: &mut egui::Ui, behaviour: &mut Behaviour) -> bool {
     edited
 }
 
+/// How a slideshow runs, and where the other display is explained.
+fn slideshow_section(ui: &mut egui::Ui, slideshow: &mut crate::config::Slideshow) -> bool {
+    let mut edited = false;
+
+    ui.label(egui::RichText::new("Slideshow").strong());
+    ui.add_space(6.0);
+    ui.label("Each picture stays up for");
+    // Logarithmic, because the difference between two seconds and four is the
+    // difference a person feels, and between eight minutes and ten it is not.
+    edited |= ui
+        .add(
+            egui::Slider::new(&mut slideshow.interval, crate::slideshow::MIN_INTERVAL..=crate::slideshow::MAX_INTERVAL)
+                .logarithmic(true)
+                .custom_formatter(|value, _| crate::slideshow::interval_text(value.round() as u32))
+                .custom_parser(seconds_from),
+        )
+        .changed();
+    ui.label(
+        egui::RichText::new("S shows the folder in order and Shift+S in a random one. During a show Space pauses, and ↑ ↓ change this.")
+            .weak()
+            .small(),
+    );
+    ui.add_space(4.0);
+    ui.label(
+        egui::RichText::new("The time starts once a picture is whole on screen, and an animation plays one whole cycle, up to a minute.")
+            .weak()
+            .small(),
+    );
+
+    ui.add_space(10.0);
+    ui.label(egui::RichText::new("Another display").strong());
+    ui.add_space(2.0);
+    ui.label(
+        egui::RichText::new(
+            "D puts the picture on another display as well — a television, a projector — and leaves this window as it is. D again moves it to the next display, and after the last takes it away.",
+        )
+        .weak()
+        .small(),
+    );
+
+    edited
+}
+
+/// An interval typed into the slider: "45", "45 s", "2 min", "1 min 30 s".
+fn seconds_from(text: &str) -> Option<f64> {
+    let mut seconds = 0.0;
+    let mut number = None;
+    for word in text.split_whitespace() {
+        match word {
+            "s" | "sec" => seconds += number.take()?,
+            "m" | "min" => seconds += number.take()? * 60.0,
+            _ => {
+                if number.is_some() {
+                    return None;
+                }
+                number = Some(word.trim_end_matches('s').parse::<f64>().ok()?);
+            }
+        }
+    }
+    let total = seconds + number.unwrap_or(0.0);
+    (total > 0.0).then_some(total)
+}
+
 /// The colour tools.
 /// What `Ctrl+Alt+C` makes of a picture before it goes on the clipboard.
 fn sending_section(ui: &mut egui::Ui, sending: &mut crate::config::Sending) -> bool {
@@ -2857,7 +2962,7 @@ fn separator_vertical(ui: &mut egui::Ui) {
 pub const KEYS: &[(&str, &str)] = &[
     ("← →", "previous / next image"),
     ("Home End", "first / last image"),
-    ("Space", "pause an animation, or the next image"),
+    ("Space", "pause a slideshow or an animation, or the next image"),
     ("Wheel", "zoom around the cursor, or step through the folder"),
     ("Ctrl+Wheel", "whichever of the two the bare wheel is not"),
     ("Drag", "pan"),
@@ -2879,6 +2984,10 @@ pub const KEYS: &[(&str, &str)] = &[
     ("V", "put the next one beside this one to compare; again to stop"),
     ("Shift+V", "compare them by blinking one over the other"),
     ("Enter", "while comparing, pin the right-hand one and move on"),
+    ("S", "show the folder one picture after another; again to stop"),
+    ("Shift+S", "the same, in a random order"),
+    ("↑ ↓", "during a slideshow, longer / shorter on each picture"),
+    ("D", "show the picture on another display too; again for the next one or to stop"),
     ("Ctrl+X", "frame a crop; Enter saves it as a copy, Esc leaves it"),
     ("Ctrl+Drag", "drag the picture into another window"),
     ("Ctrl+C", "copy the picture"),
@@ -2899,7 +3008,10 @@ pub const KEYS: &[(&str, &str)] = &[
     ("F11", "full screen"),
     (",", "settings"),
     ("?", "this list"),
-    ("Esc", "leave a crop, a comparison or the settings; otherwise quit"),
+    (
+        "Esc",
+        "leave a crop, the settings, a comparison, a slideshow or the other display; otherwise quit",
+    ),
 ];
 
 /// What the toolbar is, said where a person looking for it would read it.
@@ -3317,6 +3429,8 @@ mod tests {
             mark: crate::cull::Mark::Unmarked,
             filtered: false,
             compared: None,
+            slideshow: None,
+            presenting: false,
         }
     }
 
@@ -4869,7 +4983,7 @@ mod tests {
 
         let mut seen = std::collections::BTreeSet::new();
         // The list sits at the left of a window centred in 900x600.
-        for y in (120..300).step_by(2) {
+        for y in (120..400).step_by(2) {
             for x in (230..340).step_by(4) {
                 let before = interface.section;
                 settings_frame(&mut interface, &mut config, Some(egui::pos2(x as f32, y as f32)));
@@ -5228,5 +5342,59 @@ mod tests {
             "an unchanged comparison asked for a frame"
         );
         assert!(interface.changed(&comparing(Layout::Blink, Which::Pinned)), "the flip was not seen");
+    }
+
+    /// What a person types into the interval box is read the way they would
+    /// say it.
+    #[test]
+    fn an_interval_is_read_the_way_it_is_written() {
+        assert_eq!(seconds_from("45"), Some(45.0));
+        assert_eq!(seconds_from("45 s"), Some(45.0));
+        assert_eq!(seconds_from("45s"), Some(45.0));
+        assert_eq!(seconds_from("2 min"), Some(120.0));
+        assert_eq!(seconds_from("1 min 30 s"), Some(90.0));
+        assert_eq!(seconds_from("soon"), None);
+        assert_eq!(seconds_from(""), None);
+        // What the slider writes, it reads back.
+        for seconds in crate::slideshow::INTERVALS {
+            assert_eq!(seconds_from(&crate::slideshow::interval_text(seconds)), Some(f64::from(seconds)));
+        }
+    }
+
+    /// A show and the other display are said in the status line, and each
+    /// change to them is a change worth drawing.
+    #[test]
+    fn a_slideshow_and_the_other_display_are_noticed() {
+        let mut interface = Interface::new();
+        let mut showing = status();
+        interface.changed(&showing);
+
+        showing.slideshow = Some(Showing {
+            shuffled: false,
+            paused: false,
+            interval: 5,
+        });
+        assert!(interface.changed(&showing), "a show starting went unnoticed");
+        showing.slideshow = Some(Showing {
+            shuffled: false,
+            paused: true,
+            interval: 5,
+        });
+        assert!(interface.changed(&showing), "a pause went unnoticed");
+        showing.slideshow = Some(Showing {
+            shuffled: false,
+            paused: true,
+            interval: 7,
+        });
+        assert!(interface.changed(&showing), "a new pace went unnoticed");
+        showing.presenting = true;
+        assert!(interface.changed(&showing), "the other display went unnoticed");
+
+        let words = words_on_screen(&showing);
+        assert!(words.contains("slideshow paused"), "the status line did not say the show is paused: {words}");
+        assert!(
+            words.contains("on the other display"),
+            "the status line did not say where else the picture is: {words}"
+        );
     }
 }

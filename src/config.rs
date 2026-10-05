@@ -379,6 +379,24 @@ impl Default for Tools {
     }
 }
 
+/// How a slideshow runs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Slideshow {
+    /// How long each picture stays up, in seconds.
+    ///
+    /// Whole seconds: nobody sets a slideshow to two and a half, and the
+    /// arrow keys walk a ladder of whole steps anyway.
+    pub interval: u32,
+}
+
+impl Default for Slideshow {
+    fn default() -> Self {
+        Self {
+            interval: crate::slideshow::DEFAULT_INTERVAL,
+        }
+    }
+}
+
 /// The zebra's default thresholds, matching what the shader judged on before
 /// they were adjustable: a whisker below the ends rather than exactly at them.
 pub const DEFAULT_CLIP_HIGH: f32 = 0.996;
@@ -473,6 +491,7 @@ pub struct Config {
     pub behaviour: Behaviour,
     pub tools: Tools,
     pub sending: Sending,
+    pub slideshow: Slideshow,
     pub sorting: Sorting,
     pub programs: Programs,
     /// Keys the file carried that this version does not know.
@@ -560,6 +579,15 @@ impl Config {
                 "wrap" => config.behaviour.wrap = value != "false",
                 "order" => config.behaviour.order = Order::parse(value).unwrap_or_default(),
 
+                // Held to what the settings offer: a file edited by hand to
+                // zero would show a picture for no time at all, which is a
+                // flicker rather than a show.
+                "slideshow_interval" => {
+                    if let Ok(seconds) = value.parse::<u32>() {
+                        config.slideshow.interval = seconds.clamp(crate::slideshow::MIN_INTERVAL, crate::slideshow::MAX_INTERVAL);
+                    }
+                }
+
                 "clip_high" => config.tools.clip_high = parse_fraction(value).unwrap_or(DEFAULT_CLIP_HIGH),
                 "clip_low" => config.tools.clip_low = parse_fraction(value).unwrap_or(DEFAULT_CLIP_LOW),
                 "units" => config.tools.units = Units::parse(value).unwrap_or_default(),
@@ -627,6 +655,8 @@ impl Config {
         out.push_str(&format!("hold_zoom = {}\n", self.behaviour.hold_zoom));
         out.push_str(&format!("wrap = {}\n", self.behaviour.wrap));
         out.push_str(&format!("order = {}\n", self.behaviour.order.render()));
+
+        out.push_str(&format!("slideshow_interval = {}\n", self.slideshow.interval));
 
         out.push_str(&format!("clip_high = {}\n", self.tools.clip_high));
         out.push_str(&format!("clip_low = {}\n", self.tools.clip_low));
@@ -799,6 +829,7 @@ mod tests {
             // Neither is the default: a round trip that carried the default
             // through would pass even if the key were never written at all.
             sending: Sending { budget_kb: 250, width: 1600 },
+            slideshow: Slideshow { interval: 45 },
             tools: Tools {
                 clip_high: 0.98,
                 clip_low: 0.02,
@@ -1009,5 +1040,18 @@ mod tests {
     fn the_modifier_always_offers_the_other_gesture() {
         assert_eq!(Wheel::Zoom.modified(), Wheel::Step);
         assert_eq!(Wheel::Step.modified(), Wheel::Zoom);
+    }
+
+    /// A hand-edited interval outside what the settings offer is held to the
+    /// nearest end, and nonsense leaves the default.
+    #[test]
+    fn a_slideshow_interval_is_held_to_what_the_settings_offer() {
+        assert_eq!(Config::parse("slideshow_interval = 0").slideshow.interval, crate::slideshow::MIN_INTERVAL);
+        assert_eq!(Config::parse("slideshow_interval = 86400").slideshow.interval, crate::slideshow::MAX_INTERVAL);
+        assert_eq!(
+            Config::parse("slideshow_interval = soon").slideshow.interval,
+            crate::slideshow::DEFAULT_INTERVAL
+        );
+        assert_eq!(Config::parse("slideshow_interval = 12").slideshow.interval, 12);
     }
 }
