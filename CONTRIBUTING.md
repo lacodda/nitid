@@ -20,7 +20,17 @@ platform's package manager.
 ## The gate
 
 `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test` is
-what CI runs; a green terminal here means a green pull request.
+what CI runs on Windows. CI runs the same lint on Linux too, where every
+`cfg(windows)` is false and code reached only from behind one is dead:
+
+```
+bash tools/check-linux.sh
+```
+
+lints for the Linux target from Windows - it needs
+`rustup target add x86_64-unknown-linux-gnu` and
+`rustup component add llvm-tools`, and says so if either is missing. With both
+green, a green terminal here means a green pull request.
 
 ## Architecture decisions
 

@@ -14,10 +14,6 @@ use anyhow::Result;
 
 use super::Every;
 
-/// The task's name, in the root of the Task Scheduler's library — where a
-/// person looking for it in the Task Scheduler window finds it first.
-const TASK: &str = "nitid wallpaper";
-
 /// Make the task, or remake it with a new interval. The first run is one
 /// interval from now: the picture was changed just before this is called.
 pub fn register(every: Every, program: &Path) -> Result<()> {
@@ -164,8 +160,13 @@ mod imp {
     use windows::Win32::System::Variant::VARIANT;
     use windows::core::{BSTR, HRESULT};
 
-    use super::TASK;
     use crate::wallpaper::Com;
+
+    /// The task's name, in the root of the Task Scheduler's library — where a
+    /// person looking for it in the Task Scheduler window finds it first.
+    /// Here rather than beside the XML because only this half names it: the
+    /// stand-in elsewhere has no library to look in.
+    const TASK: &str = "nitid wallpaper";
 
     /// The root of the Task Scheduler's library, with COM held for as long as
     /// it is. The fields drop in order: the folder before COM goes.
