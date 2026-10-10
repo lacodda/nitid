@@ -1734,7 +1734,9 @@ impl App {
             // Keys pressed with the television in front — someone clicked it —
             // do what they do at the laptop.
             WindowEvent::KeyboardInput { event, .. } if event.state.is_pressed() => self.key_pressed(&event, event_loop),
-            WindowEvent::KeyboardInput { event, .. } if is_loupe(&event.logical_key) => self.release_loupe(),
+            WindowEvent::KeyboardInput { event, .. } if is_loupe(&latin_key(&event.logical_key, &event.physical_key, self.modifiers.shift_key())) => {
+                self.release_loupe()
+            }
             _ => {}
         }
     }
@@ -1786,6 +1788,7 @@ impl App {
 
     /// One key, from either window.
     fn key_pressed(&mut self, event: &winit::event::KeyEvent, event_loop: &ActiveEventLoop) {
+        let key = latin_key(&event.logical_key, &event.physical_key, self.modifiers.shift_key());
         // A chord is answered here rather than in `handle_key`, which
         // knows nothing about modifiers: `Ctrl+C` and `C` are
         // different keys to a person and must be to the viewer.
@@ -1801,7 +1804,7 @@ impl App {
             // copy-as key is the one chord with two modifiers, and a
             // branch that asked about Alt first would swallow it.
             Route::DoubleChord => {
-                if let Some(chord) = double_chord_for(&event.logical_key) {
+                if let Some(chord) = double_chord_for(&key) {
                     self.handle_double_chord(chord);
                 }
             }
@@ -1820,9 +1823,9 @@ impl App {
             // does not deliver the character "1" on any layout.
             Route::Chord => match digit_key(&event.physical_key) {
                 Some(digit) => self.sort_current(digit, self.modifiers.shift_key()),
-                None => self.handle_chord(&event.logical_key),
+                None => self.handle_chord(&key),
             },
-            Route::Bare => self.handle_key(&event.logical_key, event_loop),
+            Route::Bare => self.handle_key(&key, event_loop),
         }
     }
 
@@ -4559,6 +4562,61 @@ fn pans(modifiers: winit::keyboard::ModifiersState) -> bool {
 
 /// Whether this is the loupe's key.
 ///
+/// The key a press means, whatever the keyboard layout.
+///
+/// A letter is what a Latin layout prints, and otherwise where the key is:
+/// switched to a Russian layout, `N` arrives as `т`, and a session with no
+/// layout at all — a test driving the window by messages — sends it with no
+/// character whatever. Both still come with the key's place, `KeyN`, which is
+/// what this reads them by. The rule the line keeps (dowel's shortcuts, kilna's
+/// chords): a Latin letter is taken as typed, any other press of a letter key
+/// as the letter on the key, capital when Shift is held — which is how every
+/// arm of `handle_key` tells `r` from `R`. Everything else — arrows, digits,
+/// `?` typed with Shift — is taken as it arrives.
+fn latin_key(logical: &Key, physical: &winit::keyboard::PhysicalKey, shift: bool) -> Key {
+    use winit::keyboard::{KeyCode, PhysicalKey};
+
+    if let Key::Character(typed) = logical
+        && typed.is_ascii()
+    {
+        return logical.clone();
+    }
+    let letter = match physical {
+        PhysicalKey::Code(code) => match code {
+            KeyCode::KeyA => 'a',
+            KeyCode::KeyB => 'b',
+            KeyCode::KeyC => 'c',
+            KeyCode::KeyD => 'd',
+            KeyCode::KeyE => 'e',
+            KeyCode::KeyF => 'f',
+            KeyCode::KeyG => 'g',
+            KeyCode::KeyH => 'h',
+            KeyCode::KeyI => 'i',
+            KeyCode::KeyJ => 'j',
+            KeyCode::KeyK => 'k',
+            KeyCode::KeyL => 'l',
+            KeyCode::KeyM => 'm',
+            KeyCode::KeyN => 'n',
+            KeyCode::KeyO => 'o',
+            KeyCode::KeyP => 'p',
+            KeyCode::KeyQ => 'q',
+            KeyCode::KeyR => 'r',
+            KeyCode::KeyS => 's',
+            KeyCode::KeyT => 't',
+            KeyCode::KeyU => 'u',
+            KeyCode::KeyV => 'v',
+            KeyCode::KeyW => 'w',
+            KeyCode::KeyX => 'x',
+            KeyCode::KeyY => 'y',
+            KeyCode::KeyZ => 'z',
+            _ => return logical.clone(),
+        },
+        PhysicalKey::Unidentified(_) => return logical.clone(),
+    };
+    let letter = if shift { letter.to_ascii_uppercase() } else { letter };
+    Key::Character(letter.to_string().into())
+}
+
 /// Its own function because the loupe is answered twice — on the press and on
 /// the release — and the two must name the same key or it would stick down.
 fn is_loupe(key: &Key) -> bool {
@@ -5051,7 +5109,7 @@ impl ApplicationHandler<Event> for App {
             // a release swallowed by a panel that opened mid-press would leave
             // the picture stuck at 100% with nothing holding it there.
             WindowEvent::KeyboardInput { event, .. } if !event.state.is_pressed() => {
-                if is_loupe(&event.logical_key) {
+                if is_loupe(&latin_key(&event.logical_key, &event.physical_key, self.modifiers.shift_key())) {
                     self.release_loupe();
                 }
             }
@@ -5986,6 +6044,38 @@ mod tests {
             chord_for(&Key::Character("C".into())),
             "Shift made no difference",
         );
+    }
+
+    /// A letter key means its letter on any layout: `N` pressed on a Russian
+    /// layout arrives as `т`, and in a session with no layout as no character
+    /// at all — both are read by the key's place. Shift makes the capital,
+    /// which is what tells `w` from `W`.
+    #[test]
+    fn a_letter_key_means_its_letter_on_any_layout() {
+        use winit::keyboard::{KeyCode, NativeKey, PhysicalKey};
+
+        let n = PhysicalKey::Code(KeyCode::KeyN);
+        assert_eq!(latin_key(&Key::Character("т".into()), &n, false), Key::Character("n".into()));
+        assert_eq!(latin_key(&Key::Character("Т".into()), &n, true), Key::Character("N".into()));
+        assert_eq!(latin_key(&Key::Unidentified(NativeKey::Windows(0x4E)), &n, false), Key::Character("n".into()));
+        // What a Latin layout types is taken as typed — on AZERTY the key in
+        // the place of Q types `a`, and `a` is what the person meant.
+        assert_eq!(
+            latin_key(&Key::Character("a".into()), &PhysicalKey::Code(KeyCode::KeyQ), false),
+            Key::Character("a".into())
+        );
+        // A non-letter key is left as it came: `?` is typed with Shift on one
+        // layout and on another key on the next.
+        assert_eq!(
+            latin_key(&Key::Character("?".into()), &PhysicalKey::Code(KeyCode::Digit7), true),
+            Key::Character("?".into())
+        );
+        assert_eq!(
+            latin_key(&Key::Named(NamedKey::ArrowLeft), &PhysicalKey::Code(KeyCode::ArrowLeft), false),
+            Key::Named(NamedKey::ArrowLeft)
+        );
+        // And the Russian layout's letters reach the arms that answer them.
+        assert!(handled(&latin_key(&Key::Character("м".into()), &PhysicalKey::Code(KeyCode::KeyV), false)));
     }
 
     /// The key sheet advertises the chords, so they have to be ones the viewer
