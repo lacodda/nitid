@@ -337,10 +337,16 @@ pub fn seed() -> u64 {
 /// SplitMix64: a few lines of arithmetic with a good spread, which is all a
 /// shuffle of photographs needs. A crate for it would be a dependency for one
 /// function.
+///
+/// Shared with the desktop picture, which deals from a folder the same way.
 #[derive(Clone, Copy, Debug)]
-struct Rng(u64);
+pub struct Rng(u64);
 
 impl Rng {
+    pub fn new(seed: u64) -> Self {
+        Self(seed)
+    }
+
     fn next(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut mixed = self.0;
@@ -351,7 +357,7 @@ impl Rng {
 
     /// A number in `0..bound`. The bias of the remainder is a few parts in
     /// 2^64 for any folder that fits on a disk.
-    fn below(&mut self, bound: usize) -> usize {
+    pub fn below(&mut self, bound: usize) -> usize {
         (self.next() % bound.max(1) as u64) as usize
     }
 }

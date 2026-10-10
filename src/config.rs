@@ -494,6 +494,13 @@ pub struct Config {
     pub slideshow: Slideshow,
     pub sorting: Sorting,
     pub programs: Programs,
+    /// Where the desktop's picture comes from, as the settings dialog edits
+    /// it.
+    ///
+    /// Kept in a file of its own, never in this one (see `wallpaper`): this
+    /// file is written whole when the viewer closes, and the desktop's
+    /// settings can change meanwhile from the command line.
+    pub wallpaper: crate::wallpaper::Settings,
     /// Keys the file carried that this version does not know.
     ///
     /// Kept so that saving does not throw away a newer version's settings:
@@ -504,10 +511,12 @@ pub struct Config {
 impl Config {
     /// Read the settings, falling back to defaults for anything missing.
     pub fn load() -> Self {
-        let Some(text) = path().and_then(|path| fs::read_to_string(path).ok()) else {
-            return Self::default();
-        };
-        Self::parse(&text)
+        let mut config = path()
+            .and_then(|path| fs::read_to_string(path).ok())
+            .map(|text| Self::parse(&text))
+            .unwrap_or_default();
+        config.wallpaper = crate::wallpaper::Settings::load();
+        config
     }
 
     /// Write the settings, ignoring a failure to do so.
@@ -830,6 +839,9 @@ mod tests {
             // through would pass even if the key were never written at all.
             sending: Sending { budget_kb: 250, width: 1600 },
             slideshow: Slideshow { interval: 45 },
+            // Not this file's to write: the desktop's settings have their own,
+            // so the default here is what reading this file back must give.
+            wallpaper: crate::wallpaper::Settings::default(),
             tools: Tools {
                 clip_high: 0.98,
                 clip_low: 0.02,

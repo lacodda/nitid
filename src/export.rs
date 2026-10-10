@@ -388,6 +388,21 @@ fn to_eight_bit(request: &Request<'_>) -> Vec<u8> {
     }
 }
 
+/// The picture in sRGB at eight bits a channel, converted at the depth it was
+/// decoded at.
+///
+/// For a destination that assumes sRGB and can be told nothing else — the
+/// desktop's picture is one. Converted before anything narrows or shrinks it,
+/// so a sixteen-bit or HDR source is mapped once, from its full precision.
+pub fn baked(image: &DecodedImage, profile: Option<&moxcms::ColorProfile>) -> DecodedImage {
+    DecodedImage {
+        width: image.width,
+        height: image.height,
+        pixels: to_srgb(image, profile),
+        depth: Depth::Eight,
+    }
+}
+
 /// Sixteen-bit samples down to eight, unchanged otherwise.
 fn narrow(image: &DecodedImage) -> Vec<u8> {
     match image.depth {

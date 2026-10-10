@@ -40,6 +40,7 @@ mod jpeg_lossless;
 mod loader;
 mod metadata;
 mod minimap;
+mod pattern;
 mod rotate;
 mod sandbox;
 mod scrub;
@@ -54,6 +55,8 @@ mod theme;
 mod tiles;
 mod vector;
 mod view;
+mod wallpaper;
+mod watch;
 
 /// The pieces the integration tests reach into.
 ///
@@ -107,6 +110,14 @@ pub mod testing {
     /// Cut a rectangle out of a decoded picture, the way the re-encoding
     /// fallback does.
     pub use crate::export::cut;
+
+    /// Make the desktop's picture from a file, for the displays named — the
+    /// very function `W`, `Shift+W` and the schedule hand to Windows, so a
+    /// gate over real files of every format runs the path itself and never
+    /// touches the desktop.
+    pub fn prepare_wallpaper(path: &std::path::Path, screens: &[(u32, u32)], fill: bool) -> anyhow::Result<Vec<u8>> {
+        crate::wallpaper::prepare(path, screens, if fill { crate::wallpaper::Fit::Fill } else { crate::wallpaper::Fit::Fit })
+    }
 
     /// Marking a picture, for the gate that asks Windows whether it can see
     /// the mark. Named after what they mean rather than exposing the enum,
@@ -178,6 +189,12 @@ enum Command {
     /// way so a C decoder runs somewhere it can do no harm — see
     /// `docs/adr/0002-sandbox-c-decoders.md`.
     Decode,
+    /// The desktop's picture: from a folder on a schedule, the next one now,
+    /// or no longer changing. See `wallpaper`.
+    Wallpaper(wallpaper::Asked),
+    /// Something the command line does not take, said before anything is
+    /// done rather than mistaken for a file to open.
+    Mistake(String),
 }
 
 /// Run the viewer, whichever binary was launched.
@@ -194,7 +211,10 @@ pub fn run(windowed: bool) -> ExitCode {
     // printing commands are handed to the binary that has somewhere to print.
     // This is a safety net rather than a path anyone takes: the windowed
     // binary exists to be launched by the shell with a file.
-    if windowed && !matches!(command, Command::View(_) | Command::Decode) {
+    // `wallpaper next` is the exception that proves it: the scheduled task
+    // runs the windowed binary precisely so that no console window flashes up
+    // on the desktop every half hour, and it prints nothing when it succeeds.
+    if windowed && !matches!(command, Command::View(_) | Command::Decode | Command::Wallpaper(wallpaper::Asked::Next)) {
         return delegate_to_console_binary();
     }
 
@@ -216,6 +236,8 @@ pub fn run(windowed: bool) -> ExitCode {
             Ok(())
         }
         Command::Decode => sandbox::run_as_decoder(),
+        Command::Wallpaper(asked) => wallpaper::command(asked),
+        Command::Mistake(mistake) => Err(anyhow::anyhow!("{mistake} (nitid --help says what it takes)")),
         #[cfg(windows)]
         Command::Install => install::install().map(|_| ()),
         #[cfg(windows)]
@@ -303,6 +325,13 @@ fn parse(args: impl Iterator<Item = OsString>) -> Command {
         Some("-V" | "--version") => Command::Version,
         Some("install") => Command::Install,
         Some("uninstall") => Command::Uninstall,
+        Some("wallpaper") => {
+            let rest: Vec<String> = args.map(|arg| arg.to_string_lossy().into_owned()).collect();
+            match wallpaper::Asked::parse(&rest) {
+                Ok(asked) => Command::Wallpaper(asked),
+                Err(error) => Command::Mistake(format!("{error:#}")),
+            }
+        }
         // Leading dashes, so it cannot be mistaken for a file: every other
         // unrecognised argument is treated as a path.
         Some(sandbox::DECODE_ARGUMENT) => Command::Decode,
@@ -323,6 +352,8 @@ Usage:
   nitid [FILE...]
   nitid install
   nitid uninstall
+  nitid wallpaper [FOLDER] [--every 30m] [--only PATTERN] [--fit fill|fit]
+  nitid wallpaper next | off
 
 Arguments:
   FILE...       images to open. One file browses its folder; several browse
@@ -333,6 +364,13 @@ Commands:
   install       copy nitid to %LOCALAPPDATA%\\Programs and register its file
                 types, so it is offered in \"Open with\"
   uninstall     undo the above
+  wallpaper     change the desktop's picture from FOLDER on a schedule, every
+                30 minutes unless --every says otherwise (5m, 2h, 1d). --only
+                takes names matching a pattern such as *.png; --fit fill
+                covers the screen, --fit fit shows the whole picture. With
+                no FOLDER it changes how the running schedule works, or says
+                what it is doing; next puts the next picture up now, off
+                stops it
 
 Options:
   -h, --help    print this message
@@ -387,6 +425,9 @@ mod tests {
     fn the_commands_are_recognised() {
         assert!(matches!(parse_args(&["install"]), Command::Install));
         assert!(matches!(parse_args(&["uninstall"]), Command::Uninstall));
+        assert!(matches!(parse_args(&["wallpaper"]), Command::Wallpaper(wallpaper::Asked::Status)));
+        assert!(matches!(parse_args(&["wallpaper", "next"]), Command::Wallpaper(wallpaper::Asked::Next)));
+        assert!(matches!(parse_args(&["wallpaper", "--every", "soon"]), Command::Mistake(_)));
         assert!(matches!(parse_args(&["--help"]), Command::Help));
         assert!(matches!(parse_args(&["-V"]), Command::Version));
     }

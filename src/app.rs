@@ -33,10 +33,12 @@ use crate::image_source::{self, Depth, Fidelity, LoadedImage, Orientation};
 use crate::interface::{Action, Interface, Status};
 use crate::loader::{Asked, Decoded, Loader, Request};
 use crate::minimap::Thumbnail;
+use crate::pattern::Pattern;
 use crate::slideshow::{self, Shuffle};
 use crate::startup;
 use crate::vector::VectorImage;
 use crate::view::{FitMode, View};
+use crate::watch::Watch;
 
 /// A wheel notch is 120 units of a high-resolution scroll device; a trackpad
 /// reports fractions of that, so dividing keeps both feeling the same.
@@ -49,6 +51,22 @@ const DEFAULT_WINDOW: (u32, u32) = (1280, 800);
 /// viewer is on an HDR surface. A second is well under the time it takes to
 /// look back at the screen after flipping the setting, and 140 µs of it.
 const DISPLAY_WATCH_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How long the open folder has to be quiet before it is read again.
+///
+/// Windows reports a file being written as it is written, many times over;
+/// reading the folder on each report would read it dozens of times for one
+/// picture. A quarter of a second is past the burst a generator or a copy
+/// makes and well under the time it takes to look at the screen.
+const FOLDER_QUIET: Duration = Duration::from_millis(250);
+
+/// The longest a folder that never goes quiet waits to be read — a long copy
+/// into it, say — so its pictures still turn up while it goes on.
+const FOLDER_PATIENCE: Duration = Duration::from_secs(2);
+
+/// How soon a file that was still being written is looked at again, whether
+/// or not the folder says anything more about it.
+const FOLDER_RETRY: Duration = Duration::from_millis(400);
 
 /// Run the viewer, optionally opening a file straight away.
 pub fn run(paths: Vec<PathBuf>) -> Result<()> {
@@ -117,6 +135,15 @@ enum Event {
     /// Another instance handed these files over rather than opening a window.
     #[cfg(windows)]
     Open(Vec<PathBuf>),
+    /// Something changed in a folder being listened to. The folder is named so
+    /// that a word from a watch that has since been replaced — another folder
+    /// opened in the meantime — is recognised and ignored.
+    FolderChanged(PathBuf),
+    /// The desktop's picture was changed, or could not be: the sentence to
+    /// say, or why not.
+    Wallpaper(Result<String, String>),
+    /// What the schedule is doing, for the settings dialog.
+    Scheduled(Option<String>),
 }
 
 /// What the viewer is showing, once a file has been opened.
@@ -476,6 +503,26 @@ struct App {
     /// Whether the pointer was hidden for a slideshow. It comes back the
     /// moment it moves; kept so a move that finds it showing asks nothing.
     cursor_hidden: bool,
+    /// The open folder, listened to for pictures arriving, leaving and being
+    /// written again (ADR 0034).
+    watch: Option<Watch>,
+    /// Which folder the watch was last started for, whether or not it could
+    /// be — so a folder that cannot be listened to is tried once rather than
+    /// on every pass of the loop.
+    watching: Option<PathBuf>,
+    /// When the folder is next read again: a moment after it last changed.
+    rescan_due: Option<Instant>,
+    /// When the present run of changes began, so a folder that keeps changing
+    /// is still read every so often.
+    changing_since: Option<Instant>,
+    /// Whether the newest picture is put up as it arrives (`N`).
+    following: bool,
+    /// A picture arrived while following, when it could not go up — a box was
+    /// open, a crop was being framed. It goes up once that is over.
+    arrival_owed: bool,
+    /// The desktop's settings as last written, so an edit in the dialog can be
+    /// told from a dialog that only opened.
+    wallpaper_written: crate::wallpaper::Settings,
 }
 
 /// One laid-out interface frame, held between the layout and the draw.
@@ -524,6 +571,13 @@ impl App {
             slideshow: None,
             presentation: None,
             cursor_hidden: false,
+            watch: None,
+            watching: None,
+            rescan_due: None,
+            changing_since: None,
+            following: false,
+            arrival_owed: false,
+            wallpaper_written: crate::wallpaper::Settings::default(),
         }
     }
 
@@ -598,7 +652,7 @@ impl App {
             [] => return,
             [single] => match Folder::open(single, self.config.behaviour.order, self.config.behaviour.wrap) {
                 Ok(folder) => {
-                    let path = folder.current().to_path_buf();
+                    let path = folder.current().map_or_else(|| single.clone(), Path::to_path_buf);
                     (Some(folder), path)
                 }
                 Err(error) => {
@@ -608,7 +662,9 @@ impl App {
             },
             several => match Folder::of_selection(several, self.config.behaviour.wrap) {
                 Some(folder) => {
-                    let path = folder.current().to_path_buf();
+                    let Some(path) = folder.current().map(Path::to_path_buf) else {
+                        return;
+                    };
                     (Some(folder), path)
                 }
                 // Nothing in the selection is an image this build opens.
@@ -1112,7 +1168,7 @@ impl App {
             false => self
                 .folder
                 .as_ref()
-                .map(Folder::current)
+                .and_then(Folder::current)
                 .and_then(Path::file_name)
                 .and_then(|name| name.to_str())
                 .unwrap_or("nitid"),
@@ -1156,7 +1212,9 @@ impl App {
         // left arrow.
         if let Some(SlideOrder::Shuffled(shuffle)) = self.slideshow.as_ref().map(|show| &show.order) {
             let walks = |path: &Path| folder.walks(path);
-            let wanted: Vec<PathBuf> = std::iter::once(folder.current())
+            let wanted: Vec<PathBuf> = folder
+                .current()
+                .into_iter()
                 .chain(shuffle.upcoming(walks))
                 .chain(shuffle.before(walks))
                 .map(Path::to_path_buf)
@@ -1278,7 +1336,85 @@ impl App {
         if let Some(show) = self.slideshow.as_mut() {
             show.clock.set_interval(Duration::from_secs(u64::from(self.config.slideshow.interval)));
         }
+        // The desktop's settings go to their own file, and from there to the
+        // schedule and the desktop — on a worker, because the Task Scheduler
+        // is another process to talk to.
+        if self.config.wallpaper != self.wallpaper_written {
+            self.wallpaper_written = self.config.wallpaper.clone();
+            self.ask_wallpaper(crate::wallpaper::Request::Settings(self.config.wallpaper.clone()));
+        }
         self.config.save();
+        self.request_redraw();
+    }
+
+    /// The settings dialog has just opened: read the desktop's settings
+    /// afresh — the command line may have changed them — and ask what the
+    /// schedule is doing.
+    fn settings_opened(&mut self) {
+        self.config.wallpaper = crate::wallpaper::Settings::load();
+        self.wallpaper_written = self.config.wallpaper.clone();
+        let proxy = self.proxy.clone();
+        let _ = std::thread::Builder::new().name("wallpaper status".into()).spawn(move || {
+            let _ = proxy.send_event(Event::Scheduled(crate::wallpaper::scheduled()));
+        });
+    }
+
+    /// `W`: the picture on screen, on the desktop.
+    fn wallpaper_picture(&mut self) {
+        let Some(path) = self.file_on_screen() else {
+            return;
+        };
+        self.interface.toast(format!("putting {} on the desktop", name_of(&path)), Instant::now());
+        self.request_redraw();
+        self.ask_wallpaper(crate::wallpaper::Request::Picture(path));
+    }
+
+    /// `Shift+W`: the desktop's picture from this folder on a schedule,
+    /// starting with the picture on screen and narrowed by the name pattern
+    /// that is up — or, when that is what is running already, stop it.
+    fn wallpaper_folder(&mut self) {
+        let Some(path) = self.file_on_screen() else {
+            return;
+        };
+        let Some(folder) = self.folder.as_ref().filter(|folder| folder.watched().is_some()) else {
+            self.interface
+                .toast("a selection of files is not a folder to change the desktop from", Instant::now());
+            self.request_redraw();
+            return;
+        };
+        let only = folder.pattern().cloned();
+        self.ask_wallpaper(crate::wallpaper::Request::Folder { first: path, only });
+    }
+
+    /// Hand a request about the desktop to a worker; the answer comes back as
+    /// an event.
+    fn ask_wallpaper(&self, request: crate::wallpaper::Request) {
+        let proxy = self.proxy.clone();
+        let started = std::thread::Builder::new().name("wallpaper".into()).spawn(move || {
+            let outcome = crate::wallpaper::carry_out(request).map_err(|error| format!("{error:#}"));
+            let _ = proxy.send_event(Event::Wallpaper(outcome));
+        });
+        if let Err(error) = started {
+            eprintln!("nitid: {error}");
+        }
+    }
+
+    /// A request about the desktop came back.
+    fn wallpaper_done(&mut self, outcome: Result<String, String>) {
+        match outcome {
+            Ok(said) if said.is_empty() => {}
+            Ok(said) => self.interface.toast(said, Instant::now()),
+            Err(error) => {
+                eprintln!("nitid: the desktop's picture: {error}");
+                self.interface.toast(format!("the desktop's picture: {error}"), Instant::now());
+            }
+        }
+        // The worker may have written a new folder or pattern.
+        self.config.wallpaper = crate::wallpaper::Settings::load();
+        self.wallpaper_written = self.config.wallpaper.clone();
+        if self.interface.settings_shown() {
+            self.settings_opened();
+        }
         self.request_redraw();
     }
 
@@ -1345,7 +1481,10 @@ impl App {
 
     fn slide_order(&self, shuffled: bool) -> SlideOrder {
         match (shuffled, self.folder.as_ref()) {
-            (true, Some(folder)) => SlideOrder::Shuffled(Shuffle::new(folder.current(), folder.walked(), slideshow::seed())),
+            (true, Some(folder)) => match folder.current() {
+                Some(current) => SlideOrder::Shuffled(Shuffle::new(current, folder.walked(), slideshow::seed())),
+                None => SlideOrder::Folder,
+            },
             _ => SlideOrder::Folder,
         }
     }
@@ -1452,7 +1591,7 @@ impl App {
         // A box over the picture is about this picture: a name being typed,
         // a format being chosen, a crop being framed. The count waits for as
         // long as one is up.
-        let busy = self.interface.renaming() || self.interface.saving() || self.interface.cleaning() || self.cropping.is_some();
+        let busy = self.busy();
         let Some(show) = self.slideshow.as_mut() else {
             return;
         };
@@ -1796,7 +1935,7 @@ impl App {
         // this, typing "gull.jpg" would step to the next picture on
         // the "g", turn it on the "r", and delete nothing only by
         // luck. Escape is left to egui, which the box watches for.
-        if self.interface.renaming() || self.interface.saving() || self.interface.cleaning() {
+        if self.boxed() {
             return;
         }
         match route_for(self.modifiers) {
@@ -1988,6 +2127,13 @@ impl App {
                 "S" => self.toggle_slideshow(true),
                 // The picture on another display: a television, a projector.
                 "d" | "D" => self.present(event_loop),
+                // The newest picture, now and as each new one arrives.
+                "n" | "N" => self.toggle_following(),
+                // The desktop: this picture, or this folder on a schedule —
+                // Shift for the folder, the way Shift on `S` is the other way
+                // through the same pictures.
+                "w" => self.wallpaper_picture(),
+                "W" => self.wallpaper_folder(),
                 // The colour under the cursor. A mode, so it can be pointed
                 // about the picture and clicked with one hand.
                 "c" | "C" => self.toggle_picking(),
@@ -1996,6 +2142,9 @@ impl App {
                 // picture alongside.
                 "," => {
                     self.interface.toggle_settings();
+                    if self.interface.settings_shown() {
+                        self.settings_opened();
+                    }
                     self.request_redraw();
                 }
                 // The colour path, spelled out. Reachable from the keyboard
@@ -2197,6 +2346,7 @@ impl App {
             Some(Chord::SaveAs) => self.begin_save_as(),
             Some(Chord::CleanCopy) => self.begin_clean(),
             Some(Chord::Crop) => self.toggle_crop(),
+            Some(Chord::Pattern) => self.begin_pattern(),
             None => {}
         }
     }
@@ -2564,6 +2714,7 @@ impl App {
         match crate::jpeg_lossless::crop(&bytes, rect)? {
             Ok(cropped) => {
                 std::fs::write(destination, cropped)?;
+                self.adopt(destination);
                 Ok(name_of(destination))
             }
             // The offer was worked out from this same file a moment ago, so
@@ -2609,6 +2760,7 @@ impl App {
             caveat: None,
         };
         crate::export::save(&request, destination)?;
+        self.adopt(destination);
         Ok(name_of(destination))
     }
 
@@ -2645,6 +2797,9 @@ impl App {
                 // that is now out of date - without this, stepping away and
                 // back would show the turn undone.
                 self.loader.forget(&path);
+                if let Some(folder) = self.folder.as_mut() {
+                    folder.restamp(&path);
+                }
                 self.interface.toast(format!("{name} keeps the turn"), Instant::now());
             }
             Err(error) => self.report(error),
@@ -2685,6 +2840,11 @@ impl App {
                 // went in; left alone, stepping away and back would show the
                 // mark undone. The same reason the saved turn forgets.
                 self.loader.forget(&path);
+                // The viewer's own write, not news from outside: the folder
+                // watch must not answer it by loading the picture again.
+                if let Some(folder) = self.folder.as_mut() {
+                    folder.restamp(&path);
+                }
                 self.interface.toast(
                     match mark {
                         crate::cull::Mark::Unmarked => format!("{name}: mark taken off"),
@@ -2708,12 +2868,17 @@ impl App {
             return;
         };
 
-        if folder.is_filtered() {
-            folder.show_all();
-            let count = folder.len();
-            self.interface.toast(format!("the whole folder: {count}"), Instant::now());
+        if folder.marked_only() {
+            let count = folder.set_marked(None);
+            // The name pattern may still be up, and then "the whole folder"
+            // would be a lie about what the arrow keys now walk.
+            let message = match folder.pattern() {
+                Some(pattern) => format!("every picture named {}: {count}", pattern.text()),
+                None => format!("the whole folder: {count}"),
+            };
+            self.interface.toast(message, Instant::now());
         } else {
-            let count = folder.show_only(|path| crate::cull::read(path).is_marked());
+            let count = folder.set_marked(Some(Box::new(|path: &Path| crate::cull::read(path).is_marked())));
             // Nothing marked is a real answer and it is said, rather than
             // leaving a person with arrow keys that have quietly stopped
             // working. The filter stays up: it is what they asked for, and
@@ -2730,10 +2895,293 @@ impl App {
         self.request_redraw();
     }
 
-    /// Re-run the filter, if one is up, against the marks as they stand now.
+    /// Re-run the filters, if any are up, against the marks as they stand now.
     fn refilter(&mut self) {
         if let Some(folder) = self.folder.as_mut() {
-            folder.refilter(|path| crate::cull::read(path).is_marked());
+            folder.refilter();
+        }
+    }
+
+    /// `Ctrl+F`: open the box that narrows the walk to names matching a
+    /// pattern, with the pattern that is up already in it.
+    fn begin_pattern(&mut self) {
+        let Some(folder) = self.folder.as_ref() else {
+            return;
+        };
+        let typed = folder.pattern().map(|pattern| pattern.text().to_string()).unwrap_or_default();
+        self.interface.begin_pattern(&typed);
+        self.request_redraw();
+    }
+
+    /// Walk only the names the typed pattern admits; an empty box walks every
+    /// name again.
+    fn apply_pattern(&mut self, typed: &str) {
+        let Some(folder) = self.folder.as_mut() else {
+            return;
+        };
+        let pattern = Pattern::parse(typed);
+        let text = pattern.as_ref().map(|pattern| pattern.text().to_string());
+        let count = folder.set_pattern(pattern);
+        // Said with the count, for the reason the marks filter says it: a
+        // pattern that matches nothing is a real answer, and arrow keys that
+        // have quietly stopped working are not.
+        let message = match (&text, count) {
+            (None, count) => format!("every name again: {count}"),
+            (Some(text), 0) => format!("no picture here is named {text}"),
+            (Some(text), 1) => format!("1 picture named {text}"),
+            (Some(text), count) => format!("{count} pictures named {text}"),
+        };
+        self.interface.toast(message, Instant::now());
+        // Following the folder means the newest of what is walked, and the
+        // walk has just changed under it.
+        if self.following {
+            self.go_to_newest();
+        }
+        self.request_redraw();
+    }
+
+    /// `N`: put the newest picture up now and every new one as it arrives,
+    /// or stop.
+    ///
+    /// A mode, said in a toast and in the status line, rather than a rule the
+    /// viewer applies by itself — "jump when the newest was on screen" would
+    /// jump on the viewer's own crop and on a mark written into the newest
+    /// file, and a picture that moves by a rule nobody stated is a picture the
+    /// person fights. Esc does not end it, any more than it ends the held
+    /// framing: it is a way of looking, not a box in front of the picture.
+    fn toggle_following(&mut self) {
+        if self.following {
+            self.following = false;
+            self.arrival_owed = false;
+            self.interface.toast("no longer following the folder", Instant::now());
+            self.request_redraw();
+            return;
+        }
+
+        let Some(folder) = self.folder.as_ref() else {
+            self.interface.toast("open a picture to follow its folder", Instant::now());
+            self.request_redraw();
+            return;
+        };
+        if folder.watched().is_none() {
+            self.interface.toast("a selection of files has no folder to follow", Instant::now());
+            self.request_redraw();
+            return;
+        }
+
+        self.following = true;
+        let message = match folder.pattern() {
+            Some(pattern) => format!("following the folder: the newest {} comes up as it arrives", pattern.text()),
+            None => "following the folder: the newest picture comes up as it arrives".to_string(),
+        };
+        self.interface.toast(message, Instant::now());
+        self.go_to_newest();
+        self.request_redraw();
+    }
+
+    /// Show the newest picture the arrow keys walk, if it is not up already.
+    fn go_to_newest(&mut self) {
+        let Some(folder) = self.folder.as_mut() else {
+            return;
+        };
+        let Some(newest) = folder.newest().map(Path::to_path_buf) else {
+            return;
+        };
+        let on_screen = self.shown.as_ref().filter(|shown| !shown.pasted).map(|shown| shown.path.as_path());
+        if on_screen == Some(newest.as_path()) {
+            return;
+        }
+        folder.go_to(&newest);
+        self.show(&newest);
+    }
+
+    /// Whether a box has the keyboard: a name, a pattern, a format being
+    /// chosen, a clean copy being decided.
+    fn boxed(&self) -> bool {
+        self.interface.typing() || self.interface.saving() || self.interface.cleaning()
+    }
+
+    /// Whether the picture must not change by itself right now: a box is up,
+    /// or a crop is being framed. A slideshow waits for this, and so does a
+    /// picture arriving in a followed folder.
+    fn busy(&self) -> bool {
+        self.boxed() || self.cropping.is_some()
+    }
+
+    /// Listen to the folder being walked, and only to it.
+    ///
+    /// Started once the first picture is on screen, not before: listening
+    /// costs a thread and a kernel handle, and nothing that is not the picture
+    /// is allowed in front of the picture. The folder is read once as soon as
+    /// the watch begins, for whatever arrived between opening it and now.
+    fn keep_watch(&mut self) {
+        if !self.shown_once {
+            return;
+        }
+        let wanted = self.folder.as_ref().and_then(Folder::watched).map(Path::to_path_buf);
+        if self.watching == wanted {
+            return;
+        }
+
+        self.watch = None;
+        self.rescan_due = None;
+        self.changing_since = None;
+        self.watching = wanted.clone();
+        let Some(dir) = wanted else {
+            return;
+        };
+
+        let proxy = self.proxy.clone();
+        let named = dir.clone();
+        match Watch::start(&dir, move || {
+            // The loop may be gone if the window closed mid-change; there is
+            // nobody left to tell.
+            let _ = proxy.send_event(Event::FolderChanged(named.clone()));
+        }) {
+            Ok(watch) => {
+                self.watch = Some(watch);
+                self.rescan_due = Some(Instant::now());
+            }
+            // A folder that cannot be listened to — some network shares — is
+            // still a folder that can be walked; it just does not follow.
+            Err(error) => eprintln!("nitid: {error:#}"),
+        }
+    }
+
+    /// The folder said something changed: read it once it has gone quiet.
+    fn folder_changed(&mut self, dir: &Path) {
+        if self.watch.as_ref().map(Watch::dir) != Some(dir) {
+            return;
+        }
+        let now = Instant::now();
+        let first = *self.changing_since.get_or_insert(now);
+        self.rescan_due = Some(rescan_at(first, now));
+    }
+
+    /// Read the folder again and answer what changed in it.
+    ///
+    /// Every answer is about what is on screen or what the arrow keys walk:
+    /// the picture on screen written again is loaded afresh where it is
+    /// framed, the picture on screen gone gives way to the next one the way a
+    /// delete does, and an arrival is put up when the folder is followed and
+    /// named in a toast when it is not.
+    fn rescan_folder(&mut self) {
+        self.rescan_due = None;
+        self.changing_since = None;
+        let Some(folder) = self.folder.as_mut() else {
+            return;
+        };
+        let was_empty = folder.is_empty();
+        let changes = match folder.rescan() {
+            Ok(changes) => changes,
+            Err(error) => {
+                eprintln!("nitid: {error:#}");
+                return;
+            }
+        };
+        if changes.unsettled {
+            self.rescan_due = Some(Instant::now() + FOLDER_RETRY);
+        }
+        if changes.is_quiet() {
+            return;
+        }
+
+        // What the loader holds of a file that went or was written again is
+        // a picture of something that is not on disk any more.
+        for path in changes.removed.iter().chain(&changes.rewritten) {
+            self.loader.forget(path);
+        }
+
+        let on_screen = self.shown.as_ref().filter(|shown| !shown.pasted).map(|shown| shown.path.clone());
+
+        // Comparing against a file that has gone would be comparing against a
+        // memory of it — the rule a delete in the viewer follows.
+        if self
+            .comparing
+            .as_ref()
+            .and_then(|comparison| comparison.pinned.path.as_ref())
+            .is_some_and(|pinned| changes.removed.contains(pinned))
+        {
+            self.stop_comparing(Leave::Here);
+        }
+
+        if let (Some(renamed), Some(old)) = (&changes.renamed, &on_screen) {
+            if let Some(shown) = self.shown.as_mut() {
+                shown.path = renamed.clone();
+            }
+            if let Some(pinned) = self.comparing.as_mut().map(|comparison| &mut comparison.pinned)
+                && pinned.path.as_ref() == Some(old)
+            {
+                pinned.name = name_of(renamed);
+                pinned.path = Some(renamed.clone());
+            }
+            self.interface
+                .toast(format!("{} is now called {}", name_of(old), name_of(renamed)), Instant::now());
+        }
+
+        let mut next: Option<PathBuf> = None;
+        let Some(folder) = self.folder.as_ref() else {
+            return;
+        };
+        if changes.current_gone {
+            let gone = on_screen.as_deref().map(name_of).unwrap_or_default();
+            match folder.current() {
+                Some(current) => {
+                    next = Some(current.to_path_buf());
+                    self.interface.toast(format!("{gone} is gone"), Instant::now());
+                }
+                None => self
+                    .interface
+                    .toast(format!("{gone} is gone, and nothing is left in the folder"), Instant::now()),
+            }
+        } else if was_empty {
+            // A folder emptied earlier has filled again: the window was still
+            // showing a picture of a file that is not there.
+            next = folder.current().map(Path::to_path_buf);
+        } else if let Some(path) = on_screen.as_ref().filter(|path| changes.rewritten.contains(path)) {
+            next = Some(path.clone());
+            self.interface.toast(format!("{} changed on disk", name_of(path)), Instant::now());
+        }
+
+        let arrived: Vec<PathBuf> = changes.added.iter().filter(|path| folder.walks(path)).cloned().collect();
+        if !arrived.is_empty() {
+            if self.following {
+                if self.busy() {
+                    self.arrival_owed = true;
+                } else if let Some(newest) = folder.newest_of(&arrived) {
+                    // The picture itself is the message.
+                    next = Some(newest.to_path_buf());
+                }
+            }
+            if !self.following || self.arrival_owed {
+                self.interface.toast(arrivals_message(&arrived, self.following), Instant::now());
+            }
+        }
+
+        match next {
+            Some(next) => {
+                if let Some(folder) = self.folder.as_mut() {
+                    folder.go_to(&next);
+                }
+                self.show(&next);
+            }
+            // Nothing new on screen, but the neighbours may have changed —
+            // the next picture along may be one that just arrived.
+            None => self.prefetch_neighbours(),
+        }
+        self.set_title();
+        self.request_redraw();
+    }
+
+    /// A picture that arrived while following, held back by a box or a crop,
+    /// goes up once they are out of the way.
+    fn put_up_owed_arrival(&mut self) {
+        if !self.arrival_owed || self.busy() {
+            return;
+        }
+        self.arrival_owed = false;
+        if self.following {
+            self.go_to_newest();
         }
     }
 
@@ -2889,6 +3337,7 @@ impl App {
         let destination = free_name_tagged(folder, &stem, "clean", &extension).ok_or_else(|| anyhow::anyhow!("there is nowhere to put the copy"))?;
 
         std::fs::write(&destination, cleaned).with_context(|| format!("writing {}", name_of(&destination)))?;
+        self.adopt(&destination);
         Ok((name_of(&destination), note))
     }
 
@@ -2938,7 +3387,10 @@ impl App {
         };
 
         match outcome {
-            Ok(crate::files::Outcome::Copied(_)) => {
+            Ok(crate::files::Outcome::Copied(copy)) => {
+                // A sorting folder can be the folder being walked; then the
+                // copy is one more picture in it.
+                self.adopt(&copy);
                 self.interface.toast(format!("{name} copied to {destination}"), Instant::now());
             }
             Ok(_) => {
@@ -2956,9 +3408,9 @@ impl App {
     /// this kind of file unless the settings name a program; a digit means one
     /// of the nine keys, which does nothing until it has been assigned.
     ///
-    /// The file is not reloaded afterwards. A program that edits it will take
-    /// as long as a person takes, and guessing when that is finished would be
-    /// worse than the `R` that reloads on request.
+    /// Nothing waits for the program to finish. It takes as long as a person
+    /// takes; when it saves over the file, the folder watch sees the file
+    /// written again and the picture on screen is loaded afresh (ADR 0034).
     fn open_in_program(&mut self, digit: Option<usize>) {
         let program = match program_for(&self.config.programs, digit) {
             Chosen::Named(program) => Some(program),
@@ -3187,7 +3639,7 @@ impl App {
         // that folder expects it to appear. A pasted picture has no file of
         // its own, so it goes beside the folder the viewer is walking.
         let beside = if pasted {
-            self.folder.as_ref().map(|folder| folder.current().to_path_buf())
+            self.folder.as_ref().and_then(Folder::current).map(Path::to_path_buf)
         } else {
             Some(beside)
         };
@@ -3209,9 +3661,9 @@ impl App {
 
         match crate::export::save(&request, &path) {
             Ok(()) => {
-                // The folder listing is not rebuilt, the way it is not after
-                // sorting a file into another folder: the walk is what it was
-                // when it was opened, and `R` is what asks for it again.
+                // One more picture in the folder being walked, joining it now
+                // rather than being announced as an arrival a moment later.
+                self.adopt(&path);
                 self.interface.toast(format!("saved as {name}"), Instant::now());
             }
             Err(error) => self.report(error),
@@ -3233,6 +3685,14 @@ impl App {
             return None;
         }
         Some(shown.path.clone())
+    }
+
+    /// A file the viewer itself just wrote: into the listing now, so the
+    /// folder watch does not announce it as somebody else's arrival.
+    fn adopt(&mut self, path: &Path) {
+        if let Some(folder) = self.folder.as_mut() {
+            folder.adopt(path);
+        }
     }
 
     /// What kind of file the picture on screen came from.
@@ -3821,7 +4281,7 @@ impl App {
             false => self
                 .folder
                 .as_ref()
-                .map(Folder::current)
+                .and_then(Folder::current)
                 .and_then(Path::file_name)
                 .and_then(|name| name.to_str())
                 .unwrap_or_default()
@@ -3866,7 +4326,9 @@ impl App {
             crop: self.crop_view(),
             visible: self.shown.as_ref().map_or((0.0, 0.0, 1.0, 1.0), |shown| shown.view.visible_fraction()),
             mark: self.shown.as_ref().map(|shown| shown.mark).unwrap_or_default(),
-            filtered: self.folder.as_ref().is_some_and(crate::folder::Folder::is_filtered),
+            marked: self.folder.as_ref().is_some_and(Folder::marked_only),
+            pattern: self.folder.as_ref().and_then(Folder::pattern).map(|pattern| pattern.text().to_string()),
+            following: self.following,
             compared: self.compared(),
             slideshow: self.slideshow.as_ref().map(|show| crate::interface::Showing {
                 shuffled: show.order.shuffled(),
@@ -3985,11 +4447,17 @@ impl App {
         if edited {
             self.settings_changed();
         }
+        if self.interface.take_wallpaper_stop() {
+            self.ask_wallpaper(crate::wallpaper::Request::Stop);
+        }
         // A name the box committed during that layout, for the same reason
         // and in the same place: renaming touches the folder and the
         // interface, both of which are borrowed above.
-        if let Some(name) = self.interface.take_rename() {
-            self.rename_current(name);
+        if let Some((asking, typed)) = self.interface.take_typed() {
+            match asking {
+                crate::interface::Asking::Name => self.rename_current(typed),
+                crate::interface::Asking::Pattern => self.apply_pattern(&typed),
+            }
         }
         // A save the box committed during that layout, collected here for the
         // reason the rename is: writing the file touches the folder and the
@@ -4245,6 +4713,10 @@ fn handled(key: &Key) -> bool {
                 | "S"
                 | "d"
                 | "D"
+                | "n"
+                | "N"
+                | "w"
+                | "W"
         ),
         _ => false,
     }
@@ -4269,6 +4741,11 @@ enum Chord {
     /// clipboard anywhere in this viewer, so the usual meaning of `Ctrl+X` is
     /// not being taken from anyone.
     Crop,
+    /// Walk only the names that match a pattern.
+    ///
+    /// `Ctrl+F` because it is the key every program finds with; the bare `F`
+    /// has mirrored the picture since v0.27.
+    Pattern,
 }
 
 /// Which way a key press goes, given the modifiers held.
@@ -4345,6 +4822,7 @@ fn chord_for(key: &Key) -> Option<Chord> {
         "s" => Some(Chord::SaveTurn),
         "m" => Some(Chord::CleanCopy),
         "x" | "X" => Some(Chord::Crop),
+        "f" | "F" => Some(Chord::Pattern),
         _ => None,
     }
 }
@@ -4701,6 +5179,33 @@ fn size_after_turn(size: (u32, u32), before: Orientation, after: Orientation) ->
     (before.swaps_axes() != after.swaps_axes()).then_some((size.1, size.0))
 }
 
+/// When to read a folder that is changing: a moment after the latest change,
+/// but never later than a while after the first one of the run.
+///
+/// The first half is what makes a picture written in a hundred pieces one
+/// reading rather than a hundred. The second is what keeps a folder that never
+/// goes quiet — a long copy into it — from never being read at all.
+fn rescan_at(first: Instant, latest: Instant) -> Instant {
+    (latest + FOLDER_QUIET).min(first + FOLDER_PATIENCE)
+}
+
+/// What a toast says about pictures that arrived and were not put up.
+///
+/// Not following, it names the key that would have put them up: the feature
+/// is a key nobody would guess, and the moment a picture arrives is the moment
+/// a person would want it. Following, they were held back by a box or a crop,
+/// and go up when it closes.
+fn arrivals_message(arrived: &[PathBuf], following: bool) -> String {
+    let what = match arrived {
+        [one] => format!("new: {}", name_of(one)),
+        many => format!("{} new pictures", many.len()),
+    };
+    match following {
+        true => format!("{what} — up once this is closed"),
+        false => format!("{what} (N follows the folder)"),
+    }
+}
+
 /// What was on screen when a new image arrived.
 struct Previous {
     view: View,
@@ -4738,6 +5243,14 @@ fn frame_arriving(previous: Option<Previous>, image: (u32, u32), window: (u32, u
         let mut view = previous.view;
         view.rebase(image);
         return view;
+    }
+
+    // The same file arriving again whole — written again on disk by an editor
+    // or a generator, or opened again — is the picture already on screen in a
+    // newer state. It is looked at where it was being looked at: a person who
+    // zoomed in to check an edit wants to see the edit there, not a fresh fit.
+    if previous.same_file {
+        return previous.view.carry_onto(image, window, scale_factor);
     }
 
     // With the lock on, the framing carries from the picture before — the same
@@ -4842,6 +5355,12 @@ impl ApplicationHandler<Event> for App {
             Event::Counted(path, histogram) => self.counted(path, *histogram),
             #[cfg(windows)]
             Event::Open(paths) => self.handed_over(paths),
+            Event::FolderChanged(dir) => self.folder_changed(&dir),
+            Event::Wallpaper(outcome) => self.wallpaper_done(outcome),
+            Event::Scheduled(status) => {
+                self.interface.set_wallpaper_status(status);
+                self.request_redraw();
+            }
         }
     }
 
@@ -4858,6 +5377,11 @@ impl ApplicationHandler<Event> for App {
         self.open_dropped();
         self.watch_the_display();
         self.watch_the_other_display();
+        self.keep_watch();
+        if self.rescan_due.is_some_and(|due| Instant::now() >= due) {
+            self.rescan_folder();
+        }
+        self.put_up_owed_arrival();
 
         // The idle gate's window has run out: quit so it can read what the
         // still picture cost. Checked here because this is where the loop
@@ -4913,6 +5437,8 @@ impl ApplicationHandler<Event> for App {
             blink_due,
             self.slideshow.as_ref().and_then(|show| show.clock.due()),
             self.idle_deadline,
+            // Only after the folder changed: a quiet folder adds no wake.
+            self.rescan_due,
         ];
         let flow = wakes.into_iter().flatten().fold(self.idle_until(), |flow, due| match flow {
             ControlFlow::WaitUntil(other) => ControlFlow::WaitUntil(other.min(due)),
@@ -5597,6 +6123,56 @@ mod tests {
         assert_eq!(carried.mode(), FitMode::Free, "the opening setting overrode the zoom lock");
     }
 
+    /// The picture on screen written again on disk arrives as the same file,
+    /// whole, and is looked at where it was being looked at — a person who
+    /// zoomed in to check an edit wants to see the edit there. A neighbour
+    /// arriving the same way, without the lock, is still fitted.
+    #[test]
+    fn the_same_file_written_again_keeps_its_framing() {
+        let mut zoomed = View::new((4000, 3000), (1000, 800), 1.0);
+        zoomed.zoom_to_at(3.0, (500.0, 400.0));
+        let previous = |same_file| {
+            Some(Previous {
+                view: zoomed,
+                fidelity: Fidelity::Full,
+                same_file,
+            })
+        };
+
+        let again = frame_arriving(previous(true), (4000, 3000), (1000, 800), 1.0, false, Opening::Fit);
+        assert_eq!(again.mode(), FitMode::Free, "the picture written again was fitted afresh");
+        assert!((again.scale() - 3.0).abs() < 0.01, "the zoom moved to {}", again.scale());
+
+        let neighbour = frame_arriving(previous(false), (4000, 3000), (1000, 800), 1.0, false, Opening::Fit);
+        assert_eq!(neighbour.mode(), FitMode::Fit);
+    }
+
+    /// A folder being written to is read once it goes quiet, and a folder
+    /// that never goes quiet is read anyway, every so often.
+    #[test]
+    fn a_changing_folder_is_read_once_quiet_but_not_never() {
+        let start = Instant::now();
+        // One change: read a quarter-second after it.
+        assert_eq!(rescan_at(start, start), start + FOLDER_QUIET);
+        // A run of changes pushes the reading on...
+        let later = start + Duration::from_millis(900);
+        assert_eq!(rescan_at(start, later), later + FOLDER_QUIET);
+        // ...but not past the patience: a long copy is read while it goes on.
+        let much_later = start + Duration::from_secs(10);
+        assert_eq!(rescan_at(start, much_later), start + FOLDER_PATIENCE);
+    }
+
+    /// Not following, an arrival is named with the key that would have put it
+    /// up; following, it is said to wait for the box in front of it.
+    #[test]
+    fn an_arrival_not_put_up_is_named() {
+        let one = [PathBuf::from("out").join("cat.png")];
+        assert_eq!(arrivals_message(&one, false), "new: cat.png (N follows the folder)");
+        assert_eq!(arrivals_message(&one, true), "new: cat.png — up once this is closed");
+        let three = [PathBuf::from("a.png"), PathBuf::from("b.png"), PathBuf::from("c.png")];
+        assert_eq!(arrivals_message(&three, false), "3 new pictures (N follows the folder)");
+    }
+
     /// Even under the lock, a file's own full image replaces its thumbnail by
     /// rebasing rather than by carrying: the two are the same picture, and
     /// carrying would re-derive the framing from a fraction instead of
@@ -6103,7 +6679,7 @@ mod tests {
             .map(|(key, _)| *key)
             .filter(|key| (key.starts_with("Ctrl+") || key.starts_with("Alt+")) && !key.contains("Drag") && !key.contains("Wheel"))
             .collect();
-        assert_eq!(advertised.len(), 11, "the sheet lists {advertised:?}, which is not the eleven chords");
+        assert_eq!(advertised.len(), 12, "the sheet lists {advertised:?}, which is not the twelve chords");
 
         // What each letter chord answers with, so two rows of the sheet
         // cannot quietly be the same key. Until v0.30.0 `chord_for` matched

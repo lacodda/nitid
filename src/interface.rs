@@ -132,7 +132,12 @@ pub struct Status {
     /// the arrow keys do, and the count beside it already reads differently
     /// while it is up. A mode with no sign of itself is a mode the user
     /// fights rather than uses — the same rule the locked framing follows.
-    pub filtered: bool,
+    pub marked: bool,
+    /// The name pattern the walk is narrowed to, as typed. Shown beside the
+    /// count for the same reason the marks filter is.
+    pub pattern: Option<String>,
+    /// Whether the newest picture is put up as it arrives in the folder.
+    pub following: bool,
     /// The comparison, while two pictures are up.
     pub compared: Option<Compared>,
     /// The slideshow, while one runs.
@@ -304,12 +309,12 @@ pub struct Interface {
     info_shown: bool,
     /// Whether the histogram is showing.
     histogram_shown: bool,
-    /// A name the box committed this frame, waiting to be collected.
+    /// What a one-line box committed this frame, waiting to be collected.
     ///
-    /// Cleared by [`take_rename`](Self::take_rename), so a name is acted on
-    /// once: laying out again before it is collected would otherwise rename
-    /// the file a second time.
-    renamed: Option<String>,
+    /// Cleared by [`take_typed`](Self::take_typed), so it is acted on once:
+    /// laying out again before it is collected would otherwise rename the
+    /// file a second time.
+    typed: Option<(Asking, String)>,
     /// A save the box committed this frame, waiting to be collected.
     ///
     /// Cleared by [`take_save`](Self::take_save), for the reason the rename is:
@@ -320,19 +325,20 @@ pub struct Interface {
     /// Held for the same reason the other two are: laying out again before it
     /// is collected would take the crop twice.
     cropped: Option<CropAction>,
-    /// The name being typed, while the rename box is up.
+    /// What is being typed, while a one-line box is up: a new name for the
+    /// file, or a pattern for the names to walk.
     ///
-    /// `None` means the box is not showing. The name lives here rather than in
-    /// the application because it is interface state — half-typed text that
+    /// `None` means no box is showing. The text lives here rather than in the
+    /// application because it is interface state — half-typed text that
     /// exists only while the box is open, and that the application must never
     /// see until it is committed.
-    renaming: Option<String>,
+    typing: Option<Typing>,
     /// Whether the box has been given the keyboard yet.
     ///
     /// egui gives focus to a widget by id, and the widget does not exist until
     /// it is laid out — so the request has to happen on the frame after the
     /// box appears, not on the one that opens it.
-    rename_focused: bool,
+    typing_focused: bool,
     /// The save box, when it is up. Interface state for the same reason the
     /// rename box is: a half-made choice the application must not see until it
     /// is committed.
@@ -385,6 +391,12 @@ pub struct Interface {
     /// in the digest for the same reason as the units.
     magnifier: bool,
     toasts: Vec<Toast>,
+    /// What the Desktop section says the schedule is doing, as last asked of
+    /// the Task Scheduler. `None` when nothing changes the picture on its own.
+    wallpaper_status: Option<String>,
+    /// Whether the Desktop section's stop button was pressed this frame,
+    /// waiting to be collected.
+    wallpaper_stop: bool,
     /// The last thing laid out, kept so an unchanged frame can be skipped.
     last: Option<String>,
 }
@@ -405,11 +417,12 @@ pub enum Section {
     Sending,
     Files,
     Programs,
+    Desktop,
 }
 
 impl Section {
     /// The sections down the left of the dialog, in the order they are shown.
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::Gestures,
         Self::Appearance,
         Self::Opening,
@@ -418,6 +431,7 @@ impl Section {
         Self::Sending,
         Self::Files,
         Self::Programs,
+        Self::Desktop,
     ];
 
     /// What the section is called in its list.
@@ -431,6 +445,7 @@ impl Section {
             Self::Sending => "Sending",
             Self::Files => "Files",
             Self::Programs => "Programs",
+            Self::Desktop => "Desktop",
         }
     }
 }
@@ -454,11 +469,11 @@ impl Interface {
             keys_shown: false,
             info_shown: false,
             histogram_shown: false,
-            renamed: None,
+            typed: None,
             saved: None,
             cropped: None,
-            renaming: None,
-            rename_focused: false,
+            typing: None,
+            typing_focused: false,
             saving: None,
             cleaning: None,
             cleaned: None,
@@ -474,6 +489,8 @@ impl Interface {
             units: Units::default(),
             magnifier: true,
             toasts: Vec::new(),
+            wallpaper_status: None,
+            wallpaper_stop: false,
             last: None,
         }
     }
@@ -501,8 +518,21 @@ impl Interface {
     /// the name and leaves the extension: that is the common case, and the
     /// rarer one is one keystroke away.
     pub fn begin_rename(&mut self, name: &str) {
-        self.renaming = Some(name.to_string());
-        self.rename_focused = false;
+        self.typing = Some(Typing {
+            asking: Asking::Name,
+            text: name.to_string(),
+        });
+        self.typing_focused = false;
+    }
+
+    /// Open the pattern box, with the pattern that is up already in it —
+    /// selected whole, so typing replaces it and a key or two edits it.
+    pub fn begin_pattern(&mut self, pattern: &str) {
+        self.typing = Some(Typing {
+            asking: Asking::Pattern,
+            text: pattern.to_string(),
+        });
+        self.typing_focused = false;
     }
 
     /// Open the save box for the file on screen.
@@ -585,15 +615,16 @@ impl Interface {
         self.cleaned.take()
     }
 
-    /// Whether the rename box is up, which is what tells the application that
+    /// Whether a one-line box is up, which is what tells the application that
     /// the keyboard belongs to it.
-    pub fn renaming(&self) -> bool {
-        self.renaming.is_some()
+    pub fn typing(&self) -> bool {
+        self.typing.is_some()
     }
 
-    /// Take the name the box committed, if it did this frame.
-    pub fn take_rename(&mut self) -> Option<String> {
-        self.renamed.take()
+    /// Take what a one-line box committed, if one did this frame, and what it
+    /// was asking for.
+    pub fn take_typed(&mut self) -> Option<(Asking, String)> {
+        self.typed.take()
     }
 
     /// Take the save the box committed, if it did this frame.
@@ -607,8 +638,13 @@ impl Interface {
     }
 
     /// Put the rename box away without renaming anything.
+    ///
+    /// The name box only: a name belongs to the file whose name is in it, and
+    /// a pattern is about the folder, which a new picture does not change.
     pub fn cancel_rename(&mut self) {
-        self.renaming = None;
+        if self.typing.as_ref().is_some_and(|typing| typing.asking == Asking::Name) {
+            self.typing = None;
+        }
     }
 
     /// Show or hide the histogram.
@@ -659,6 +695,21 @@ impl Interface {
     /// Put the settings dialog away.
     pub fn close_settings(&mut self) {
         self.settings_shown = false;
+    }
+
+    /// What the Desktop section should say the schedule is doing.
+    pub fn set_wallpaper_status(&mut self, status: Option<String>) {
+        if self.wallpaper_status != status {
+            self.wallpaper_status = status;
+            // Arrives from a worker, between frames: the section has to be
+            // drawn again to say it.
+            self.owed_frame = true;
+        }
+    }
+
+    /// Whether the Desktop section's stop button was pressed.
+    pub fn take_wallpaper_stop(&mut self) -> bool {
+        std::mem::take(&mut self.wallpaper_stop)
     }
 
     /// Whether the colour passport is showing.
@@ -741,6 +792,8 @@ impl Interface {
         let magnifier = config.tools.magnifier;
         self.magnifier = magnifier;
         let minimap = self.chrome.minimap;
+        let wallpaper_status = self.wallpaper_status.clone();
+        let mut wallpaper_stop = false;
         // The texture the minimap draws, kept across frames: uploading a copy
         // of the picture on every frame would put a texture upload inside a
         // drag, which is exactly where the viewer must not spend anything.
@@ -748,9 +801,9 @@ impl Interface {
         let mut mark_texture = self.mark_texture.take();
         // Taken out for the frame and put back after, the way the texture is:
         // the closure cannot hold a borrow of `self`.
-        let mut renaming = self.renaming.take();
-        let mut rename_focused = self.rename_focused;
-        let mut rename_outcome = None;
+        let mut typing = self.typing.take();
+        let mut typing_focused = self.typing_focused;
+        let mut typing_outcome = None;
         let mut crop_action = None;
         let mut saving = self.saving.take();
         let mut cleaning = self.cleaning.take();
@@ -804,10 +857,10 @@ impl Interface {
                 key_sheet(ui, sorting_set, programs_set);
             }
             if settings_shown {
-                edited = settings_dialog(ui, config, &mut section, &mut closed);
+                edited = settings_dialog(ui, config, &mut section, &mut closed, wallpaper_status.as_deref(), &mut wallpaper_stop);
             }
-            if let Some(name) = renaming.as_mut() {
-                rename_outcome = rename_box(ui, name, &mut rename_focused);
+            if let Some(typing) = typing.as_mut() {
+                typing_outcome = line_box(ui, typing, &mut typing_focused);
             }
             if let Some(save) = saving.as_mut() {
                 save_outcome = save_box(ui, save, &mut save_focused);
@@ -830,6 +883,10 @@ impl Interface {
         self.minimap_texture = minimap_texture;
         self.mark_texture = mark_texture;
         self.cropped = crop_action;
+        if wallpaper_stop {
+            self.wallpaper_stop = true;
+            self.owed_frame = true;
+        }
         // A press on the bar happened inside this layout, so the frame that
         // carried it was drawn before the box moved. The frame that agrees
         // with itself has to be asked for — the same rule the settings
@@ -837,12 +894,13 @@ impl Interface {
         if crop_action.is_some() {
             self.owed_frame = true;
         }
-        self.rename_focused = rename_focused;
+        self.typing_focused = typing_focused;
         self.save_focused = save_focused;
         // A box that was committed or cancelled does not come back next frame.
-        self.renaming = match rename_outcome {
+        let asked = typing.as_ref().map(|typing| typing.asking);
+        self.typing = match typing_outcome {
             Some(_) => None,
-            None => renaming,
+            None => typing,
         };
         self.saving = match save_outcome {
             Some(_) => None,
@@ -869,10 +927,10 @@ impl Interface {
         // `layout` returns: a fourth element on that tuple would make every
         // call site say what it is ignoring. A frame is owed either way — the
         // box appearing and the box going away both have to be drawn.
-        if let Some(outcome) = rename_outcome {
-            self.renamed = match outcome {
-                Renamed::To(name) => Some(name),
-                Renamed::Cancelled => None,
+        if let Some(outcome) = typing_outcome {
+            self.typed = match (outcome, asked) {
+                (Typed::Commit(text), Some(asking)) => Some((asking, text)),
+                _ => None,
             };
             self.owed_frame = true;
         }
@@ -971,7 +1029,10 @@ impl Interface {
                 ))
             )
             // The box itself, and every keystroke in it.
-            + &format!("|{:?}", self.renaming)
+            + &format!("|{:?}", self.typing)
+            // The filters and the following, which change what the status
+            // line says without anything else in the digest moving.
+            + &format!("|{}|{:?}|{}", status.marked, status.pattern, status.following)
             // A show starting, pausing, changing pace or order, and the other
             // display coming and going.
             + &format!("|{:?}|{}", status.slideshow, status.presenting)
@@ -1157,7 +1218,7 @@ fn toolbar_groups(status: &Status, info_shown: bool, histogram_shown: bool) -> V
                 status.mark == crate::cull::Mark::Reject,
                 Action::Reject,
             ),
-            state("Marked", "Walk only the pictures that are marked  (M)", !alone, status.filtered, Action::Filter),
+            state("Marked", "Walk only the pictures that are marked  (M)", !alone, status.marked, Action::Filter),
             state(
                 "Compare",
                 "Put the next one beside this one; again to stop  (V)",
@@ -1312,11 +1373,17 @@ fn status_line(ui: &mut egui::Ui, status: &Status) -> Option<Action> {
                     // differently from the folder on disk is exactly the thing
                     // that needs explaining, and the explanation belongs next
                     // to it.
-                    if status.filtered {
-                        ui.label(counted).on_hover_text("Only the marked pictures are being walked  (M)");
-                        ui.label(egui::RichText::new("marked only").strong());
-                    } else {
-                        ui.label(counted);
+                    let counted = ui.label(counted);
+                    if status.marked || status.pattern.is_some() {
+                        counted.on_hover_text("Not every picture in the folder is being walked: Ctrl+F names them, M keeps the marked ones");
+                    }
+                    if let Some(pattern) = &status.pattern {
+                        ui.label(egui::RichText::new(pattern).strong())
+                            .on_hover_text("Only the names matching this are walked  (Ctrl+F to change, an empty box for every name)");
+                    }
+                    if status.marked {
+                        ui.label(egui::RichText::new("marked only").strong())
+                            .on_hover_text("Only the marked pictures are being walked  (M)");
                     }
                 }
 
@@ -1403,6 +1470,13 @@ fn status_line(ui: &mut egui::Ui, status: &Status) -> Option<Action> {
                         separator(ui);
                         ui.label(egui::RichText::new("on the other display").strong())
                             .on_hover_text("The picture is on another display too  (D for the next one or to stop)");
+                    }
+                    // The window changes pictures by itself while following,
+                    // so it says so where the other self-moving modes do.
+                    if status.following {
+                        separator(ui);
+                        ui.label(egui::RichText::new("following").strong())
+                            .on_hover_text("The newest picture comes up as it arrives in the folder  (N to stop)");
                     }
                     // A comparison changes what the arrow keys and the zoom
                     // do, so it says so where the zoom is read.
@@ -2290,16 +2364,67 @@ fn clean_box(ui: &mut egui::Ui, cleaning: &mut Cleaning) -> Option<Cleaned> {
     outcome
 }
 
-/// What the rename box decided this frame.
+/// What a one-line box is asking for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Asking {
+    /// A new name for the file on screen (`F2`).
+    Name,
+    /// A pattern for the names the arrow keys walk (`Ctrl+F`).
+    Pattern,
+}
+
+impl Asking {
+    /// The box's title.
+    fn title(self) -> &'static str {
+        match self {
+            Self::Name => "Rename",
+            Self::Pattern => "Walk only the names that match",
+        }
+    }
+
+    /// What the empty field says it wants.
+    fn hint(self) -> &'static str {
+        match self {
+            Self::Name => "a name for this file",
+            Self::Pattern => "*.png, IMG_????.jpg, or a word in the name",
+        }
+    }
+
+    /// The button that commits.
+    fn commit(self) -> &'static str {
+        match self {
+            Self::Name => "Rename",
+            Self::Pattern => "Walk these",
+        }
+    }
+
+    /// The line under the field.
+    fn help(self) -> &'static str {
+        match self {
+            Self::Name => "Enter to rename, Esc to cancel",
+            Self::Pattern => "Enter to walk them, an empty box for every name, Esc to cancel",
+        }
+    }
+}
+
+/// A one-line box while it is up.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Renamed {
-    /// Commit this name.
-    To(String),
+struct Typing {
+    asking: Asking,
+    text: String,
+}
+
+/// What a one-line box decided this frame.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Typed {
+    /// Commit this text.
+    Commit(String),
     /// Put the box away and change nothing.
     Cancelled,
 }
 
-/// The name box: type a new name for the file on screen.
+/// A one-line box: a new name for the file on screen, or a pattern for the
+/// names to walk.
 ///
 /// Centred like the colour passport, and for the same reason — this is done
 /// deliberately, once, and the picture behind it is not what is being read
@@ -2309,10 +2434,11 @@ enum Renamed {
 /// open so that typing a name does not also step through the folder and
 /// toggle the zebra. That last part is the application's job: this reports
 /// that it is open, and the application stops answering keys.
-fn rename_box(ui: &mut egui::Ui, name: &mut String, focused: &mut bool) -> Option<Renamed> {
+fn line_box(ui: &mut egui::Ui, typing: &mut Typing, focused: &mut bool) -> Option<Typed> {
     let mut outcome = None;
+    let asking = typing.asking;
 
-    egui::Window::new("Rename")
+    egui::Window::new(asking.title())
         .collapsible(false)
         .resizable(false)
         // See the settings dialog: a viewer that lays out only on demand
@@ -2323,7 +2449,11 @@ fn rename_box(ui: &mut egui::Ui, name: &mut String, focused: &mut bool) -> Optio
         .show(ui.ctx(), |ui| {
             ui.set_min_width(360.0);
 
-            let field = ui.add(egui::TextEdit::singleline(name).desired_width(f32::INFINITY).hint_text("a name for this file"));
+            let field = ui.add(
+                egui::TextEdit::singleline(&mut typing.text)
+                    .desired_width(f32::INFINITY)
+                    .hint_text(asking.hint()),
+            );
 
             // Focus on the frame after the box appears: egui gives focus to a
             // widget by id, and the widget does not exist until it has been
@@ -2333,42 +2463,51 @@ fn rename_box(ui: &mut egui::Ui, name: &mut String, focused: &mut bool) -> Optio
                 *focused = true;
             }
 
-            // The name without its extension, selected, so typing replaces
-            // the name and leaves ".jpg" alone — the common case. Done once,
-            // on the frame focus is taken, or every keystroke would put the
-            // selection back and the box could not be edited at all.
-            if field.gained_focus()
-                && let Some(stem) = name.rfind('.').filter(|dot| *dot > 0)
-            {
-                select_range(ui, field.id, 0, stem);
+            // Done once, on the frame focus is taken, or every keystroke would
+            // put the selection back and the box could not be edited at all.
+            if field.gained_focus() {
+                match asking {
+                    // The name without its extension, selected, so typing
+                    // replaces the name and leaves ".jpg" alone — the common
+                    // case.
+                    Asking::Name => {
+                        if let Some(stem) = typing.text.rfind('.').filter(|dot| *dot > 0) {
+                            select_range(ui, field.id, 0, stem);
+                        }
+                    }
+                    // The whole pattern: a new one is typed over it, and the
+                    // old one is a key away from being edited instead.
+                    Asking::Pattern => select_range(ui, field.id, 0, typing.text.chars().count()),
+                }
             }
 
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                if ui.button("Rename").clicked() {
-                    outcome = Some(Renamed::To(name.clone()));
+                if ui.button(asking.commit()).clicked() {
+                    outcome = Some(Typed::Commit(typing.text.clone()));
                 }
                 if ui.button("Cancel").clicked() {
-                    outcome = Some(Renamed::Cancelled);
+                    outcome = Some(Typed::Cancelled);
                 }
-                ui.label(egui::RichText::new("Enter to rename, Esc to cancel").weak().small());
+                ui.label(egui::RichText::new(asking.help()).weak().small());
             });
 
             // Enter commits from inside the field, which is where the hands
             // already are.
             if field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
-                outcome = Some(Renamed::To(name.clone()));
+                outcome = Some(Typed::Commit(typing.text.clone()));
             }
             if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
-                outcome = Some(Renamed::Cancelled);
+                outcome = Some(Typed::Cancelled);
             }
         });
 
     // An empty name is not a rename. Treated as a cancel rather than handed
     // to the file layer, which would refuse it with a message about something
-    // the person can see for themselves.
+    // the person can see for themselves. An empty pattern is an answer: every
+    // name again.
     match outcome {
-        Some(Renamed::To(name)) if name.trim().is_empty() => Some(Renamed::Cancelled),
+        Some(Typed::Commit(text)) if asking == Asking::Name && text.trim().is_empty() => Some(Typed::Cancelled),
         other => other,
     }
 }
@@ -2480,7 +2619,7 @@ fn key_sheet(ui: &mut egui::Ui, sorting_set: bool, programs_set: bool) {
 /// Every control here edits the config in place. There is no OK button and
 /// nothing to apply — the dialog is a view onto the settings, not a copy of
 /// them that has to be reconciled.
-fn settings_dialog(ui: &mut egui::Ui, config: &mut Config, section: &mut Section, closed: &mut bool) -> bool {
+fn settings_dialog(ui: &mut egui::Ui, config: &mut Config, section: &mut Section, closed: &mut bool, wallpaper: Option<&str>, stop: &mut bool) -> bool {
     let mut edited = false;
 
     // Closed by its own button as well as by Esc: a dialog with no visible
@@ -2539,6 +2678,7 @@ fn settings_dialog(ui: &mut egui::Ui, config: &mut Config, section: &mut Section
                                 Section::Slideshow => slideshow_section(ui, &mut config.slideshow),
                                 Section::Tools => tools_section(ui, &mut config.tools),
                                 Section::Sending => sending_section(ui, &mut config.sending),
+                                Section::Desktop => desktop_section(ui, &mut config.wallpaper, wallpaper, stop),
                             };
                         });
                 });
@@ -2823,6 +2963,78 @@ fn slideshow_section(ui: &mut egui::Ui, slideshow: &mut crate::config::Slideshow
     edited
 }
 
+/// The desktop's picture: how often a folder changes it, and how it meets the
+/// screen.
+///
+/// What changes it is chosen in the viewer, not here — `Shift+W` with the
+/// folder open, narrowed by the pattern on `Ctrl+F` — because a folder is
+/// something a person is looking at, and choosing one from a path box would
+/// be choosing it blind. This section says what is running and lets it stop.
+fn desktop_section(ui: &mut egui::Ui, settings: &mut crate::wallpaper::Settings, status: Option<&str>, stop: &mut bool) -> bool {
+    let mut edited = false;
+
+    ui.label(egui::RichText::new("Desktop picture").strong());
+    ui.add_space(6.0);
+    match status {
+        Some(status) => {
+            ui.label(status);
+            ui.add_space(2.0);
+            if ui.button("Stop changing it").clicked() {
+                *stop = true;
+            }
+        }
+        None => {
+            ui.label("It does not change on its own.");
+        }
+    }
+
+    ui.add_space(10.0);
+    ui.label("A folder changes it every");
+    // Every step of the ladder as a choice of its own, wrapped: a drop-down
+    // needs frames to open and close, and this viewer lays out only on demand.
+    ui.horizontal_wrapped(|ui| {
+        for minutes in crate::wallpaper::Every::LADDER {
+            let every = crate::wallpaper::Every::minutes(minutes);
+            edited |= ui.selectable_value(&mut settings.every, every, every.text()).changed();
+        }
+    });
+    if !crate::wallpaper::Every::LADDER.contains(&settings.every.in_minutes()) {
+        ui.label(
+            egui::RichText::new(format!("Now every {}, as set from the command line.", settings.every.text()))
+                .weak()
+                .small(),
+        );
+    }
+
+    ui.add_space(6.0);
+    edited |= choice(
+        ui,
+        "The picture is",
+        &mut settings.fit,
+        &[
+            (crate::wallpaper::Fit::Fill, "filling the screen"),
+            (crate::wallpaper::Fit::Fit, "whole on the screen"),
+        ],
+    );
+
+    ui.add_space(8.0);
+    ui.label(
+        egui::RichText::new(
+            "W puts the picture on screen on the desktop. Shift+W changes it from the open folder instead — only the names Ctrl+F narrowed the walk to, a picture that has just arrived first — and Shift+W again stops it.",
+        )
+        .weak()
+        .small(),
+    );
+    ui.add_space(4.0);
+    ui.label(
+        egui::RichText::new("The desktop gets a copy made for it: in sRGB, upright, and no bigger than the largest display needs. nitid wallpaper does the same from a terminal.")
+            .weak()
+            .small(),
+    );
+
+    edited
+}
+
 /// An interval typed into the slider: "45", "45 s", "2 min", "1 min 30 s".
 fn seconds_from(text: &str) -> Option<f64> {
     let mut seconds = 0.0;
@@ -2988,6 +3200,10 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Shift+S", "the same, in a random order"),
     ("↑ ↓", "during a slideshow, longer / shorter on each picture"),
     ("D", "show the picture on another display too; again for the next one or to stop"),
+    ("N", "follow the folder: the newest picture now, and each new one as it arrives"),
+    ("W", "put this picture on the desktop"),
+    ("Shift+W", "change the desktop's picture from this folder on a schedule; again to stop"),
+    ("Ctrl+F", "walk only the names that match, such as *.png"),
     ("Ctrl+X", "frame a crop; Enter saves it as a copy, Esc leaves it"),
     ("Ctrl+Drag", "drag the picture into another window"),
     ("Ctrl+C", "copy the picture"),
@@ -3427,7 +3643,9 @@ mod tests {
             thumbnail: None,
             visible: (0.0, 0.0, 1.0, 1.0),
             mark: crate::cull::Mark::Unmarked,
-            filtered: false,
+            marked: false,
+            pattern: None,
+            following: false,
             compared: None,
             slideshow: None,
             presenting: false,

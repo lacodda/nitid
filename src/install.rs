@@ -135,6 +135,14 @@ pub fn uninstall() -> Result<()> {
         Err(error) => eprintln!("nitid: could not remove the desktop shortcut: {error:#}"),
     }
 
+    // A schedule left behind would start a program that is no longer there,
+    // every half hour, for as long as the machine lives.
+    match crate::wallpaper::forget_schedule() {
+        Ok(true) => println!("Removed the desktop picture's schedule"),
+        Ok(false) => {}
+        Err(error) => eprintln!("nitid: could not remove the desktop picture's schedule: {error:#}"),
+    }
+
     // The decoder's AppContainer profile is machine state nitid registered on
     // its first sandboxed decode; uninstalling takes it too. A machine that
     // never decoded a HEIC has nothing to remove, which is not an error.
