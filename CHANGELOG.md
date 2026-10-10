@@ -2,6 +2,17 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.37.0] - 2026-10-10
+
+### Bug Fixes
+- Read a letter key by its place on any keyboard layout
+
+### Documentation
+- Describe following a folder and the desktop's picture
+
+### Features
+- Follow the open folder and feed the desktop from it
+
 ## [0.36.0] - 2026-10-05
 
 ### Documentation
