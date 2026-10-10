@@ -58,7 +58,9 @@ deduce. Switching it on does not move the picture you are looking at, even when
 that picture is one the filter leaves out: the frame you just judged is usually
 still on screen, and it is the next arrow key that takes you into the
 selection. `M` again gives the whole folder back. With nothing marked yet, the
-viewer says so instead of leaving the arrow keys quietly doing nothing.
+viewer says so instead of leaving the arrow keys quietly doing nothing. It
+works together with the name filter on `Ctrl+F`: `*.png` and `M` walk the
+marked PNGs — see [Following a folder](/nitid/guides/following-a-folder/).
 
 **`F2` renames it.** The box opens with the whole name in it and the stem
 selected, so typing replaces the name and leaves `.jpg` alone, while renaming
@@ -83,8 +85,10 @@ only overrides the choice. `Alt+1` through `Alt+9` open the file in programs
 you name yourself, for the ones the system would never pick: a raw converter,
 a batch stamper, an upload script.
 
-Nothing waits for the program to close, and the picture is not reloaded when
-it does — an edit takes as long as it takes, and `R` reloads when you want it.
+Nothing waits for the program to close: an edit takes as long as it takes.
+When the program saves over the file, the viewer sees the file written again
+and loads it afresh, framed where you were looking — so checking an edit is a
+matter of saving and looking back.
 
 **`Ctrl+S` keeps a turn.** `R` and `Shift+R` turn the picture on screen and
 always have; pressing `Ctrl+S` writes that turn into the file, so it stays

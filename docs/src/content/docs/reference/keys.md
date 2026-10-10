@@ -40,6 +40,10 @@ Opening a file opens its folder: the arrow keys walk the images beside it.
 | `Shift+S` | the same, in a random order |
 | `↑` `↓` | during a slideshow, longer / shorter on each picture |
 | `D` | show the picture on another display too; again for the next display or to stop |
+| `N` | follow the folder: the newest picture now, and each new one as it arrives |
+| `Ctrl+F` | walk only the names that match, such as `*.png` |
+| `W` | put this picture on the desktop |
+| `Shift+W` | change the desktop's picture from this folder on a schedule; again to stop |
 | `Ctrl+X` | frame a crop; Enter saves it as a copy, Esc leaves it |
 | `Ctrl+Drag` | drag the picture into another window |
 | `Ctrl+C` | copy the picture |
@@ -68,7 +72,7 @@ here as everywhere else on a scaled display.
 
 `,` opens the settings, or the gear on the toolbar; `Esc` closes them. There is
 no OK button — a change takes effect as it is made, so a threshold can be
-dragged while watching what it marks. Eight sections:
+dragged while watching what it marks. Nine sections:
 
 | Section | What it holds |
 | --- | --- |
@@ -80,15 +84,35 @@ dragged while watching what it marks. Eight sections:
 | Sending | the size budget and the maximum width `Ctrl+Alt+C` copies a picture to |
 | Files | the nine folders `Ctrl+1`-`9` sort a picture into |
 | Programs | the editor `E` opens a picture in, and the nine programs `Alt+1`-`9` hand it to |
+| Desktop | what is changing the desktop's picture, and a button to stop it; how often a folder changes it, from five minutes to a day; and whether the picture fills the screen or shows whole |
 
 Ctrl+wheel always performs whichever gesture the bare wheel does not, so both
 are reachable whichever way round the setting is.
 
 Settings live in `%APPDATA%\lacodda\nitid\settings.conf`, one `key = value`
-per line, meant to be readable and repairable by hand. A key the running
+per line, meant to be readable and repairable by hand. The Desktop section's
+are in `wallpaper.conf` beside it, because the command line changes them too
+and an open viewer writes `settings.conf` whole when it closes. A key the running
 version does not recognise is left alone rather than dropped, so a newer
 build's settings survive a run of an older one — see
 [ADR 0022](https://github.com/lacodda/nitid/blob/main/docs/adr/0022-settings-are-plain-lines-that-survive-both-directions.md).
+
+### Commands
+
+| Command | What it does |
+| --- | --- |
+| `nitid FILE...` | open the images; one file browses its folder, several browse themselves |
+| `nitid install` | install for this user and register the file types |
+| `nitid uninstall` | undo that, and take away the desktop picture's schedule if one is running |
+| `nitid wallpaper FOLDER` | change the desktop's picture from `FOLDER`, every 30 minutes |
+| `nitid wallpaper ... --every 2h` | how often: `5m`, `90m`, `2h`, `1d`, from a minute to 31 days |
+| `nitid wallpaper ... --only "*.png"` | only the names that match; `--only ""` takes the pattern off |
+| `nitid wallpaper ... --fit fit` | show the whole picture rather than filling the screen (`--fit fill`) |
+| `nitid wallpaper` | say what the desktop's picture is doing; with options and no folder, change how |
+| `nitid wallpaper next` | the next picture, now |
+| `nitid wallpaper off` | stop changing it |
+
+See [The desktop's picture](/nitid/guides/the-desktop-picture/).
 
 ### Environment
 
@@ -101,3 +125,4 @@ build's settings survive a run of an older one — see
 | `NITID_INSTANCE_ID=<text>` | share a window only with launches carrying the same value, so a test never talks to the viewer you have open |
 | `NITID_SECOND_SCREEN_HERE=1` | let `D` open the other display as a plain window on this one, so the second screen can be exercised on a machine with a single display |
 | `NITID_HANDOVER_REPORT=1` | print which process the foreground was offered to when a file is handed over; used by the one-window gate |
+| `NITID_DESKTOP_RECORD=<file>` | write what the desktop would have been told into the file instead of changing the desktop's picture, so the whole way there can be run on a desktop that is not the test's to change |

@@ -32,8 +32,8 @@ with** — right-click an image, choose *Open with* → *Choose another app*, pi
 nitid and tick *Always use this app*. It also shows up in *Settings → Apps →
 Default apps*.
 
-`nitid uninstall` removes the files, the registration, the `PATH` entry, and
-the desktop shortcut.
+`nitid uninstall` removes the files, the registration, the `PATH` entry, the
+desktop shortcut, and the desktop picture's schedule if one is running.
 
 ## The first minute
 

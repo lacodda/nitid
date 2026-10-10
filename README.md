@@ -46,6 +46,11 @@ difference, not the function.
   shuffled like a deck, and `D` puts the picture on a television or a
   projector while the laptop keeps its window - in HDR there if the television
   has it.
+- **A folder that keeps up.** Pictures written into the open folder join the
+  walk as they land, and `N` puts each new render, generation or tethered shot
+  on screen the moment it arrives - narrowed to `*.png` by `Ctrl+F` if you
+  like. `Shift+W` feeds the desktop's picture from the folder on a schedule,
+  newcomers first.
 - **A copy without the camera, the date and the place.** `Ctrl+M` strips EXIF,
   XMP and IPTC by not copying them - no encoder runs, so the photograph you send
   is the photograph you took.
