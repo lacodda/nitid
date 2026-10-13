@@ -15,6 +15,8 @@ mod app;
 mod avif;
 mod clipboard;
 mod color;
+#[cfg(windows)]
+mod com;
 mod compare;
 mod config;
 mod console;
@@ -25,6 +27,7 @@ mod editor;
 mod export;
 mod eyedropper;
 mod files;
+mod fit;
 mod folder;
 mod format;
 mod gpu;
@@ -41,6 +44,11 @@ mod loader;
 mod metadata;
 mod minimap;
 mod pattern;
+// The page is laid out and tested everywhere, but only Windows has a print
+// system to hand it to: elsewhere `print::show` says so, and the layout goes
+// unused outside the tests. The arrangement `sandbox::protocol` uses.
+#[cfg_attr(not(windows), allow(dead_code))]
+mod print;
 mod rotate;
 mod sandbox;
 mod scrub;
@@ -111,12 +119,38 @@ pub mod testing {
     /// fallback does.
     pub use crate::export::cut;
 
+    /// A sheet and its printable area, in the print system's units.
+    pub use crate::print::{Area as PrintArea, Page as PrintPage};
+
+    /// Print a file into an XPS document rather than to a printer: the page
+    /// the print dialog hands a printer, drawn by the same code from the same
+    /// job, for a gate that runs where there is no printer at all.
+    #[cfg(windows)]
+    pub fn print_to_xps(source: &std::path::Path, page: crate::print::Page, fill: bool, out: &std::path::Path) -> anyhow::Result<()> {
+        let bytes = std::fs::read(source)?;
+        let loaded = crate::image_source::decode(&bytes)?;
+        let picture = match &loaded.vector {
+            Some(vector) => crate::print::Picture::Vector(vector.clone()),
+            None => crate::print::Picture::Raster {
+                image: loaded.image.clone(),
+                profile: loaded.profile.clone().map(Box::new),
+            },
+        };
+        let job = crate::print::Job {
+            title: source.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default(),
+            picture,
+            orientation: loaded.orientation,
+        };
+        let fit = if fill { crate::fit::Fit::Fill } else { crate::fit::Fit::Fit };
+        crate::print::write_xps(&job, page, fit, out)
+    }
+
     /// Make the desktop's picture from a file, for the displays named — the
     /// very function `W`, `Shift+W` and the schedule hand to Windows, so a
     /// gate over real files of every format runs the path itself and never
     /// touches the desktop.
     pub fn prepare_wallpaper(path: &std::path::Path, screens: &[(u32, u32)], fill: bool) -> anyhow::Result<Vec<u8>> {
-        crate::wallpaper::prepare(path, screens, if fill { crate::wallpaper::Fit::Fill } else { crate::wallpaper::Fit::Fit })
+        crate::wallpaper::prepare(path, screens, if fill { crate::fit::Fit::Fill } else { crate::fit::Fit::Fit })
     }
 
     /// Marking a picture, for the gate that asks Windows whether it can see

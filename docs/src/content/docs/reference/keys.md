@@ -58,6 +58,7 @@ Opening a file opens its folder: the arrow keys walk the images beside it.
 | `Ctrl+S` | write the turn into the file, without touching its pixels |
 | `Ctrl+Shift+S` | save as another format, with the colour you see |
 | `Ctrl+M` | save a copy with the camera, date and place taken out |
+| `Ctrl+P` | print the picture, through the Windows print dialog |
 | `E` | open this file in the program that edits it |
 | `Alt+1`-`9` | open it in the program set for that key |
 | `F11` | fullscreen |

@@ -160,7 +160,7 @@ mod imp {
     use windows::Win32::System::Variant::VARIANT;
     use windows::core::{BSTR, HRESULT};
 
-    use crate::wallpaper::Com;
+    use crate::com::Com;
 
     /// The task's name, in the root of the Task Scheduler's library — where a
     /// person looking for it in the Task Scheduler window finds it first.

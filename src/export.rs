@@ -403,6 +403,29 @@ pub fn baked(image: &DecodedImage, profile: Option<&moxcms::ColorProfile>) -> De
     }
 }
 
+/// The picture as a destination that knows only sRGB receives it: converted,
+/// no longer than `longest` on its long side (`0` for no limit), and upright.
+///
+/// The desktop's picture and a printed page are made this way. Converted
+/// first, so an HDR or sixteen-bit picture is mapped once from its full
+/// precision; made smaller next, which is cheap on eight bits; turned last,
+/// on the small copy.
+pub fn upright_srgb(
+    image: &DecodedImage,
+    profile: Option<&moxcms::ColorProfile>,
+    orientation: crate::image_source::Orientation,
+    longest: u32,
+) -> Result<DecodedImage> {
+    let srgb = baked(image, profile);
+    let small = shrink(&srgb, longest);
+    if orientation == crate::image_source::Orientation::Normal {
+        // Upright already; the turn would be a copy of every pixel.
+        return Ok(small);
+    }
+    let size = crate::eyedropper::shown_size(&small, orientation);
+    cut(&small, orientation, (0, 0, size.0, size.1))
+}
+
 /// Sixteen-bit samples down to eight, unchanged otherwise.
 fn narrow(image: &DecodedImage) -> Vec<u8> {
     match image.depth {

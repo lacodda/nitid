@@ -51,6 +51,9 @@ difference, not the function.
   on screen the moment it arrives - narrowed to `*.png` by `Ctrl+F` if you
   like. `Shift+W` feeds the desktop's picture from the folder on a schedule,
   newcomers first.
+- **A print in the colour you see.** `Ctrl+P` opens the Windows print dialog,
+  preview and all; the page gets the picture as it is on screen - turned,
+  converted, whole on the sheet or filling it.
 - **A copy without the camera, the date and the place.** `Ctrl+M` strips EXIF,
   XMP and IPTC by not copying them - no encoder runs, so the photograph you send
   is the photograph you took.

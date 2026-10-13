@@ -144,6 +144,9 @@ enum Event {
     Wallpaper(Result<String, String>),
     /// What the schedule is doing, for the settings dialog.
     Scheduled(Option<String>),
+    /// The print dialog sent the page to the printer, or the print system
+    /// could not.
+    Printed(crate::print::Outcome),
 }
 
 /// What the viewer is showing, once a file has been opened.
@@ -2347,6 +2350,7 @@ impl App {
             Some(Chord::CleanCopy) => self.begin_clean(),
             Some(Chord::Crop) => self.toggle_crop(),
             Some(Chord::Pattern) => self.begin_pattern(),
+            Some(Chord::Print) => self.print(),
             None => {}
         }
     }
@@ -2900,6 +2904,57 @@ impl App {
         if let Some(folder) = self.folder.as_mut() {
             folder.refilter();
         }
+    }
+
+    /// `Ctrl+P`: print the picture on screen, through the dialog Windows
+    /// prints with (ADR 0036).
+    ///
+    /// What is printed is what is shown: the turn on screen, the frame of an
+    /// animation that is up, a vector drawn for the paper, a pasted picture.
+    /// The colour is made sRGB on the way, by the print module, on one of the
+    /// print system's threads — the window does not wait for a sixty-megapixel
+    /// photograph to be converted before the dialog opens.
+    fn print(&mut self) {
+        let Some(shown) = self.shown.as_ref() else {
+            return;
+        };
+        let orientation = shown.orientation.then(shown.turn);
+        let title = if shown.pasted { "pasted picture".to_string() } else { name_of(&shown.path) };
+
+        let picture = if let Some(vector) = &shown.vector {
+            Some(crate::print::Picture::Vector(vector.clone()))
+        } else if shown.pasted {
+            // Numbers with nothing said about them — see ADR 0020.
+            self.pasted.clone().map(|image| crate::print::Picture::Raster { image, profile: None })
+        } else {
+            match self.loader.request(&shown.path) {
+                Request::Ready(loaded) => {
+                    let image = shown.player.as_ref().map_or_else(|| loaded.image.clone(), |player| player.frame().clone());
+                    Some(crate::print::Picture::Raster {
+                        image,
+                        profile: loaded.profile.clone().map(Box::new),
+                    })
+                }
+                Request::Pending => None,
+            }
+        };
+        let Some(picture) = picture else {
+            self.interface.toast("still opening", Instant::now());
+            self.request_redraw();
+            return;
+        };
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+
+        let job = crate::print::Job { title, picture, orientation };
+        let proxy = self.proxy.clone();
+        if let Err(error) = crate::print::show(window, job, move |outcome| {
+            let _ = proxy.send_event(Event::Printed(outcome));
+        }) {
+            self.report(error.context("the print dialog did not open"));
+        }
+        self.request_redraw();
     }
 
     /// `Ctrl+F`: open the box that narrows the walk to names matching a
@@ -4746,6 +4801,8 @@ enum Chord {
     /// `Ctrl+F` because it is the key every program finds with; the bare `F`
     /// has mirrored the picture since v0.27.
     Pattern,
+    /// Print the picture, through the system's dialog.
+    Print,
 }
 
 /// Which way a key press goes, given the modifiers held.
@@ -4823,6 +4880,9 @@ fn chord_for(key: &Key) -> Option<Chord> {
         "m" => Some(Chord::CleanCopy),
         "x" | "X" => Some(Chord::Crop),
         "f" | "F" => Some(Chord::Pattern),
+        // The bare letter only: Ctrl+Shift+P is left for something that is
+        // not printing, as Ctrl+Shift+S was left for saving as.
+        "p" => Some(Chord::Print),
         _ => None,
     }
 }
@@ -5359,6 +5419,14 @@ impl ApplicationHandler<Event> for App {
             Event::Wallpaper(outcome) => self.wallpaper_done(outcome),
             Event::Scheduled(status) => {
                 self.interface.set_wallpaper_status(status);
+                self.request_redraw();
+            }
+            Event::Printed(outcome) => {
+                let said = match outcome {
+                    crate::print::Outcome::Sent => "sent to the printer",
+                    crate::print::Outcome::Failed => "the printer could not take the page",
+                };
+                self.interface.toast(said, Instant::now());
                 self.request_redraw();
             }
         }
@@ -6679,7 +6747,7 @@ mod tests {
             .map(|(key, _)| *key)
             .filter(|key| (key.starts_with("Ctrl+") || key.starts_with("Alt+")) && !key.contains("Drag") && !key.contains("Wheel"))
             .collect();
-        assert_eq!(advertised.len(), 12, "the sheet lists {advertised:?}, which is not the twelve chords");
+        assert_eq!(advertised.len(), 13, "the sheet lists {advertised:?}, which is not the thirteen chords");
 
         // What each letter chord answers with, so two rows of the sheet
         // cannot quietly be the same key. Until v0.30.0 `chord_for` matched

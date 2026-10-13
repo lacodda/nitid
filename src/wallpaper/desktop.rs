@@ -6,7 +6,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use super::Fit;
+use crate::fit::Fit;
 
 /// Put `path` on every display's desktop, fitted as asked.
 pub fn show(path: &Path, fit: Fit) -> Result<()> {
@@ -62,8 +62,8 @@ mod imp {
     use windows::Win32::UI::Shell::{DESKTOP_WALLPAPER_POSITION, DWPOS_FILL, DWPOS_FIT, DesktopWallpaper, IDesktopWallpaper};
     use windows::core::{BOOL, HSTRING, PCWSTR};
 
-    use super::Fit;
-    use crate::wallpaper::Com;
+    use crate::fit::Fit;
+    use crate::com::Com;
 
     fn desktop() -> Result<IDesktopWallpaper> {
         // SAFETY: COM is initialised on this thread by the caller's `Com`.
@@ -139,7 +139,7 @@ mod imp {
 
     use anyhow::{Result, bail};
 
-    use super::Fit;
+    use crate::fit::Fit;
 
     pub fn show(_path: &Path, _fit: Fit) -> Result<()> {
         bail!("the desktop's picture is set on Windows only")

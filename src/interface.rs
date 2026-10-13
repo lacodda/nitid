@@ -3012,8 +3012,8 @@ fn desktop_section(ui: &mut egui::Ui, settings: &mut crate::wallpaper::Settings,
         "The picture is",
         &mut settings.fit,
         &[
-            (crate::wallpaper::Fit::Fill, "filling the screen"),
-            (crate::wallpaper::Fit::Fit, "whole on the screen"),
+            (crate::fit::Fit::Fill, "filling the screen"),
+            (crate::fit::Fit::Fit, "whole on the screen"),
         ],
     );
 
@@ -3218,6 +3218,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Ctrl+S", "write the turn into the file, without touching its pixels"),
     ("Ctrl+Shift+S", "save as another format, with the colour you see"),
     ("Ctrl+M", "save a copy with the camera, date and place taken out"),
+    ("Ctrl+P", "print the picture"),
     ("E", "open this file in the program that edits it"),
     ("Alt+1-9", "open it in the program set for that key"),
     ("+ -", "zoom in / out"),

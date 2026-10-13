@@ -33,6 +33,7 @@ use std::time::SystemTime;
 
 use anyhow::{Context, Result, bail};
 
+use crate::fit::Fit;
 use crate::pattern::Pattern;
 use crate::slideshow::Rng;
 
@@ -164,17 +165,7 @@ impl Default for Every {
     }
 }
 
-/// How the picture meets a display of another shape.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum Fit {
-    /// Cover the whole display, cutting off what overhangs. No bars: a
-    /// desktop with black edges looks broken rather than careful.
-    #[default]
-    Fill,
-    /// Show the whole picture, with the desktop's colour round it.
-    Fit,
-}
-
+/// The desktop's words for how the picture meets a display.
 impl Fit {
     fn parse(text: &str) -> Option<Self> {
         match text.trim() {
@@ -201,7 +192,7 @@ impl Fit {
 }
 
 /// Where the desktop's picture comes from, and how.
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Settings {
     /// The folder a schedule deals from. `None` until one has been chosen.
     pub folder: Option<PathBuf>,
@@ -209,6 +200,19 @@ pub struct Settings {
     pub only: Option<Pattern>,
     pub every: Every,
     pub fit: Fit,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            folder: None,
+            only: None,
+            every: Every::default(),
+            // Filling: a desktop with bars at its edges looks broken rather
+            // than careful.
+            fit: Fit::Fill,
+        }
+    }
 }
 
 impl Settings {
@@ -247,7 +251,7 @@ impl Settings {
                 "folder" if !value.is_empty() => settings.folder = Some(PathBuf::from(value)),
                 "only" => settings.only = Pattern::parse(value),
                 "every" => settings.every = Every::parse(value).unwrap_or_default(),
-                "fit" => settings.fit = Fit::parse(value).unwrap_or_default(),
+                "fit" => settings.fit = Fit::parse(value).unwrap_or(Fit::Fill),
                 _ => {}
             }
         }
@@ -609,12 +613,9 @@ fn put_up(source: &Path, settings: &Settings, deck: &mut Deck) -> Result<()> {
     Ok(())
 }
 
-/// The desktop's picture, as JPEG bytes.
-///
-/// sRGB at the file's own depth first, so an HDR or sixteen-bit picture is
-/// mapped once from its full precision; then made smaller, which is cheap on
-/// eight bits; then turned upright, on the small copy. A vector picture is
-/// drawn at the size it is needed at instead.
+/// The desktop's picture, as JPEG bytes: the picture as an sRGB-only
+/// destination receives it (`export::upright_srgb`), as large as the largest
+/// display needs. A vector picture is drawn at the size it is needed at.
 pub(crate) fn prepare(source: &Path, screens: &[(u32, u32)], fit: Fit) -> Result<Vec<u8>> {
     let bytes = std::fs::read(source).with_context(|| format!("reading {}", source.display()))?;
     let loaded = crate::image_source::decode(&bytes).with_context(|| format!("opening {}", source.display()))?;
@@ -627,10 +628,7 @@ pub(crate) fn prepare(source: &Path, screens: &[(u32, u32)], fit: Fit) -> Result
         Some(vector) => (vector.rasterise(wanted.0, wanted.1)?, crate::image_source::Orientation::Normal),
         None => (loaded.image.clone(), loaded.orientation),
     };
-    let srgb = crate::export::baked(&image, loaded.profile.as_ref());
-    let small = crate::export::shrink(&srgb, wanted.0.max(wanted.1));
-    let upright_size = crate::eyedropper::shown_size(&small, orientation);
-    let upright = crate::export::cut(&small, orientation, (0, 0, upright_size.0, upright_size.1))?;
+    let upright = crate::export::upright_srgb(&image, loaded.profile.as_ref(), orientation, wanted.0.max(wanted.1))?;
 
     crate::export::encode(&crate::export::Request {
         image: &upright,
@@ -656,14 +654,7 @@ fn needed_size(shown: (u32, u32), screens: &[(u32, u32)], fit: Fit, vector: bool
     let (width, height) = (f64::from(shown.0.max(1)), f64::from(shown.1.max(1)));
     let scale = screens
         .iter()
-        .map(|&(screen_width, screen_height)| {
-            let across = f64::from(screen_width) / width;
-            let down = f64::from(screen_height) / height;
-            match fit {
-                Fit::Fill => across.max(down),
-                Fit::Fit => across.min(down),
-            }
-        })
+        .map(|&(screen_width, screen_height)| fit.scale((width, height), (f64::from(screen_width), f64::from(screen_height))))
         .fold(None, |most: Option<f64>, scale| Some(most.map_or(scale, |most| most.max(scale))));
     let Some(scale) = scale else {
         return shown;
@@ -911,33 +902,6 @@ fn data_dir() -> Option<PathBuf> {
 
 fn deck_path() -> Option<PathBuf> {
     data_dir().map(|dir| dir.join("deck"))
-}
-
-/// COM for the length of one call, undone afterwards if this call began it.
-///
-/// Both halves of this module talk to the shell through COM, from whichever
-/// thread asked: the command line's, or a worker of the viewer's.
-#[cfg(windows)]
-struct Com(bool);
-
-#[cfg(windows)]
-impl Com {
-    fn begin() -> Self {
-        use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
-        // SAFETY: balanced by `drop`, and only when it succeeded here; a
-        // thread already in another apartment keeps it and is not undone.
-        Self(unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok())
-    }
-}
-
-#[cfg(windows)]
-impl Drop for Com {
-    fn drop(&mut self) {
-        if self.0 {
-            // SAFETY: matches the successful initialisation above.
-            unsafe { windows::Win32::System::Com::CoUninitialize() };
-        }
-    }
 }
 
 /// Take the schedule away, for `nitid uninstall`: a task left behind would run
