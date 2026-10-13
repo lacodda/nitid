@@ -38,9 +38,12 @@ def main() -> int:
     text = CHANGELOG.read_text(encoding="utf-8")
     # The header is everything before the first release heading.
     first_release = text.index("## [")
+    # LF whatever the platform: Python on Windows writes CRLF by default, and
+    # a release that flips every line ending rewrites the whole file in git.
     CHANGELOG.write_text(
         text[:first_release] + section + "\n\n" + text[first_release:],
         encoding="utf-8",
+        newline="\n",
     )
 
     print(f"{tag} written to {CHANGELOG.name}")
