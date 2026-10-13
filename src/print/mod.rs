@@ -350,7 +350,10 @@ mod tests {
         assert!(close(placed.on_page.x, printable.x));
         assert!(close(placed.on_page.width, printable.width));
         assert!(close(placed.on_page.height, printable.width * 2.0 / 3.0));
-        assert!(close(placed.on_page.y - printable.y, printable.bottom() - placed.on_page.bottom()), "not centred: {placed:?}");
+        assert!(
+            close(placed.on_page.y - printable.y, printable.bottom() - placed.on_page.bottom()),
+            "not centred: {placed:?}"
+        );
         assert_eq!(placed.seen, Area::WHOLE);
     }
 

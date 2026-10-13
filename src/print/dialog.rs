@@ -20,21 +20,22 @@ use anyhow::{Context, Result, bail};
 use windows::Foundation::{IReference, PropertyValue, TypedEventHandler};
 use windows::Graphics::Printing::OptionDetails::{PrintTaskOptionChangedEventArgs, PrintTaskOptionDetails};
 use windows::Graphics::Printing::{
-    IPrintDocumentSource, IPrintDocumentSource_Impl, PrintManager, PrintOrientation, PrintTaskCompletedEventArgs, PrintTaskCompletion,
-    PrintTaskOptions, PrintTaskRequestedEventArgs, PrintTaskSourceRequestedArgs, PrintTaskSourceRequestedHandler, StandardPrintTaskOptions,
+    IPrintDocumentSource, IPrintDocumentSource_Impl, PrintManager, PrintOrientation, PrintTaskCompletedEventArgs, PrintTaskCompletion, PrintTaskOptions,
+    PrintTaskRequestedEventArgs, PrintTaskSourceRequestedArgs, PrintTaskSourceRequestedHandler, StandardPrintTaskOptions,
 };
 use windows::Win32::Foundation::{E_FAIL, E_INVALIDARG, E_NOINTERFACE, HMODULE, HWND};
-use windows::Win32::Graphics::Direct2D::Common::{D2D_RECT_F, D2D_SIZE_F, D2D_SIZE_U, D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT};
+use windows::Win32::Graphics::Direct2D::Common::{
+    D2D_RECT_F, D2D_SIZE_F, D2D_SIZE_U, D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
+};
 use windows::Win32::Graphics::Direct2D::{
     D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_NONE, D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1, D2D1_COLOR_SPACE_SRGB,
     D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_FACTORY_OPTIONS, D2D1_FACTORY_TYPE_MULTI_THREADED, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
-    D2D1_PRINT_CONTROL_PROPERTIES, D2D1_PRINT_FONT_SUBSET_MODE_DEFAULT, D2D1CreateFactory, ID2D1Bitmap1, ID2D1Device, ID2D1DeviceContext,
-    ID2D1Factory1,
+    D2D1_PRINT_CONTROL_PROPERTIES, D2D1_PRINT_FONT_SUBSET_MODE_DEFAULT, D2D1CreateFactory, ID2D1Bitmap1, ID2D1Device, ID2D1DeviceContext, ID2D1Factory1,
 };
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE, D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP};
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
-    D3D11_USAGE_DEFAULT, D3D11CreateDevice, ID3D11Device,
+    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+    D3D11CreateDevice, ID3D11Device,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{IDXGIDevice, IDXGISurface};
@@ -43,8 +44,8 @@ use windows::Win32::Graphics::Printing::{FinalPageCount, IPrintPreviewDxgiPackag
 use windows::Win32::Storage::Packaging::Opc::IOpcPartUri;
 use windows::Win32::Storage::Xps::Printing::{ID_DOCUMENTPACKAGETARGET_MSXPS, IPrintDocumentPackageTarget, IPrintDocumentPackageTarget_Impl};
 use windows::Win32::Storage::Xps::{
-    IXpsDocumentPackageTarget, IXpsDocumentPackageTarget_Impl, IXpsOMObjectFactory, IXpsOMPackageWriter, XPS_DOCUMENT_TYPE,
-    XPS_DOCUMENT_TYPE_XPS, XPS_INTERLEAVING_OFF, XpsOMObjectFactory,
+    IXpsDocumentPackageTarget, IXpsDocumentPackageTarget_Impl, IXpsOMObjectFactory, IXpsOMPackageWriter, XPS_DOCUMENT_TYPE, XPS_DOCUMENT_TYPE_XPS,
+    XPS_INTERLEAVING_OFF, XpsOMObjectFactory,
 };
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemAlloc, IStream, STGM_CREATE, STGM_SHARE_EXCLUSIVE, STGM_WRITE};
 use windows::Win32::System::WinRT::Printing::{
@@ -407,7 +408,9 @@ impl IPrintPreviewPageCollection_Impl for Document_Impl {
         let paper = self.shared.paper()?;
 
         let mut state = self.shared.state.lock()?;
-        let (page, fit) = state.page.ok_or_else(|| failure("a preview page was asked for before the pages were counted"))?;
+        let (page, fit) = state
+            .page
+            .ok_or_else(|| failure("a preview page was asked for before the pages were counted"))?;
         let preview = state.preview.clone().ok_or_else(|| failure("a preview page was asked for before its target"))?;
         let dpi = self.shared.preview_dpi;
         let graphics = graphics_in(&mut state)?;
@@ -446,7 +449,8 @@ impl Graphics {
         let d3d = d3d_device(D3D_DRIVER_TYPE_HARDWARE).or_else(|_| d3d_device(D3D_DRIVER_TYPE_WARP))?;
         let dxgi: IDXGIDevice = d3d.cast()?;
         // SAFETY: plain factory and device creation.
-        let factory: ID2D1Factory1 = unsafe { D2D1CreateFactory(D2D1_FACTORY_TYPE_MULTI_THREADED, Some(&D2D1_FACTORY_OPTIONS::default())) }.context("starting Direct2D")?;
+        let factory: ID2D1Factory1 =
+            unsafe { D2D1CreateFactory(D2D1_FACTORY_TYPE_MULTI_THREADED, Some(&D2D1_FACTORY_OPTIONS::default())) }.context("starting Direct2D")?;
         // SAFETY: as above.
         let device = unsafe { factory.CreateDevice(&dxgi) }.context("starting Direct2D on the device")?;
         // SAFETY: as above, on a thread with COM.
@@ -459,7 +463,17 @@ fn d3d_device(kind: D3D_DRIVER_TYPE) -> Result<ID3D11Device> {
     let mut device = None;
     // SAFETY: the out-pointer is a local the call fills.
     unsafe {
-        D3D11CreateDevice(None, kind, HMODULE::default(), D3D11_CREATE_DEVICE_BGRA_SUPPORT, None, D3D11_SDK_VERSION, Some(&mut device), None, None)
+        D3D11CreateDevice(
+            None,
+            kind,
+            HMODULE::default(),
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            None,
+            D3D11_SDK_VERSION,
+            Some(&mut device),
+            None,
+            None,
+        )
     }
     .context("starting Direct3D")?;
     device.context("Direct3D started without a device")
@@ -505,7 +519,13 @@ fn rect(area: &Area) -> D2D_RECT_F {
 }
 
 /// Write the page for the printer.
-fn write_page(graphics: &Graphics, target: &IPrintDocumentPackageTarget, page: &Page, placement: &Placement, paper: &crate::image_source::DecodedImage) -> Result<()> {
+fn write_page(
+    graphics: &Graphics,
+    target: &IPrintDocumentPackageTarget,
+    page: &Page,
+    placement: &Placement,
+    paper: &crate::image_source::DecodedImage,
+) -> Result<()> {
     let pixels = sent(paper, placement, PIXELS_PER_INCH / UNITS_PER_INCH);
     let properties = D2D1_PRINT_CONTROL_PROPERTIES {
         fontSubset: D2D1_PRINT_FONT_SUBSET_MODE_DEFAULT,
@@ -517,7 +537,10 @@ fn write_page(graphics: &Graphics, target: &IPrintDocumentPackageTarget, page: &
     // SAFETY: Direct2D calls on objects made above, in the order its print
     // control documents: draw into a command list, add it as a page, close.
     unsafe {
-        let control = graphics.device.CreatePrintControl(&graphics.wic, target, Some(&properties)).context("starting the print")?;
+        let control = graphics
+            .device
+            .CreatePrintControl(&graphics.wic, target, Some(&properties))
+            .context("starting the print")?;
         let context = graphics.device.CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)?;
         let list = context.CreateCommandList()?;
         context.SetTarget(&list);
@@ -526,7 +549,14 @@ fn write_page(graphics: &Graphics, target: &IPrintDocumentPackageTarget, page: &
         // would be ink, or at least work, for nothing.
         let drawn = bitmap(&context, &pixels);
         if let Ok(drawn) = &drawn {
-            context.DrawBitmap(drawn, Some(&rect(&placement.on_page)), 1.0, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, None, None);
+            context.DrawBitmap(
+                drawn,
+                Some(&rect(&placement.on_page)),
+                1.0,
+                D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
+                None,
+                None,
+            );
         }
         context.EndDraw(None, None).context("drawing the page")?;
         drawn?;
@@ -577,7 +607,10 @@ fn preview_page(
     // and the print system may ask for two pages at once.
     unsafe {
         let mut texture = None;
-        graphics.d3d.CreateTexture2D(&description, None, Some(&mut texture)).context("making the preview's surface")?;
+        graphics
+            .d3d
+            .CreateTexture2D(&description, None, Some(&mut texture))
+            .context("making the preview's surface")?;
         let surface: IDXGISurface = texture.context("Direct3D made no surface")?.cast()?;
         let context = graphics.device.CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)?;
         let properties = D2D1_BITMAP_PROPERTIES1 {
@@ -597,7 +630,12 @@ fn preview_page(
         // page in the top-left quarter of its preview.
         context.SetDpi(dpi, dpi);
         context.BeginDraw();
-        context.Clear(Some(&D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }));
+        context.Clear(Some(&D2D1_COLOR_F {
+            r: 1.0,
+            g: 1.0,
+            b: 1.0,
+            a: 1.0,
+        }));
         context.SetTransform(&windows_numerics::Matrix3x2 {
             M11: scale,
             M12: 0.0,
@@ -608,7 +646,14 @@ fn preview_page(
         });
         let drawn = bitmap(&context, pixels);
         if let Ok(drawn) = &drawn {
-            context.DrawBitmap(drawn, Some(&rect(&placement.on_page)), 1.0, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, None, None);
+            context.DrawBitmap(
+                drawn,
+                Some(&rect(&placement.on_page)),
+                1.0,
+                D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
+                None,
+                None,
+            );
         }
         context.EndDraw(None, None).context("drawing the preview")?;
         drawn?;

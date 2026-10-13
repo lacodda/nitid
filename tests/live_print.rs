@@ -62,7 +62,11 @@ fn print(source: &Path, page: PrintPage, fill: bool) -> Printed {
     // One picture on the page, drawn by one image brush, with nothing moving
     // it but its viewport — a transform would have to be read too, and a test
     // that ignored one would pass on a page drawn somewhere else.
-    assert_eq!(page_xml.matches("<ImageBrush").count(), 1, "the page does not hold exactly one picture: {page_xml}");
+    assert_eq!(
+        page_xml.matches("<ImageBrush").count(),
+        1,
+        "the page does not hold exactly one picture: {page_xml}"
+    );
     for transform in page_xml.split("RenderTransform=\"").skip(1) {
         let value = transform.split('"').next().unwrap_or_default();
         assert_eq!(value, "1,0,0,1,0,0", "the picture is moved by a transform this gate does not read: {page_xml}");
@@ -75,7 +79,10 @@ fn print(source: &Path, page: PrintPage, fill: bool) -> Printed {
 
     let source_name = attribute(&page_xml, "ImageBrush", "ImageSource");
     let file_name = source_name.rsplit('/').next().expect("an image name").to_string();
-    let (_, bytes) = parts.iter().find(|(name, _)| name.ends_with(&file_name)).expect("the page names an image the document does not hold");
+    let (_, bytes) = parts
+        .iter()
+        .find(|(name, _)| name.ends_with(&file_name))
+        .expect("the page names an image the document does not hold");
     let picture = image::load_from_memory(bytes).expect("an image another decoder can read").to_rgba8();
 
     Printed { page: size, viewport, picture }
@@ -181,9 +188,21 @@ fn a_picture_is_printed_whole_inside_the_margins() {
     assert_eq!(printed.picture.dimensions(), (300, 200), "the picture was not sent at its own pixels");
     let picture = &printed.picture;
     assert!(about(colour(picture, 5, 5), [20, 200, 20]), "the corner mark is {:?}", colour(picture, 5, 5));
-    assert!(about(colour(picture, 100, 100), [230, 20, 20]), "red arrived as {:?}", colour(picture, 100, 100));
-    assert!(about(colour(picture, 200, 100), [20, 20, 230]), "blue arrived as {:?}", colour(picture, 200, 100));
-    assert!(about(colour(picture, 295, 195), [255, 255, 255]), "transparency arrived as {:?}", colour(picture, 295, 195));
+    assert!(
+        about(colour(picture, 100, 100), [230, 20, 20]),
+        "red arrived as {:?}",
+        colour(picture, 100, 100)
+    );
+    assert!(
+        about(colour(picture, 200, 100), [20, 20, 230]),
+        "blue arrived as {:?}",
+        colour(picture, 200, 100)
+    );
+    assert!(
+        about(colour(picture, 295, 195), [255, 255, 255]),
+        "transparency arrived as {:?}",
+        colour(picture, 295, 195)
+    );
 }
 
 /// Filling the page covers what the printer can reach and sends only the part
@@ -214,11 +233,19 @@ fn a_filling_picture_sends_only_its_middle() {
     };
     let printed = print(&png, square, true);
     let [x, y, width, height] = printed.viewport;
-    assert!(near(x, 0.0) && near(y, 0.0) && near(width, 400.0) && near(height, 400.0), "the page is not covered: {:?}", printed.viewport);
+    assert!(
+        near(x, 0.0) && near(y, 0.0) && near(width, 400.0) && near(height, 400.0),
+        "the page is not covered: {:?}",
+        printed.viewport
+    );
     assert_eq!(printed.picture.dimensions(), (100, 100), "more than the middle third was sent");
     let picture = &printed.picture;
     for x in [0, 50, 99] {
-        assert!(about(colour(picture, x, 50), [20, 200, 20]), "column {x} of the middle is {:?}", colour(picture, x, 50));
+        assert!(
+            about(colour(picture, x, 50), [20, 200, 20]),
+            "column {x} of the middle is {:?}",
+            colour(picture, x, 50)
+        );
     }
 }
 
@@ -254,7 +281,9 @@ fn a_turned_photograph_is_printed_upright() {
 fn a_large_picture_is_sent_at_three_hundred_to_the_inch() {
     let (_dir, dir) = folder();
     let png = dir.join("large.png");
-    image::RgbImage::from_pixel(3000, 2000, image::Rgb([120, 120, 120])).save(&png).expect("writing the PNG");
+    image::RgbImage::from_pixel(3000, 2000, image::Rgb([120, 120, 120]))
+        .save(&png)
+        .expect("writing the PNG");
 
     // Two inches of printable width.
     let small = PrintPage {
@@ -286,5 +315,9 @@ fn a_vector_is_drawn_at_the_size_the_paper_needs() {
     let printed = print(&svg, letter(), false);
     // Seven and a half inches across, at three hundred to the inch.
     assert_eq!(printed.picture.dimensions(), (2250, 2250), "the vector was not drawn for the paper");
-    assert!(about(colour(&printed.picture, 1125, 1125), [230, 20, 20]), "{:?}", colour(&printed.picture, 1125, 1125));
+    assert!(
+        about(colour(&printed.picture, 1125, 1125), [230, 20, 20]),
+        "{:?}",
+        colour(&printed.picture, 1125, 1125)
+    );
 }

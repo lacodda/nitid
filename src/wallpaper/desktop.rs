@@ -62,8 +62,8 @@ mod imp {
     use windows::Win32::UI::Shell::{DESKTOP_WALLPAPER_POSITION, DWPOS_FILL, DWPOS_FIT, DesktopWallpaper, IDesktopWallpaper};
     use windows::core::{BOOL, HSTRING, PCWSTR};
 
-    use crate::fit::Fit;
     use crate::com::Com;
+    use crate::fit::Fit;
 
     fn desktop() -> Result<IDesktopWallpaper> {
         // SAFETY: COM is initialised on this thread by the caller's `Com`.

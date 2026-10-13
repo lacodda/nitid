@@ -3011,10 +3011,7 @@ fn desktop_section(ui: &mut egui::Ui, settings: &mut crate::wallpaper::Settings,
         ui,
         "The picture is",
         &mut settings.fit,
-        &[
-            (crate::fit::Fit::Fill, "filling the screen"),
-            (crate::fit::Fit::Fit, "whole on the screen"),
-        ],
+        &[(crate::fit::Fit::Fill, "filling the screen"), (crate::fit::Fit::Fit, "whole on the screen")],
     );
 
     ui.add_space(8.0);
