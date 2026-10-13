@@ -57,4 +57,6 @@ commit_parsers = [
   # arrived as `chore(deps)` and was written into the changelog by hand, which
   # regeneration then erased — twice.
   { message = "^chore", skip = true },
+  # Formatting changes nothing a reader of the changelog could notice.
+  { message = "^style", skip = true },
 ]
