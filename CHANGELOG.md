@@ -2,6 +2,18 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.38.0] - 2026-10-13
+
+### Bug Fixes
+- Lint for Linux from Windows, and keep the task name there
+
+### Build
+- Write the changelog with LF on every platform
+- Leave formatting commits out of the changelog
+
+### Features
+- Print the picture through the Windows print dialog
+
 ## [0.37.0] - 2026-10-10
 
 ### Bug Fixes
