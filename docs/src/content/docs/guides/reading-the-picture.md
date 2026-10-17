@@ -69,3 +69,27 @@ so, and so does the save box, because a colour that is quietly wrong is the one
 kind of wrong nobody can find by looking. Colour management is invisible when it works
 and inexplicable when it does not — a photograph that looks wrong here and
 right elsewhere is a question nobody can answer by looking harder at it.
+
+That question is usually asked of somebody else, so the passport travels.
+`Shift+K` — or **Copy as Markdown** in the passport — puts the whole of it on
+the clipboard as a block that reads the same rendered or raw: the file's name,
+what it says, what the display says, what happens between them, the format,
+depth and size, whether the screen is in HDR, any caveat, and which version of
+nitid said all of that. Paste it into a chat, a forum post or an issue, and the
+person helping has every fact they would have asked for next:
+
+```markdown
+**Colour passport: `IMG_0412.HEIC`**
+
+Display P3 converted to the display's own profile.
+
+| | |
+| --- | --- |
+| This file | Display P3 |
+| This display | the display's own profile, by its name |
+| Between them | converted, moving a primary by up to 23% |
+| The picture | HEIC, 16-bit, 4032×3024 |
+| The screen | high dynamic range (scRGB) |
+
+_nitid X.Y.Z_
+```

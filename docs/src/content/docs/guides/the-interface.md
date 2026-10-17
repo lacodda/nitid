@@ -13,7 +13,9 @@ everything else appears when you reach for it.
 
 Move the pointer to the top of the window and a toolbar comes down. It is the
 top bar every product of the lacodda line opens with: the mark and the name on
-the left, then where the file lives as a trail of folders — the ones nearest
+the left — a click on them opens the start screen, as `O` does (see
+[Where you left off](/nitid/guides/where-you-left-off/)) — then where the file
+lives as a trail of folders — the ones nearest
 the file stay when the window is narrow, and the full path is in its tooltip —
 and the actions on the right: step
 through the folder, zoom, fit, actual size, turn, the zoom lock, the backdrop,

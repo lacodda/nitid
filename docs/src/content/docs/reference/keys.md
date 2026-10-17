@@ -8,6 +8,8 @@ nitid photo.jpg
 ```
 
 Opening a file opens its folder: the arrow keys walk the images beside it.
+Started with no file, nitid opens on the folders it has been to — see
+[Where you left off](/nitid/guides/where-you-left-off/).
 
 | Key | Action |
 | --- | --- |
@@ -29,6 +31,7 @@ Opening a file opens its folder: the arrow keys walk the images beside it.
 | `G` | mark what the file clipped |
 | `C` | read the colour under the pointer, with the pixels around it magnified; click to copy |
 | `K` | what is happening to this image's colour |
+| `Shift+K` | copy that, as Markdown |
 | `P` | keep this one; again to take the mark off |
 | `X` | reject this one; again to take the mark off |
 | `U` | take the mark off |
@@ -62,6 +65,9 @@ Opening a file opens its folder: the arrow keys walk the images beside it.
 | `E` | open this file in the program that edits it |
 | `Alt+1`-`9` | open it in the program set for that key |
 | `F11` | fullscreen |
+| `O` | the pictures looked at lately, folder by folder; again to go back |
+| `Ctrl+O` | open a picture, with the Windows open dialog |
+| `Win+Alt+N` | from anywhere in Windows: the newest picture in those folders (the default; Settings, Opening) |
 | `,` | settings |
 | `?` | every key there is |
 | `Esc` | leave a crop, the settings, a comparison, a slideshow or the other display; otherwise quit |
@@ -79,7 +85,7 @@ dragged while watching what it marks. Nine sections:
 | --- | --- |
 | Gestures | what the bare wheel does — zoom or step through the folder — how far one notch zooms, whether the wheel is reversed, whether the middle button toggles fit and 100% |
 | View | when the toolbar and the status line are on screen: on hover, always, or never; when the minimap is — zoomed, always or never; and what shows behind transparency when a picture opens |
-| Opening | fit or 100% for a picture that arrives, whether the framing is held across a step, whether the folder wraps at its ends, and the order it is walked in — name, date or size |
+| Opening | fit or 100% for a picture that arrives, whether the framing is held across a step, whether the folder wraps at its ends, the order it is walked in — name, date or size — and the hotkey that brings the newest picture up from anywhere, or `off` |
 | Slideshow | how long each picture stays up, from a second to ten minutes |
 | Colour | where the clipping zebra draws its two lines, the units the eyedropper reads in, what a click copies, and whether the eyedropper magnifies the pixels around the pointer |
 | Sending | the size budget and the maximum width `Ctrl+Alt+C` copies a picture to |
@@ -102,7 +108,7 @@ build's settings survive a run of an older one — see
 
 | Command | What it does |
 | --- | --- |
-| `nitid FILE...` | open the images; one file browses its folder, several browse themselves |
+| `nitid FILE...` | open the images; one file browses its folder, several browse themselves; none opens on the folders looked at lately |
 | `nitid install` | install for this user and register the file types |
 | `nitid uninstall` | undo that, and take away the desktop picture's schedule if one is running |
 | `nitid wallpaper FOLDER` | change the desktop's picture from `FOLDER`, every 30 minutes |
