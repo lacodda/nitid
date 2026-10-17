@@ -16,14 +16,14 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use windows::Foundation::{IReference, PropertyValue, TypedEventHandler};
 use windows::Graphics::Printing::OptionDetails::{PrintTaskOptionChangedEventArgs, PrintTaskOptionDetails};
 use windows::Graphics::Printing::{
     IPrintDocumentSource, IPrintDocumentSource_Impl, PrintManager, PrintOrientation, PrintTaskCompletedEventArgs, PrintTaskCompletion, PrintTaskOptions,
     PrintTaskRequestedEventArgs, PrintTaskSourceRequestedArgs, PrintTaskSourceRequestedHandler, StandardPrintTaskOptions,
 };
-use windows::Win32::Foundation::{E_FAIL, E_INVALIDARG, E_NOINTERFACE, HMODULE, HWND};
+use windows::Win32::Foundation::{E_FAIL, E_INVALIDARG, E_NOINTERFACE, HMODULE};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D_RECT_F, D2D_SIZE_F, D2D_SIZE_U, D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
 };
@@ -81,7 +81,7 @@ type Told = Arc<Mutex<Box<dyn Fn(Outcome) + Send>>>;
 /// one of the print system's threads, once the person prints. Closing the
 /// dialog without printing is not news and is not told.
 pub fn show(window: &winit::window::Window, job: Job, told: impl Fn(Outcome) + Send + 'static) -> Result<()> {
-    let hwnd = hwnd_of(window)?;
+    let hwnd = crate::com::hwnd_of(window)?;
     let _com = Com::begin();
 
     let interop = windows::core::factory::<PrintManager, IPrintManagerInterop>().context("reaching the print system")?;
@@ -146,15 +146,6 @@ pub fn write_xps(job: &Job, page: Page, fit: Fit, path: &Path) -> Result<()> {
     let target: IPrintDocumentPackageTarget = XpsFile { factory, stream }.into();
     let placement = place((paper.full.width, paper.full.height), &page, fit);
     write_page(&graphics, &target, &page, &placement, &paper.full)
-}
-
-/// The handle of a window, as the print system wants it.
-fn hwnd_of(window: &winit::window::Window) -> Result<HWND> {
-    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    match window.window_handle().context("the window has no handle")?.as_raw() {
-        RawWindowHandle::Win32(handle) => Ok(HWND(handle.hwnd.get() as *mut core::ffi::c_void)),
-        _ => bail!("the window is not a Windows window"),
-    }
 }
 
 /// Answer the dialog's request: the task, its options, and where its pages
