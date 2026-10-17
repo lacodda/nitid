@@ -57,6 +57,10 @@ difference, not the function.
 - **A copy without the camera, the date and the place.** `Ctrl+M` strips EXIF,
   XMP and IPTC by not copying them - no encoder runs, so the photograph you send
   is the photograph you took.
+- **Where you left off.** Started from its icon, nitid opens on the folders
+  it has been to, each tile the picture you stopped at; `O` brings them up over
+  a picture. `Win+Alt+N`, pressed in any program, puts the newest picture from
+  them on screen - the screenshot you just took.
 - **One window.** Opening a second image hands it to the viewer already
   running, so a multi-select does not scatter windows across the desktop.
 - **Nothing that phones home.** The process that decodes the heavy formats has
@@ -112,14 +116,12 @@ app*. Full instructions: [Getting Started](https://lacodda.github.io/nitid/getti
 
 ## Status
 
-v0.38.0, in daily use on Windows. Startup, colour and HDR hold end to end;
-every modern still format opens and the animated ones play; images past what a
-GPU texture can hold are drawn as tiles; a picture can be cropped, turned and
-stripped of its metadata without an encoder ever running, culled two frames at
-a time, and printed in the colour on screen. A folder plays as a slideshow, on
-a television too, keeps up with what is written into it, and can feed the
-desktop's picture. The chrome wears the lacodda line's colours in light and
-dark, straight from its design tokens. What landed in each
+v0.39.0, in daily use on Windows. Startup, colour and HDR hold end to end;
+every modern still format opens, the animated ones play, and pictures past a
+GPU texture's limit are drawn as tiles. Cropping, turning and stripping
+metadata run without an encoder; frames are culled two at a time; prints come
+out in the colour on screen. Started with no file, it opens on where you left
+off. What landed in each
 version: [CHANGELOG](https://github.com/lacodda/nitid/blob/main/CHANGELOG.md).
 
 ## Documentation

@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.39.0] - 2026-10-17
+
+### Documentation
+- Describe the start screen, the hotkey and the passport as Markdown
+
+### Features
+- Open on the folders looked at lately
+
+### Refactoring
+- Share the window handle the system dialogs are owned by
+
+### Testing
+- Keep the viewer's own files out of the developer's profile
+
 ## [0.38.0] - 2026-10-13
 
 ### Bug Fixes
