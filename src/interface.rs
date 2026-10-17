@@ -13,6 +13,8 @@
 //! anyway. The promise from v0.12.0 — a still image costs no wakeups — is not
 //! this module's to spend.
 
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use std::path::PathBuf;
@@ -147,6 +149,55 @@ pub struct Status {
     /// Said at the laptop because nothing else there says it: the television
     /// is behind the person reading the status line.
     pub presenting: bool,
+    /// The start screen, while it is up. Everything about the picture above
+    /// is left off the screen while it is: the grid has the window.
+    pub recent: Option<Recents>,
+}
+
+/// What the start screen shows, worked out by the application.
+#[derive(Clone, Debug)]
+pub struct Recents {
+    /// Newest first: the folders that can be gone back to now.
+    pub tiles: Vec<Tile>,
+    /// The tile the keyboard is on.
+    pub selected: usize,
+    /// Moved by the application whenever anything on the screen changes — a
+    /// tile's picture arriving, the selection, the list itself — so the
+    /// digest sees one number move rather than comparing every tile.
+    pub version: u64,
+    /// The key that brings the newest picture up from anywhere, if one is
+    /// listening, so the screen can say it is there.
+    pub hotkey: Option<String>,
+}
+
+/// One remembered folder on the start screen.
+#[derive(Clone, Debug)]
+pub struct Tile {
+    /// The picture last looked at there, which opening the tile goes back to.
+    pub path: PathBuf,
+    pub folder: String,
+    pub name: String,
+    /// How long ago, in the words a person would use.
+    pub ago: String,
+    /// The tile's picture, in display colours, once it has been made.
+    pub picture: Option<Arc<crate::minimap::Thumbnail>>,
+    /// Whether a picture is still on its way. False with no picture means
+    /// there will not be one: the file is gone or will not open.
+    pub waiting: bool,
+}
+
+/// What the start screen asks for.
+///
+/// Its own type for the reason the crop bar's is: every `Action` is a key the
+/// viewer answers, and a click on a tile is not one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RecentAction {
+    /// Go back to this picture, in its folder.
+    Open(PathBuf),
+    /// Take this folder off the list.
+    Forget(PathBuf),
+    /// Choose a picture with Windows' own dialog.
+    Browse,
 }
 
 /// What the status line says about a slideshow.
@@ -253,6 +304,10 @@ pub enum Action {
     Compare,
     /// Compare them by blinking one over the other, or stop.
     Blink,
+    /// Put the colour passport on the clipboard, as Markdown.
+    CopyPassport,
+    /// Open the start screen over the picture, or put it away.
+    Recent,
 }
 
 /// What the crop bar asks for.
@@ -397,6 +452,27 @@ pub struct Interface {
     /// Whether the Desktop section's stop button was pressed this frame,
     /// waiting to be collected.
     wallpaper_stop: bool,
+    /// The start screen's pictures, uploaded once per picture rather than per
+    /// frame: keyed by the tile's path, and by which picture of it — the
+    /// embedded thumbnail is replaced by the sharp one, and that has to reach
+    /// the GPU, where a redraw of the same one must not.
+    recent_textures: HashMap<PathBuf, (egui::TextureHandle, usize)>,
+    /// How many tiles the last layout put in a row, so the arrow keys move up
+    /// and down the grid the way it is drawn rather than the way a guess at
+    /// the window's width would draw it.
+    recent_columns: usize,
+    /// What the start screen asked for this frame, waiting to be collected.
+    recent_action: Option<RecentAction>,
+    /// The tile the screen last scrolled into view. A step of the keyboard
+    /// that leaves the rows on screen brings the new tile into view once,
+    /// rather than pinning the scroll to the selection and fighting the wheel.
+    recent_revealed: Option<usize>,
+    /// The hotkey as it is being typed in the settings. `None` while nothing
+    /// is being typed, when the box shows the setting itself.
+    hotkey_text: Option<String>,
+    /// What the viewer says about the hotkey it is listening for — or why it
+    /// is not — for the settings to show under the box.
+    hotkey_status: Option<String>,
     /// The last thing laid out, kept so an unchanged frame can be skipped.
     last: Option<String>,
 }
@@ -491,6 +567,12 @@ impl Interface {
             toasts: Vec::new(),
             wallpaper_status: None,
             wallpaper_stop: false,
+            recent_textures: HashMap::new(),
+            recent_columns: 1,
+            recent_action: None,
+            recent_revealed: None,
+            hotkey_text: None,
+            hotkey_status: None,
             last: None,
         }
     }
@@ -712,6 +794,24 @@ impl Interface {
         std::mem::take(&mut self.wallpaper_stop)
     }
 
+    /// What the start screen asked for, if it asked this frame.
+    pub fn take_recent(&mut self) -> Option<RecentAction> {
+        self.recent_action.take()
+    }
+
+    /// How many tiles a row of the start screen holds, as last laid out.
+    pub fn recent_columns(&self) -> usize {
+        self.recent_columns.max(1)
+    }
+
+    /// What the settings should say about the hotkey.
+    pub fn set_hotkey_status(&mut self, status: Option<String>) {
+        if self.hotkey_status != status {
+            self.hotkey_status = status;
+            self.owed_frame = true;
+        }
+    }
+
     /// Whether the colour passport is showing.
     ///
     /// Asked by the application before it builds one: the profiles are only
@@ -794,6 +894,12 @@ impl Interface {
         let minimap = self.chrome.minimap;
         let wallpaper_status = self.wallpaper_status.clone();
         let mut wallpaper_stop = false;
+        let mut recent_textures = std::mem::take(&mut self.recent_textures);
+        let mut recent_columns = self.recent_columns;
+        let mut recent_revealed = self.recent_revealed;
+        let mut recent_action = None;
+        let mut hotkey_text = self.hotkey_text.take();
+        let hotkey_status = self.hotkey_status.clone();
         // The texture the minimap draws, kept across frames: uploading a copy
         // of the picture on every frame would put a texture upload inside a
         // drag, which is exactly where the viewer must not spend anything.
@@ -813,6 +919,7 @@ impl Interface {
         // Whether any sorting folder is set, for the sheet's note.
         let sorting_set = config.sorting.any();
         let programs_set = config.programs.any();
+        let hotkey_in_use = config.behaviour.hotkey.map(|hotkey| hotkey.to_string());
         let toasts: Vec<(String, f32)> = self
             .toasts
             .iter()
@@ -829,35 +936,52 @@ impl Interface {
         // `run_ui` hands over the root `Ui` rather than the context: in egui
         // 0.36 panels are shown inside a `Ui`, and this is the one they sit in.
         let output = self.context.clone().run_ui(raw, |ui| {
-            if toolbar_shown {
-                action = toolbar(ui, status, info_shown, histogram_shown, &mut mark_texture);
-            }
-            if status_shown {
-                action = action.or(status_line(ui, status));
-            }
-            if info_shown {
-                info_panel(ui, status);
-            }
-            if histogram_shown {
-                histogram_panel(ui, status);
-            }
-            if minimap_wanted(minimap, status) {
-                minimap_panel(ui, status, &mut minimap_texture);
-            }
-            if status.picking {
-                eyedropper_panel(ui, status, units, magnifier);
-            }
-            if let Some(crop) = &status.crop {
-                crop_action = crop_overlay(ui, crop);
-            }
-            if let Some(passport) = &status.passport {
-                passport_panel(ui, passport);
+            // The start screen has the window: nothing that describes a
+            // picture is drawn over it, because there is no picture on it.
+            // What stays is what does not belong to a picture — the keys,
+            // the settings, a drop, the toasts.
+            if let Some(recents) = &status.recent {
+                recent_action = recent_screen(ui, recents, &mut recent_textures, &mut recent_columns, &mut recent_revealed);
+            } else {
+                if toolbar_shown {
+                    action = toolbar(ui, status, info_shown, histogram_shown, &mut mark_texture);
+                }
+                if status_shown {
+                    action = action.or(status_line(ui, status));
+                }
+                if info_shown {
+                    info_panel(ui, status);
+                }
+                if histogram_shown {
+                    histogram_panel(ui, status);
+                }
+                if minimap_wanted(minimap, status) {
+                    minimap_panel(ui, status, &mut minimap_texture);
+                }
+                if status.picking {
+                    eyedropper_panel(ui, status, units, magnifier);
+                }
+                if let Some(crop) = &status.crop {
+                    crop_action = crop_overlay(ui, crop);
+                }
+                if let Some(passport) = &status.passport {
+                    action = action.or(passport_panel(ui, passport));
+                }
             }
             if keys_shown {
-                key_sheet(ui, sorting_set, programs_set);
+                key_sheet(ui, sorting_set, programs_set, hotkey_in_use.clone());
             }
             if settings_shown {
-                edited = settings_dialog(ui, config, &mut section, &mut closed, wallpaper_status.as_deref(), &mut wallpaper_stop);
+                edited = settings_dialog(
+                    ui,
+                    config,
+                    &mut section,
+                    &mut closed,
+                    wallpaper_status.as_deref(),
+                    &mut wallpaper_stop,
+                    &mut hotkey_text,
+                    hotkey_status.as_deref(),
+                );
             }
             if let Some(typing) = typing.as_mut() {
                 typing_outcome = line_box(ui, typing, &mut typing_focused);
@@ -874,13 +998,25 @@ impl Interface {
             // The table sits where the toasts do, so they are stacked above
             // it rather than over it.
             let mut lift = 0.0;
-            if let Some(compared) = &status.compared {
+            if let Some(compared) = status.compared.as_ref().filter(|_| status.recent.is_none()) {
                 pane_tags(ui, status, compared, toolbar_shown);
                 lift = difference_table(ui, status, compared);
             }
             toast_stack(ui, &toasts, lift);
         });
         self.minimap_texture = minimap_texture;
+        self.recent_textures = recent_textures;
+        self.recent_columns = recent_columns;
+        self.recent_revealed = if status.recent.is_some() { recent_revealed } else { None };
+        // A tile chosen inside this layout was drawn before the click landed;
+        // the frame that answers it has to be asked for, as the crop bar's is.
+        if recent_action.is_some() {
+            self.recent_action = recent_action;
+            self.owed_frame = true;
+        }
+        // What was typed is kept only while the dialog that holds it is up:
+        // opened again, the box shows the setting rather than an old draft.
+        self.hotkey_text = if self.settings_shown { hotkey_text } else { None };
         self.mark_texture = mark_texture;
         self.cropped = crop_action;
         if wallpaper_stop {
@@ -1036,6 +1172,14 @@ impl Interface {
             // A show starting, pausing, changing pace or order, and the other
             // display coming and going.
             + &format!("|{:?}|{}", status.slideshow, status.presenting)
+            // The start screen, by the one number the application moves when
+            // anything on it changes, and what the hotkey box holds.
+            + &format!(
+                "|{:?}|{:?}|{:?}",
+                status.recent.as_ref().map(|recents| (recents.version, recents.selected)),
+                self.hotkey_text,
+                self.hotkey_status
+            )
             // The crop box, rounded to a tenth of a point. This is what makes
             // a crop drag ask for frames: nothing else in the digest moves
             // while the box is dragged, so without it the box would be drawn
@@ -1118,8 +1262,10 @@ fn toolbar(ui: &mut egui::Ui, status: &Status, info_shown: bool, histogram_shown
                     }
                 }
 
-                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| identity(ui, status, mark));
-                chosen
+                let home = ui
+                    .with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| identity(ui, status, mark))
+                    .inner;
+                chosen.or(home)
             })
             .inner
         })
@@ -1260,7 +1406,7 @@ const MARK_PIXELS: u32 = 32;
 const TRAIL_STEP: &str = "  ›  ";
 
 /// The left of the bar: the mark, the name, and the trail to the file.
-fn identity(ui: &mut egui::Ui, status: &Status, mark: &mut Option<egui::TextureHandle>) {
+fn identity(ui: &mut egui::Ui, status: &Status, mark: &mut Option<egui::TextureHandle>) -> Option<Action> {
     if mark.is_none() {
         *mark = crate::icon::rgba(MARK_PIXELS).map(|(pixels, width, height)| {
             ui.ctx().load_texture(
@@ -1270,17 +1416,28 @@ fn identity(ui: &mut egui::Ui, status: &Status, mark: &mut Option<egui::TextureH
             )
         });
     }
-    if let Some(texture) = mark {
-        ui.add(egui::Image::new((texture.id(), egui::vec2(MARK_SIZE, MARK_SIZE))));
-    }
-    ui.label(egui::RichText::new("nitid").strong());
+    // The mark and the name are the way home, the way they are on a web
+    // page: they open the start screen. A button of its own would have been
+    // one more on a bar that has no room left for one.
+    let home = ui
+        .scope(|ui| {
+            if let Some(texture) = mark {
+                ui.add(egui::Image::new((texture.id(), egui::vec2(MARK_SIZE, MARK_SIZE))));
+            }
+            ui.label(egui::RichText::new("nitid").strong());
+        })
+        .response
+        .interact(egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text("The pictures looked at lately  (O)");
+    let home = home.clicked().then_some(Action::Recent);
 
     let Some(path) = &status.path else {
-        return;
+        return home;
     };
     let steps = trail(path);
     if steps.is_empty() {
-        return;
+        return home;
     }
     separator(ui);
 
@@ -1308,6 +1465,7 @@ fn identity(ui: &mut egui::Ui, status: &Status, mark: &mut Option<egui::TextureH
     }
     job.wrap = egui::text::TextWrapping::truncate_at_width(room);
     ui.add(egui::Label::new(job).selectable(false)).on_hover_text(path.display().to_string());
+    home
 }
 
 /// The folders a file sits in, then the file: the steps of the trail.
@@ -2530,7 +2688,8 @@ fn select_range(ui: &egui::Ui, id: egui::Id, from: usize, to: usize) {
 /// Centred like the key sheet rather than tucked in a corner: this is read
 /// once, deliberately, to answer a question — not watched while working, the
 /// way the histogram and the eyedropper are.
-fn passport_panel(ui: &mut egui::Ui, passport: &Passport) {
+fn passport_panel(ui: &mut egui::Ui, passport: &Passport) -> Option<Action> {
+    let mut action = None;
     egui::Window::new("Colour")
         .collapsible(false)
         .resizable(false)
@@ -2576,11 +2735,24 @@ fn passport_panel(ui: &mut egui::Ui, passport: &Passport) {
                     .weak()
                     .small(),
             );
+            ui.add_space(6.0);
+            // The question this panel answers is usually asked of somebody
+            // else — "why does it look wrong here" — and the answer has to
+            // travel whole: a screenshot of a dialog is not something anyone
+            // can search, quote or paste into an issue.
+            if ui
+                .button("Copy as Markdown")
+                .on_hover_text("The whole passport, as a block to paste into a chat or an issue  (Shift+K)")
+                .clicked()
+            {
+                action = Some(Action::CopyPassport);
+            }
         });
+    action
 }
 
 /// Every key there is, because the chrome does not advertise them.
-fn key_sheet(ui: &mut egui::Ui, sorting_set: bool, programs_set: bool) {
+fn key_sheet(ui: &mut egui::Ui, sorting_set: bool, programs_set: bool, hotkey: Option<String>) {
     egui::Window::new("Keys")
         .collapsible(false)
         .resizable(false)
@@ -2592,7 +2764,14 @@ fn key_sheet(ui: &mut egui::Ui, sorting_set: bool, programs_set: bool) {
         .show(ui.ctx(), |ui| {
             egui::Grid::new("keys").num_columns(2).spacing([24.0, 4.0]).show(ui, |ui| {
                 for (key, action) in KEYS {
-                    ui.label(monospace(*key));
+                    // The hotkey's row names the key this viewer is actually
+                    // listening for: the list holds the default, and a
+                    // person who chose another should not be told the old one.
+                    let key = match *key {
+                        HOTKEY_ROW => hotkey.as_deref().unwrap_or("(off)"),
+                        other => other,
+                    };
+                    ui.label(monospace(key));
                     ui.label(*action);
                     ui.end_row();
                 }
@@ -2619,7 +2798,17 @@ fn key_sheet(ui: &mut egui::Ui, sorting_set: bool, programs_set: bool) {
 /// Every control here edits the config in place. There is no OK button and
 /// nothing to apply — the dialog is a view onto the settings, not a copy of
 /// them that has to be reconciled.
-fn settings_dialog(ui: &mut egui::Ui, config: &mut Config, section: &mut Section, closed: &mut bool, wallpaper: Option<&str>, stop: &mut bool) -> bool {
+#[allow(clippy::too_many_arguments)]
+fn settings_dialog(
+    ui: &mut egui::Ui,
+    config: &mut Config,
+    section: &mut Section,
+    closed: &mut bool,
+    wallpaper: Option<&str>,
+    stop: &mut bool,
+    hotkey_text: &mut Option<String>,
+    hotkey_status: Option<&str>,
+) -> bool {
     let mut edited = false;
 
     // Closed by its own button as well as by Esc: a dialog with no visible
@@ -2674,7 +2863,7 @@ fn settings_dialog(ui: &mut egui::Ui, config: &mut Config, section: &mut Section
                                 Section::Files => files_section(ui, &mut config.sorting),
                                 Section::Programs => programs_section(ui, &mut config.programs),
                                 Section::Appearance => appearance_section(ui, &mut config.appearance),
-                                Section::Opening => opening_section(ui, &mut config.behaviour),
+                                Section::Opening => opening_section(ui, &mut config.behaviour, hotkey_text, hotkey_status),
                                 Section::Slideshow => slideshow_section(ui, &mut config.slideshow),
                                 Section::Tools => tools_section(ui, &mut config.tools),
                                 Section::Sending => sending_section(ui, &mut config.sending),
@@ -2889,7 +3078,7 @@ fn programs_section(ui: &mut egui::Ui, programs: &mut Programs) -> bool {
 }
 
 /// How an image arrives, and what the folder does.
-fn opening_section(ui: &mut egui::Ui, behaviour: &mut Behaviour) -> bool {
+fn opening_section(ui: &mut egui::Ui, behaviour: &mut Behaviour, hotkey_text: &mut Option<String>, hotkey_status: Option<&str>) -> bool {
     let mut edited = false;
 
     ui.label(egui::RichText::new("Opening").strong());
@@ -2916,6 +3105,60 @@ fn opening_section(ui: &mut egui::Ui, behaviour: &mut Behaviour) -> bool {
         &mut behaviour.order,
         &[(Order::Name, "name"), (Order::Modified, "date"), (Order::Size, "size")],
     );
+
+    ui.add_space(14.0);
+    edited |= hotkey_field(ui, &mut behaviour.hotkey, hotkey_text, hotkey_status);
+
+    edited
+}
+
+/// The key that brings the newest picture up from anywhere in Windows.
+///
+/// Typed rather than pressed: the combinations worth taking globally are the
+/// ones Windows and other programs answer before a box here would ever see
+/// them, so a box that listened for the press could not be given `Win+Alt`
+/// anything. The setting changes only once what is typed reads as a
+/// combination; until then the box says why it does not, and the key in use
+/// stays the one in use.
+fn hotkey_field(ui: &mut egui::Ui, hotkey: &mut Option<crate::hotkey::Hotkey>, text: &mut Option<String>, status: Option<&str>) -> bool {
+    let mut edited = false;
+
+    ui.label(egui::RichText::new("Hotkey").strong());
+    ui.add_space(2.0);
+    ui.label(
+        egui::RichText::new("Pressed anywhere in Windows while nitid is open, it brings up the newest picture in the folders on the start screen.")
+            .weak()
+            .small(),
+    );
+    ui.add_space(6.0);
+
+    let current = hotkey.map_or_else(|| "off".to_string(), |hotkey| hotkey.to_string());
+    let typed = text.get_or_insert_with(|| current.clone());
+    let response = ui.add(egui::TextEdit::singleline(typed).desired_width(200.0).hint_text("Win+Alt+N, or off"));
+
+    let wanted = typed.trim();
+    let reading = match wanted.to_ascii_lowercase().as_str() {
+        "off" | "" => Ok(None),
+        _ => crate::hotkey::Hotkey::parse(wanted).map(Some),
+    };
+    match reading {
+        Ok(chosen) => {
+            if response.changed() && chosen != *hotkey {
+                *hotkey = chosen;
+                edited = true;
+            }
+            if let Some(status) = status {
+                ui.label(egui::RichText::new(status).weak().small());
+            }
+        }
+        Err(why) => {
+            ui.label(
+                egui::RichText::new(format!("Not changed: {why}."))
+                    .color(crate::theme::palette(ui).warn)
+                    .small(),
+            );
+        }
+    }
 
     edited
 }
@@ -3186,6 +3429,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("G", "mark what the file clipped"),
     ("C", "read the colour under the pointer; click to copy"),
     ("K", "what is happening to this image's colour"),
+    ("Shift+K", "copy that, as Markdown"),
     ("P", "keep this one; again to take the mark off"),
     ("X", "reject this one; again to take the mark off"),
     ("U", "take the mark off"),
@@ -3220,6 +3464,9 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Alt+1-9", "open it in the program set for that key"),
     ("+ -", "zoom in / out"),
     ("F11", "full screen"),
+    ("O", "the pictures looked at lately, folder by folder; again to go back"),
+    ("Ctrl+O", "open a picture"),
+    ("Win+Alt+N", "from anywhere in Windows: the newest picture in those folders"),
     (",", "settings"),
     ("?", "this list"),
     (
@@ -3227,6 +3474,10 @@ pub const KEYS: &[(&str, &str)] = &[
         "leave a crop, the settings, a comparison, a slideshow or the other display; otherwise quit",
     ),
 ];
+
+/// The row of [`KEYS`] that names the hotkey, by the default it is written
+/// with. The sheet puts the key in use in its place.
+const HOTKEY_ROW: &str = "Win+Alt+N";
 
 /// What the toolbar is, said where a person looking for it would read it.
 const TOOLBAR_HINT: &str = "Every one of these is on the toolbar too, which appears when the pointer reaches the top of the window.";
@@ -3515,6 +3766,248 @@ fn crop_overlay(ui: &mut egui::Ui, crop: &CropView) -> Option<CropAction> {
     action
 }
 
+/// How wide a tile of the start screen is, in points.
+///
+/// Wide enough that a folder's name and a camera's file name both fit on a
+/// line at the size they are read; narrow enough that a laptop window holds
+/// four in a row, which is a screen of choices rather than a list to read.
+const TILE_WIDTH: f32 = 220.0;
+
+/// How tall a tile's picture is. Four by three of the width inside the
+/// padding: the shape of most photographs, so most fill their well and the
+/// rest sit in it.
+const TILE_PICTURE: f32 = 156.0;
+
+/// The room under the picture for the two lines that name it.
+const TILE_TEXT: f32 = 44.0;
+
+/// The space between tiles, and around the picture inside one.
+const TILE_GAP: f32 = 14.0;
+const TILE_PADDING: f32 = 6.0;
+
+/// The start screen: where the viewer has been, a folder to a tile, newest
+/// first.
+///
+/// It has the whole window, on the line's own ground rather than over the
+/// renderer's grey — this is the one screen of the viewer that is not about a
+/// photograph, and it reads as the place the program opens on.
+fn recent_screen(
+    ui: &mut egui::Ui,
+    recents: &Recents,
+    textures: &mut HashMap<PathBuf, (egui::TextureHandle, usize)>,
+    columns: &mut usize,
+    revealed: &mut Option<usize>,
+) -> Option<RecentAction> {
+    let palette = crate::theme::palette(ui);
+    // Pictures no tile shows any more go: a folder taken off the list must
+    // not keep its picture on the GPU for the rest of the session.
+    textures.retain(|path, _| recents.tiles.iter().any(|tile| &tile.path == path));
+
+    let mut action = None;
+    egui::CentralPanel::default()
+        .frame(egui::Frame::new().fill(palette.bg).inner_margin(egui::Margin::symmetric(28, 22)))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Recent").heading().strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .button("Open a picture…")
+                        .on_hover_text("Choose one with Windows' own dialog  (Ctrl+O)")
+                        .clicked()
+                    {
+                        action = Some(RecentAction::Browse);
+                    }
+                });
+            });
+            ui.add_space(2.0);
+            let mut said = String::from("Where you were, a folder to a tile. Click to carry on from that picture; O or Esc goes back.");
+            if let Some(hotkey) = &recents.hotkey {
+                said.push_str(&format!(" {hotkey}, anywhere in Windows, brings up the newest picture in these folders."));
+            }
+            ui.label(egui::RichText::new(said).color(palette.dim));
+            ui.add_space(16.0);
+
+            if recents.tiles.is_empty() {
+                ui.add_space(40.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(egui::RichText::new("Nothing here yet").strong());
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new("Open a picture, or drop one on this window. The folders you look at will wait for you here.").color(palette.dim),
+                    );
+                });
+                return;
+            }
+
+            let room = ui.available_width();
+            let count = (((room + TILE_GAP) / (TILE_WIDTH + TILE_GAP)).floor() as usize).max(1);
+            *columns = count;
+
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                for (row, tiles) in recents.tiles.chunks(count).enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = TILE_GAP;
+                        for (offset, tile) in tiles.iter().enumerate() {
+                            let index = row * count + offset;
+                            let selected = index == recents.selected;
+                            let (asked, response) = recent_tile(ui, tile, selected, textures);
+                            // Brought into view once, when the keyboard moves
+                            // the selection — not on every frame, which would
+                            // hold the scroll against the wheel.
+                            if selected && *revealed != Some(index) {
+                                response.scroll_to_me(None);
+                                *revealed = Some(index);
+                            }
+                            action = action.clone().or(asked);
+                        }
+                    });
+                    ui.add_space(TILE_GAP);
+                }
+            });
+        });
+    action
+}
+
+/// One tile: the picture last looked at in a folder, the folder's name, and
+/// when.
+///
+/// Returns what was asked of it, and the response to scroll to when the
+/// keyboard lands on it.
+fn recent_tile(
+    ui: &mut egui::Ui,
+    tile: &Tile,
+    selected: bool,
+    textures: &mut HashMap<PathBuf, (egui::TextureHandle, usize)>,
+) -> (Option<RecentAction>, egui::Response) {
+    let palette = crate::theme::palette(ui);
+    let size = egui::vec2(TILE_WIDTH, TILE_PADDING + TILE_PICTURE + TILE_TEXT);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let pointed = response.contains_pointer();
+    let corner = egui::CornerRadius::same(crate::theme::dowel::radius::MD);
+    let painter = ui.painter_at(rect);
+
+    painter.rect_filled(rect, corner, palette.raise);
+    let well = egui::Rect::from_min_size(
+        rect.min + egui::vec2(TILE_PADDING, TILE_PADDING),
+        egui::vec2(TILE_WIDTH - 2.0 * TILE_PADDING, TILE_PICTURE),
+    );
+    painter.rect_filled(well, egui::CornerRadius::same(crate::theme::dowel::radius::SM), palette.softer);
+
+    match &tile.picture {
+        Some(picture) if picture.width > 0 && picture.height > 0 => {
+            // Keyed by which picture this is, so the sharp one replacing the
+            // embedded thumbnail reaches the GPU and a redraw of the same one
+            // does not.
+            let key = Arc::as_ptr(picture) as usize;
+            let handle = match textures.get(&tile.path) {
+                Some((handle, uploaded)) if *uploaded == key => handle.clone(),
+                _ => {
+                    let image = egui::ColorImage::from_rgb([picture.width as usize, picture.height as usize], &picture.pixels);
+                    let handle = ui.ctx().load_texture("recent", image, egui::TextureOptions::LINEAR);
+                    textures.insert(tile.path.clone(), (handle.clone(), key));
+                    handle
+                }
+            };
+            painter.image(
+                handle.id(),
+                contained(well, (picture.width as f32, picture.height as f32)),
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                crate::theme::UNTINTED,
+            );
+        }
+        // The empty well says "on its way" by itself; a spinner would ask
+        // for a frame on every step of its turn, and this viewer does not
+        // spend frames on decoration.
+        _ if tile.waiting => {}
+        _ => {
+            painter.text(
+                well.center(),
+                egui::Align2::CENTER_CENTER,
+                "cannot be shown",
+                egui::TextStyle::Small.resolve(ui.style()),
+                palette.faint,
+            );
+        }
+    }
+
+    // The names, each held to one line: a long camera file name cut short
+    // keeps its tile the same height as its neighbours. When is set apart on
+    // the right of the folder's line, so it is never what gets cut: "is this
+    // the one from this morning" is the question the line answers first.
+    let text = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + TILE_PADDING + 2.0, well.bottom() + 6.0),
+        egui::pos2(rect.right() - TILE_PADDING - 2.0, rect.bottom() - 2.0),
+    );
+    let line = egui::TextStyle::Body.resolve(ui.style()).size + 6.0;
+    let when = ui
+        .painter()
+        .layout_no_wrap(tile.ago.clone(), egui::TextStyle::Small.resolve(ui.style()), palette.dim);
+    let when_at = egui::pos2(text.right() - when.size().x, text.top() + (line - when.size().y) / 2.0);
+    let when_width = when.size().x;
+    painter.galley(when_at, when, palette.dim);
+
+    let folder = egui::Rect::from_min_max(text.min, egui::pos2(text.right() - when_width - 8.0, text.top() + line));
+    ui.new_child(egui::UiBuilder::new().max_rect(folder).layout(egui::Layout::left_to_right(egui::Align::Center)))
+        .add(egui::Label::new(egui::RichText::new(&tile.folder).strong()).truncate().selectable(false));
+    let name = egui::Rect::from_min_max(egui::pos2(text.left(), text.top() + line), text.max);
+    ui.new_child(egui::UiBuilder::new().max_rect(name).layout(egui::Layout::top_down(egui::Align::Min)))
+        .add(
+            egui::Label::new(egui::RichText::new(&tile.name).color(palette.dim).small())
+                .truncate()
+                .selectable(false),
+        );
+
+    if selected {
+        painter.rect_stroke(rect, corner, egui::Stroke::new(2.0, palette.accent), egui::StrokeKind::Inside);
+    } else if pointed {
+        painter.rect_stroke(rect, corner, egui::Stroke::new(1.0, palette.line_2), egui::StrokeKind::Inside);
+    }
+
+    // Taking a folder off the list, in the corner of its picture, shown only
+    // where the hand or the keyboard is: twenty crosses in a grid would be
+    // the loudest thing on the screen.
+    let cross = egui::Rect::from_min_size(egui::pos2(well.right() - 26.0, well.top() + 4.0), egui::vec2(22.0, 22.0));
+    let forget = ui
+        .interact(cross, response.id.with("forget"), egui::Sense::click())
+        .on_hover_text("Take this folder off the list  (Del)");
+    if pointed || selected || forget.hovered() {
+        painter.rect_filled(cross, egui::CornerRadius::same(crate::theme::dowel::radius::XS), crate::theme::panel(ui));
+        painter.text(
+            cross.center(),
+            egui::Align2::CENTER_CENTER,
+            "×",
+            egui::TextStyle::Body.resolve(ui.style()),
+            if forget.hovered() { palette.text } else { palette.dim },
+        );
+    }
+
+    let asked = if forget.clicked() {
+        Some(RecentAction::Forget(tile.path.clone()))
+    } else if response.clicked() {
+        Some(RecentAction::Open(tile.path.clone()))
+    } else {
+        None
+    };
+    let response = response
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(tile.path.display().to_string());
+    (asked, response)
+}
+
+/// The largest rectangle of `size`'s proportions that fits inside `well`,
+/// centred in it.
+///
+/// Separated from the drawing so the one property a tile's picture has to keep
+/// — its shape, whatever the shape of the well — is checkable without a
+/// painter.
+fn contained(well: egui::Rect, size: (f32, f32)) -> egui::Rect {
+    if size.0 <= 0.0 || size.1 <= 0.0 {
+        return well;
+    }
+    let scale = (well.width() / size.0).min(well.height() / size.1);
+    egui::Rect::from_center_size(well.center(), egui::vec2(size.0 * scale, size.1 * scale))
+}
+
 fn area(name: &'static str) -> egui::Area {
     egui::Area::new(name.into()).fade_in(false)
 }
@@ -3647,6 +4140,7 @@ mod tests {
             compared: None,
             slideshow: None,
             presenting: false,
+            recent: None,
         }
     }
 
@@ -5612,5 +6106,155 @@ mod tests {
             words.contains("on the other display"),
             "the status line did not say where else the picture is: {words}"
         );
+    }
+
+    /// A start screen of `count` folders, the first two with their pictures
+    /// made and the rest still waiting.
+    fn start_screen(count: usize) -> Status {
+        let tiles = (0..count)
+            .map(|index| Tile {
+                path: PathBuf::from(format!("/pictures/folder{index}/picture{index}.jpg")),
+                folder: format!("folder{index}"),
+                name: format!("picture{index}.jpg"),
+                ago: "2 h ago".into(),
+                picture: (index < 2).then(|| {
+                    Arc::new(Thumbnail {
+                        width: 8,
+                        height: 6,
+                        pixels: vec![100; 8 * 6 * 3],
+                    })
+                }),
+                waiting: index >= 2,
+            })
+            .collect();
+        Status {
+            recent: Some(Recents {
+                tiles,
+                selected: 0,
+                version: 1,
+                hotkey: Some("Win+Alt+N".into()),
+            }),
+            ..status()
+        }
+    }
+
+    /// Lay out the start screen with the pointer at `at`, clicking or not, and
+    /// say what it asked for.
+    fn on_start(interface: &mut Interface, status: &Status, at: egui::Pos2, click: bool) -> Option<RecentAction> {
+        // A move first, so the widget under the pointer is known to the frame
+        // the click lands in — the way a hand reaches before it presses.
+        press_showing(interface, at, false, status);
+        press_showing(interface, at, click, status);
+        interface.take_recent()
+    }
+
+    /// Where the first tile begins, found by walking down its middle rather
+    /// than assuming the height of the heading: egui decides that.
+    fn first_tile_top(interface: &mut Interface, status: &Status) -> f32 {
+        let x = 28.0 + TILE_WIDTH / 2.0;
+        for y in 0..600 {
+            let at = egui::pos2(x, y as f32);
+            if on_start(interface, status, at, true).is_some() {
+                return y as f32;
+            }
+        }
+        panic!("no tile on the start screen answered a click");
+    }
+
+    /// The screen's whole purpose: a click on a tile goes back to the picture
+    /// it shows, and a click on another tile to that one.
+    #[test]
+    fn a_click_on_a_tile_opens_its_picture() {
+        let mut interface = Interface::new();
+        let status = start_screen(5);
+        let top = first_tile_top(&mut interface, &status);
+        let middle = top + TILE_PICTURE / 2.0;
+
+        let first = egui::pos2(28.0 + TILE_WIDTH / 2.0, middle);
+        assert_eq!(on_start(&mut interface, &status, first, false), None, "hovering a tile acted on it");
+        assert_eq!(
+            on_start(&mut interface, &status, first, true),
+            Some(RecentAction::Open(PathBuf::from("/pictures/folder0/picture0.jpg")))
+        );
+
+        let second = egui::pos2(28.0 + TILE_WIDTH + TILE_GAP + TILE_WIDTH / 2.0, middle);
+        assert_eq!(
+            on_start(&mut interface, &status, second, true),
+            Some(RecentAction::Open(PathBuf::from("/pictures/folder1/picture1.jpg"))),
+            "the second tile opened something else"
+        );
+
+        // The gap between them is not a tile.
+        let gap = egui::pos2(28.0 + TILE_WIDTH + TILE_GAP / 2.0, middle);
+        assert_eq!(on_start(&mut interface, &status, gap, true), None, "the gap between two tiles opened one");
+    }
+
+    /// The cross takes the folder off the list, and only that: a click on it
+    /// must not also open the picture under it.
+    #[test]
+    fn the_cross_forgets_the_folder_rather_than_opening_it() {
+        let mut interface = Interface::new();
+        let status = start_screen(3);
+        let top = first_tile_top(&mut interface, &status);
+        let cross = egui::pos2(28.0 + TILE_WIDTH - TILE_PADDING - 15.0, top + TILE_PADDING + 15.0);
+
+        assert_eq!(
+            on_start(&mut interface, &status, cross, true),
+            Some(RecentAction::Forget(PathBuf::from("/pictures/folder0/picture0.jpg")))
+        );
+    }
+
+    /// The rows follow the window: a narrow one holds fewer tiles, and the
+    /// arrow keys move by what is actually in a row.
+    #[test]
+    fn a_row_holds_what_the_window_has_room_for() {
+        let mut interface = Interface::new();
+        let status = start_screen(8);
+        press_showing(&mut interface, egui::pos2(1.0, 1.0), false, &status);
+        // 900 points, less the margins: three tiles of 220 with their gaps.
+        assert_eq!(interface.recent_columns(), 3);
+    }
+
+    /// With nothing remembered, the screen says what to do rather than
+    /// showing an empty grid, and the way to a picture is still there.
+    #[test]
+    fn an_empty_list_still_offers_a_way_to_a_picture() {
+        let mut interface = Interface::new();
+        let status = start_screen(0);
+        let mut found = None;
+        'search: for y in 0..90 {
+            for x in (600..900).step_by(4) {
+                if let Some(asked) = on_start(&mut interface, &status, egui::pos2(x as f32, y as f32), true) {
+                    found = Some(asked);
+                    break 'search;
+                }
+            }
+        }
+        assert_eq!(found, Some(RecentAction::Browse), "the open button could not be found or pressed");
+    }
+
+    /// A tile's picture fills its well in its own shape: a portrait is not
+    /// stretched to the well's landscape.
+    #[test]
+    fn a_tile_picture_keeps_its_shape() {
+        let well = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(200.0, 150.0));
+        let portrait = contained(well, (300.0, 600.0));
+        assert!(
+            (portrait.height() - 150.0).abs() < 0.01 && (portrait.width() - 75.0).abs() < 0.01,
+            "{portrait:?}"
+        );
+        assert!((portrait.center() - well.center()).length() < 0.01, "not centred: {portrait:?}");
+        let wide = contained(well, (1600.0, 400.0));
+        assert!((wide.width() - 200.0).abs() < 0.01 && (wide.height() - 50.0).abs() < 0.01, "{wide:?}");
+        assert_eq!(contained(well, (0.0, 10.0)), well);
+    }
+
+    /// The key sheet's hotkey row is the default the list is written with;
+    /// the sheet swaps in the key in use, which it can only do if the row
+    /// it looks for is there to find.
+    #[test]
+    fn the_hotkey_row_is_the_default_combination() {
+        assert_eq!(crate::hotkey::Hotkey::default().to_string(), HOTKEY_ROW);
+        assert!(KEYS.iter().any(|(key, _)| *key == HOTKEY_ROW), "the key sheet has no row for the hotkey");
     }
 }

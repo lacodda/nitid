@@ -83,6 +83,40 @@ impl Passport {
         }
     }
 
+    /// The passport as Markdown, for pasting where somebody else will read
+    /// it: a chat, a forum post, an issue.
+    ///
+    /// "Why does this look wrong here" is a question asked of other people,
+    /// and the answer has to travel whole. Everything a person helping would
+    /// ask next is in it — what the file says, what the display says, what
+    /// happens between them, what the picture is and what the screen is
+    /// running in, and which viewer said so — as a table that reads the same
+    /// rendered or raw.
+    pub fn markdown(&self, about: &About<'_>) -> String {
+        let mut out = format!("**Colour passport: {}**\n\n{}\n\n", code(about.name), self.summary());
+        out.push_str("| | |\n| --- | --- |\n");
+        let mut row = |label: &str, value: &str| out.push_str(&format!("| {label} | {} |\n", cell(value)));
+        row("This file", self.source.as_deref().unwrap_or("says nothing (untagged, shown untouched)"));
+        row("This display", self.display.as_deref().unwrap_or("unnamed"));
+        row(
+            "Between them",
+            &if self.converting {
+                format!("converted, moving a primary by up to {:.0}%", self.distance * 100.0)
+            } else {
+                "nothing to convert".to_string()
+            },
+        );
+        if let Some(picture) = &about.picture {
+            row("The picture", picture);
+        }
+        row("The screen", if about.hdr { "high dynamic range (scRGB)" } else { "standard dynamic range" });
+        if let Some(caveat) = &self.caveat {
+            row("Caveat", caveat);
+        }
+        out.push_str(&format!("\n_nitid {}_\n", env!("CARGO_PKG_VERSION")));
+        out
+    }
+
     /// The colour path itself, before any caveat about it.
     fn described(&self) -> String {
         match (&self.source, self.converting) {
@@ -96,6 +130,31 @@ impl Passport {
             }
         }
     }
+}
+
+/// What the passport cannot know by itself: which file, what the picture is,
+/// and what the screen is running in.
+pub struct About<'a> {
+    /// The file's name, or what stands in for one — "clipboard".
+    pub name: &'a str,
+    /// The format, depth and size, as the status line says them.
+    pub picture: Option<String>,
+    /// Whether the window is on a high-dynamic-range surface.
+    pub hdr: bool,
+}
+
+/// `text` as inline code, with a fence it cannot close early.
+///
+/// A file name may hold a backtick, and one backtick inside single ones ends
+/// the code span half-way through the name.
+fn code(text: &str) -> String {
+    if text.contains('`') { format!("`` {text} ``") } else { format!("`{text}`") }
+}
+
+/// `text` as one cell of a Markdown table: a bar would start a new column,
+/// and a line break would end the row.
+fn cell(text: &str) -> String {
+    text.replace('|', "\\|").replace(['\r', '\n'], " ")
 }
 
 /// What a profile calls itself.
@@ -613,6 +672,76 @@ mod tests {
         assert!(!passport.converting);
         assert!(passport.distance < 0.001, "an identity moved a primary by {}", passport.distance);
         assert!(passport.summary().contains("matches the display"), "{}", passport.summary());
+    }
+
+    /// The copied passport carries every fact the panel shows, plus the ones
+    /// a person helping would ask next — and says them in a table that a
+    /// file or profile name cannot break.
+    #[test]
+    fn the_markdown_passport_carries_the_whole_answer() {
+        let source = ColorProfile::new_display_p3();
+        let display = ColorProfile::new_srgb();
+        let transform = ColorTransform::new(&source, &display);
+        let passport = Passport::new(Some(&source), &display, &transform).with_caveat(Some("The decoder resolved it to sRGB.".into()));
+        let about = About {
+            name: "IMG_0042.HEIC",
+            picture: Some("HEIC, 16-bit, 4032×3024".into()),
+            hdr: true,
+        };
+        let markdown = passport.markdown(&about);
+
+        let source_name = passport.source.clone().expect("the source was named");
+        let display_name = passport.display.clone().expect("the display was named");
+        for expected in [
+            "`IMG_0042.HEIC`",
+            source_name.as_str(),
+            display_name.as_str(),
+            "converted, moving a primary by up to",
+            "HEIC, 16-bit, 4032×3024",
+            "high dynamic range",
+            "The decoder resolved it to sRGB.",
+            env!("CARGO_PKG_VERSION"),
+        ] {
+            assert!(markdown.contains(expected), "{expected:?} is missing from:\n{markdown}");
+        }
+        // Each fact in its own row, under its own label: the summary above
+        // the table names the profiles too, so finding a name somewhere in
+        // the text is not finding the row that says which end it is.
+        for row in [
+            format!("| This file | {source_name} |"),
+            format!("| This display | {display_name} |"),
+            "| The picture | HEIC, 16-bit, 4032×3024 |".to_string(),
+            "| The screen | high dynamic range (scRGB) |".to_string(),
+            "| Caveat | The decoder resolved it to sRGB. |".to_string(),
+        ] {
+            assert!(markdown.lines().any(|line| line == row), "the row {row:?} is missing from:\n{markdown}");
+        }
+        // Every row of the table has its two cells and nothing more.
+        for line in markdown.lines().filter(|line| line.starts_with("| ") && !line.starts_with("| ---")) {
+            assert_eq!(line.matches(" | ").count(), 1, "a row does not have two cells: {line}");
+        }
+
+        let untagged = Passport::new(None, &display, &ColorTransform::identity()).markdown(&About {
+            name: "screenshot.png",
+            picture: None,
+            hdr: false,
+        });
+        assert!(untagged.contains("says nothing"), "{untagged}");
+        assert!(untagged.contains("nothing to convert"), "{untagged}");
+        assert!(untagged.contains("standard dynamic range"), "{untagged}");
+        assert!(!untagged.contains("The picture"), "a row with nothing in it was written: {untagged}");
+    }
+
+    /// A bar in a name would open a third column and a backtick would close
+    /// the code span early; both are legal in the names they come from.
+    #[test]
+    fn a_name_cannot_break_the_markdown() {
+        let bar = cell("Display | Wide");
+        assert!(!bar.replace("\\|", "").contains('|'), "a bar was left bare: {bar}");
+        assert!(!cell("one\r\ntwo").contains('\n'));
+        assert_eq!(code("plain.jpg"), "`plain.jpg`");
+        let fenced = code("odd`name.jpg");
+        assert!(fenced.starts_with("`` ") && fenced.ends_with(" ``"), "{fenced}");
     }
 
     /// An untagged file states nothing, and the passport says that rather than

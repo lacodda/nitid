@@ -13,6 +13,9 @@
 mod animation;
 mod app;
 mod avif;
+// Only Windows has the dialog; the list of what it filters on is shared.
+#[cfg_attr(not(windows), allow(dead_code))]
+mod browse;
 mod clipboard;
 mod color;
 #[cfg(windows)]
@@ -33,6 +36,10 @@ mod format;
 mod gpu;
 mod hdr;
 mod histogram;
+// The listener is Windows' alone; the combination itself is read and written
+// everywhere, because the settings that hold it are.
+#[cfg_attr(not(windows), allow(dead_code))]
+mod hotkey;
 mod icon;
 mod image_source;
 #[cfg(windows)]
@@ -49,6 +56,7 @@ mod pattern;
 // unused outside the tests. The arrangement `sandbox::protocol` uses.
 #[cfg_attr(not(windows), allow(dead_code))]
 mod print;
+mod recent;
 mod rotate;
 mod sandbox;
 mod scrub;
@@ -392,7 +400,8 @@ Usage:
 Arguments:
   FILE...       images to open. One file browses its folder; several browse
                 themselves. A viewer already open takes them rather than a
-                second window starting
+                second window starting. With none, the folders opened lately
+                are shown, each at the picture last looked at there
 
 Commands:
   install       copy nitid to %LOCALAPPDATA%\\Programs and register its file
@@ -418,6 +427,7 @@ Keys:
   Drag          pan
   Middle click  toggle fit and 100%
   0 / 1         fit to window / actual size
+  O             the folders opened lately; Ctrl+O opens another picture
   F11           fullscreen
   Esc           quit",
         version = env!("CARGO_PKG_VERSION")

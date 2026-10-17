@@ -5,6 +5,7 @@
 //! animation is the one exception, and a bounded one — the loop wakes for its
 //! next frame and for nothing else, and pausing restores the silence.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -30,7 +31,7 @@ use crate::gpu::Renderer;
 use crate::gpu::{Overlay, Painted, Pane, Screen, Slot};
 use crate::histogram::Histogram;
 use crate::image_source::{self, Depth, Fidelity, LoadedImage, Orientation};
-use crate::interface::{Action, Interface, Status};
+use crate::interface::{Action, Interface, RecentAction, Status};
 use crate::loader::{Asked, Decoded, Loader, Request};
 use crate::minimap::Thumbnail;
 use crate::pattern::Pattern;
@@ -147,6 +148,34 @@ enum Event {
     /// The print dialog sent the page to the printer, or the print system
     /// could not.
     Printed(crate::print::Outcome),
+    /// A tile's picture for the start screen was made, or will not be.
+    Pictured(crate::recent::pictures::Made),
+    /// The hotkey was pressed, in whatever program had the keyboard.
+    Hotkey,
+    /// The newest picture in the remembered folders, found after a press of
+    /// the hotkey — or none in any of them.
+    Newest(Option<PathBuf>),
+    /// What was picked in the open dialog — nothing, when it was cancelled —
+    /// or why the dialog could not be shown.
+    Chosen(Result<Vec<PathBuf>, String>),
+}
+
+/// The start screen, while it is up.
+struct StartScreen {
+    tiles: Vec<crate::interface::Tile>,
+    /// The tile the keyboard is on.
+    selected: usize,
+}
+
+/// A tile's picture as made so far this session.
+struct Pictured {
+    picture: Option<Arc<Thumbnail>>,
+    /// Whether this is the final picture rather than the embedded thumbnail
+    /// standing in for it.
+    full: bool,
+    /// When the file was written, as it was when the picture was made: a file
+    /// written since is a different picture, and its tile is made again.
+    modified: Option<std::time::SystemTime>,
 }
 
 /// What the viewer is showing, once a file has been opened.
@@ -526,6 +555,23 @@ struct App {
     /// The desktop's settings as last written, so an edit in the dialog can be
     /// told from a dialog that only opened.
     wallpaper_written: crate::wallpaper::Settings,
+    /// Where the viewer has been, a folder to an entry (see `recent`).
+    recent: crate::recent::Recent,
+    /// The start screen, while it is up.
+    start: Option<StartScreen>,
+    /// Moved whenever anything on the start screen changes, so the interface
+    /// can tell a frame worth laying out from one that is not by one number.
+    start_version: u64,
+    /// What makes the start screen's pictures, off this thread.
+    pictures: crate::recent::pictures::Pictures,
+    /// The pictures made this session, by file, so the screen opened a
+    /// second time fills at once rather than decoding everything again.
+    pictured: HashMap<PathBuf, Pictured>,
+    /// The hotkey, while it is being listened for.
+    hotkey: Option<crate::hotkey::Listening>,
+    /// Which setting `hotkey` was last made from — `None` until the first
+    /// time — so a change in the settings is acted on once.
+    hotkey_for: Option<Option<crate::hotkey::Hotkey>>,
 }
 
 /// One laid-out interface frame, held between the layout and the draw.
@@ -539,6 +585,13 @@ impl App {
     fn new(initial: Vec<PathBuf>, loader: Loader, proxy: EventLoopProxy<Event>) -> Self {
         let config = Config::load();
         let hold_zoom = config.behaviour.hold_zoom;
+        let pictures = {
+            let proxy = proxy.clone();
+            crate::recent::pictures::Pictures::new(move |made| {
+                // The loop may be gone if the window closed mid-pass.
+                let _ = proxy.send_event(Event::Pictured(made));
+            })
+        };
         Self {
             initial,
             window: None,
@@ -581,6 +634,13 @@ impl App {
             following: false,
             arrival_owed: false,
             wallpaper_written: crate::wallpaper::Settings::default(),
+            recent: crate::recent::Recent::load(),
+            start: None,
+            start_version: 0,
+            pictures,
+            pictured: HashMap::new(),
+            hotkey: None,
+            hotkey_for: None,
         }
     }
 
@@ -622,6 +682,16 @@ impl App {
         // thumbnail first, the full decode after — and would take the box away
         // under a person who framed it while the file was still opening.
         self.cropping = None;
+
+        // Where the viewer has been, for the start screen. Written at once
+        // when a folder comes to the front; a step inside one only moves which
+        // picture its entry holds, and waits for the window to close.
+        if self.recent.record(path, crate::recent::now()) {
+            self.recent.save();
+        }
+        // A picture going up is the end of the start screen, whichever way it
+        // came: a tile, a drop, a hand-over, the open dialog, the hotkey.
+        self.close_start();
 
         match self.loader.request(path) {
             // Prefetched: the neighbour the arrow key asked for is already in
@@ -1163,6 +1233,10 @@ impl App {
         let Some(window) = &self.window else {
             return;
         };
+        if self.start.is_some() {
+            window.set_title("Recent — nitid");
+            return;
+        }
 
         let name = match self.shown.as_ref().is_some_and(|shown| shown.pasted) {
             // A pasted picture has no name, and the title has to say what is
@@ -1941,6 +2015,12 @@ impl App {
         if self.boxed() {
             return;
         }
+        // The start screen answers its own keys: the arrows move between
+        // tiles there, and the keys that act on a picture have no picture to
+        // act on.
+        if self.start.is_some() {
+            return self.start_key(&key, event_loop);
+        }
         match route_for(self.modifiers) {
             // Ctrl and Alt together, decided before either alone: the
             // copy-as key is the one chord with two modifiers, and a
@@ -2153,10 +2233,16 @@ impl App {
                 // The colour path, spelled out. Reachable from the keyboard
                 // as well as by clicking the status line's colour chip: the
                 // toolbar and the status line carry nothing the keys do not.
-                "k" | "K" => {
+                "k" => {
                     self.interface.toggle_passport();
                     self.request_redraw();
                 }
+                // The same passport, on the clipboard as Markdown: the
+                // answer to "why does it look wrong" is usually wanted by
+                // somebody else.
+                "K" => self.copy_passport(),
+                // Where the viewer has been, over the picture.
+                "o" | "O" => self.toggle_start(),
                 // Which pixels the file itself clipped. A viewing aid, so
                 // it belongs to the renderer rather than to the picture: it
                 // costs one uniform write and survives a step to the next
@@ -2322,6 +2408,12 @@ impl App {
         if !self.interface.passport_shown() {
             return None;
         }
+        self.passport_now()
+    }
+
+    /// The same, whether or not the panel is up: copying it does not need
+    /// the panel open.
+    fn passport_now(&self) -> Option<crate::color::Passport> {
         let shown = self.shown.as_ref()?;
         if shown.pasted {
             // A clipboard bitmap carries no profile, so it is passed through
@@ -2351,6 +2443,7 @@ impl App {
             Some(Chord::Crop) => self.toggle_crop(),
             Some(Chord::Pattern) => self.begin_pattern(),
             Some(Chord::Print) => self.print(),
+            Some(Chord::Open) => self.browse(),
             None => {}
         }
     }
@@ -3050,6 +3143,344 @@ impl App {
         self.show(&newest);
     }
 
+    /// Put the start screen up: the folders the viewer has been to, newest
+    /// first, each showing the picture last looked at there.
+    ///
+    /// Over a picture, the keyboard starts on the second tile — the folder
+    /// before this one — the way switching windows starts on the window
+    /// before this one: the first tile is where you already are.
+    fn open_start(&mut self) {
+        let now = crate::recent::now();
+        let mut wanted = Vec::new();
+        let tiles: Vec<crate::interface::Tile> = self
+            .recent
+            .reachable()
+            .into_iter()
+            .map(|entry| {
+                let modified = std::fs::metadata(&entry.path).and_then(|metadata| metadata.modified()).ok();
+                let made = self.pictured.get(&entry.path).filter(|made| made.modified == modified);
+                let full = made.is_some_and(|made| made.full);
+                if !full {
+                    wanted.push(entry.path.clone());
+                }
+                crate::interface::Tile {
+                    folder: entry.folder().map(folder_name).unwrap_or_default(),
+                    name: name_of(&entry.path),
+                    ago: crate::recent::ago(now, entry.when),
+                    picture: made.and_then(|made| made.picture.clone()),
+                    waiting: !full,
+                    path: entry.path,
+                }
+            })
+            .collect();
+        if !wanted.is_empty() {
+            self.pictures.make(wanted, &self.display_profile);
+        }
+
+        let selected = first_tile(self.shown.is_some(), tiles.len());
+        self.start = Some(StartScreen { tiles, selected });
+        self.start_version += 1;
+        // Modes that belong to the picture end here: the picture is not on
+        // screen to be read, cropped or compared.
+        self.picking = false;
+        self.cropping = None;
+        self.set_title();
+        self.wants_frame = true;
+        self.request_redraw();
+    }
+
+    /// Take the start screen away, if it is up.
+    fn close_start(&mut self) {
+        if self.start.take().is_none() {
+            return;
+        }
+        // The pictures still being made are for nobody now.
+        self.pictures.stop();
+        self.start_version += 1;
+        self.set_title();
+        self.wants_frame = true;
+        self.request_redraw();
+    }
+
+    /// `O`: the start screen over the picture, or the picture again.
+    ///
+    /// With nothing behind it, the screen stays: there is nothing to go back
+    /// to, and an empty window is the thing the screen replaced.
+    fn toggle_start(&mut self) {
+        match self.start {
+            Some(_) if self.shown.is_some() => self.close_start(),
+            Some(_) => {}
+            None => self.open_start(),
+        }
+    }
+
+    /// A key, while the start screen is up.
+    fn start_key(&mut self, key: &Key, event_loop: &ActiveEventLoop) {
+        match route_for(self.modifiers) {
+            // Two chords mean something here: another picture from a dialog,
+            // and the one on the clipboard. The rest act on a picture.
+            Route::Chord => match chord_for(key) {
+                Some(Chord::Open) => self.browse(),
+                Some(Chord::Paste) => self.paste_picture(),
+                _ => {}
+            },
+            Route::Bare => {
+                let columns = self.interface.recent_columns();
+                let Some(start) = self.start.as_mut() else {
+                    return;
+                };
+                if let Some(selected) = step_in_grid(key, start.selected, start.tiles.len(), columns) {
+                    if selected != start.selected {
+                        start.selected = selected;
+                        self.start_version += 1;
+                        self.request_redraw();
+                    }
+                    return;
+                }
+                let chosen = start.tiles.get(start.selected).map(|tile| tile.path.clone());
+                match key {
+                    Key::Named(NamedKey::Enter) => {
+                        if let Some(path) = chosen {
+                            self.act_on_start(RecentAction::Open(path));
+                        }
+                    }
+                    Key::Named(NamedKey::Delete) => {
+                        if let Some(path) = chosen {
+                            self.act_on_start(RecentAction::Forget(path));
+                        }
+                    }
+                    Key::Named(NamedKey::Escape) if self.interface.settings_shown() => {
+                        self.interface.close_settings();
+                        self.request_redraw();
+                    }
+                    // Back to the picture behind the screen, or — with none
+                    // behind it — out, as Esc always did on an empty window.
+                    Key::Named(NamedKey::Escape) => match self.shown {
+                        Some(_) => self.close_start(),
+                        None => event_loop.exit(),
+                    },
+                    Key::Named(NamedKey::F11) => self.toggle_fullscreen(),
+                    Key::Character(character) => match character.as_str() {
+                        "o" | "O" => self.toggle_start(),
+                        "?" => {
+                            self.interface.toggle_keys();
+                            self.request_redraw();
+                        }
+                        "," => {
+                            self.interface.toggle_settings();
+                            if self.interface.settings_shown() {
+                                self.settings_opened();
+                            }
+                            self.request_redraw();
+                        }
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
+            Route::DoubleChord | Route::Program => {}
+        }
+    }
+
+    /// Do what the start screen asked.
+    fn act_on_start(&mut self, asked: RecentAction) {
+        match asked {
+            // Back to that picture, in its folder. A file deleted since is
+            // not a dead end: the folder opens on its first picture instead.
+            RecentAction::Open(path) => self.open(&[path]),
+            RecentAction::Forget(path) => {
+                self.recent.forget(&path);
+                self.recent.save();
+                if let Some(start) = self.start.as_mut() {
+                    start.tiles.retain(|tile| tile.path != path);
+                    start.selected = start.selected.min(start.tiles.len().saturating_sub(1));
+                }
+                self.start_version += 1;
+                self.request_redraw();
+            }
+            RecentAction::Browse => self.browse(),
+        }
+    }
+
+    /// A tile's picture arrived from the worker.
+    fn pictured(&mut self, made: crate::recent::pictures::Made) {
+        let crate::recent::pictures::Made { path, picture, full } = made;
+        let modified = std::fs::metadata(&path).and_then(|metadata| metadata.modified()).ok();
+        let entry = self.pictured.entry(path.clone()).or_insert(Pictured {
+            picture: None,
+            full: false,
+            modified,
+        });
+        // A sharp picture that could not be made leaves the embedded one in
+        // place rather than taking it away: it is still the right picture.
+        if picture.is_some() {
+            entry.picture = picture;
+        }
+        entry.full |= full;
+        entry.modified = modified;
+
+        let (picture, full) = (entry.picture.clone(), entry.full);
+        let Some(start) = self.start.as_mut() else {
+            return;
+        };
+        if let Some(tile) = start.tiles.iter_mut().find(|tile| tile.path == path) {
+            tile.picture = picture;
+            tile.waiting = !full;
+            self.start_version += 1;
+            self.request_redraw();
+        }
+    }
+
+    /// Listen for the hotkey the settings name — once there is a window to
+    /// bring forward, and again whenever the settings change it.
+    ///
+    /// Asked on every pass of the loop and answered at once when nothing
+    /// changed: one comparison, and no thread or registration until there is
+    /// something to do.
+    fn keep_hotkey(&mut self) {
+        if self.window.is_none() || !(self.shown_once || self.start.is_some()) {
+            return;
+        }
+        let wanted = self.config.behaviour.hotkey;
+        if self.hotkey_for == Some(wanted) {
+            return;
+        }
+        self.hotkey_for = Some(wanted);
+        // The old combination is let go of first: asked for again — the
+        // same key, saved again by the dialog — it would be refused as held,
+        // by this very window.
+        self.hotkey = None;
+
+        let said = match wanted {
+            None => "Off: no key is taken from the rest of Windows.".to_string(),
+            Some(hotkey) => {
+                let proxy = self.proxy.clone();
+                match crate::hotkey::listen(hotkey, move || {
+                    let _ = proxy.send_event(Event::Hotkey);
+                }) {
+                    Ok(listening) => {
+                        self.hotkey = Some(listening);
+                        format!("{hotkey} is listening.")
+                    }
+                    Err(refused) => {
+                        // Said when it happens, as well as in the settings: a
+                        // key that silently does nothing is a key that gets
+                        // pressed harder.
+                        self.interface.toast(format!("{hotkey} is not listening: {refused}"), Instant::now());
+                        self.request_redraw();
+                        format!("{hotkey} is not listening: {refused}. Choose another.")
+                    }
+                }
+            }
+        };
+        self.interface.set_hotkey_status(Some(said));
+    }
+
+    /// The hotkey was pressed: find the newest picture in the folders on the
+    /// start screen, off this thread — a network folder can take seconds to
+    /// list, and the window must keep answering meanwhile.
+    fn hotkey_pressed(&mut self) {
+        let folders: Vec<PathBuf> = self.recent.entries().iter().filter_map(|entry| entry.folder().map(Path::to_path_buf)).collect();
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let _ = proxy.send_event(Event::Newest(crate::recent::newest(&folders)));
+        });
+    }
+
+    /// The newest picture was found: bring the window forward with it.
+    fn newest_found(&mut self, found: Option<PathBuf>) {
+        #[cfg(windows)]
+        self.raise();
+        let Some(path) = found else {
+            self.interface.toast("no pictures in the folders on the start screen", Instant::now());
+            self.request_redraw();
+            return;
+        };
+        let on_screen = self.shown.as_ref().filter(|shown| !shown.pasted).map(|shown| shown.path.as_path());
+        if on_screen == Some(path.as_path()) {
+            self.close_start();
+            return;
+        }
+        // In the folder already being walked, it is a step there; anywhere
+        // else, its folder opens on it.
+        if self.folder.as_mut().is_some_and(|folder| folder.go_to(&path)) {
+            self.show(&path);
+        } else {
+            self.open(&[path]);
+        }
+    }
+
+    /// `Ctrl+O`, or the start screen's button: Windows' own open dialog,
+    /// starting in the folder on screen.
+    fn browse(&mut self) {
+        #[cfg(windows)]
+        {
+            let Some(window) = self.window.clone() else {
+                return;
+            };
+            let folder = self.folder.as_ref().and_then(Folder::watched).map(Path::to_path_buf);
+            let proxy = self.proxy.clone();
+            crate::browse::choose(&window, folder.as_deref(), move |chosen| {
+                let _ = proxy.send_event(Event::Chosen(chosen));
+            });
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = Event::Chosen(Ok(Vec::new()));
+            self.interface.toast("the open dialog is Windows' own", Instant::now());
+            self.request_redraw();
+        }
+    }
+
+    /// What the open dialog came back with.
+    fn chosen(&mut self, chosen: Result<Vec<PathBuf>, String>) {
+        match chosen {
+            // Cancelled: whatever was up stays up.
+            Ok(paths) if paths.is_empty() => {}
+            Ok(paths) => self.open(&paths),
+            Err(why) => {
+                eprintln!("nitid: the open dialog: {why}");
+                self.interface.toast("the open dialog could not be shown", Instant::now());
+                self.request_redraw();
+            }
+        }
+    }
+
+    /// `Shift+K`: the colour passport on the clipboard, as Markdown.
+    fn copy_passport(&mut self) {
+        let Some(passport) = self.passport_now() else {
+            self.interface.toast("open a picture to say what its colour is doing", Instant::now());
+            self.request_redraw();
+            return;
+        };
+        let status = self.status();
+        let picture = status.size.map(|(width, height)| {
+            let mut said = Vec::new();
+            if let Some(format) = status.format {
+                said.push(format.name().to_string());
+            }
+            if let Some(depth) = status.depth {
+                said.push(
+                    match depth {
+                        Depth::Eight => "8-bit",
+                        Depth::Sixteen => "16-bit",
+                    }
+                    .to_string(),
+                );
+            }
+            said.push(format!("{width}×{height}"));
+            said.join(", ")
+        });
+        let markdown = passport.markdown(&crate::color::About {
+            name: &status.name,
+            picture,
+            hdr: status.hdr,
+        });
+        self.interface.context().copy_text(markdown);
+        self.interface.toast("colour passport copied as Markdown", Instant::now());
+        self.request_redraw();
+    }
+
     /// Whether a box has the keyboard: a name, a pattern, a format being
     /// chosen, a clean copy being decided.
     fn boxed(&self) -> bool {
@@ -3060,7 +3491,10 @@ impl App {
     /// or a crop is being framed. A slideshow waits for this, and so does a
     /// picture arriving in a followed folder.
     fn busy(&self) -> bool {
-        self.boxed() || self.cropping.is_some()
+        // The start screen too: a followed folder or a slideshow putting a
+        // picture up would take the screen away from under the person
+        // choosing on it.
+        self.boxed() || self.cropping.is_some() || self.start.is_some()
     }
 
     /// Listen to the folder being walked, and only to it.
@@ -3974,6 +4408,7 @@ impl App {
     fn show_pasted(&mut self, image: crate::image_source::DecodedImage) {
         // The folder goes with a paste, and a show has nothing left to walk.
         self.stop_slideshow();
+        self.close_start();
         let scale_factor = self.scale_factor();
         let area = self.picture_area();
         let Some(renderer) = self.renderer.as_mut() else {
@@ -4391,6 +4826,12 @@ impl App {
                 interval: self.config.slideshow.interval,
             }),
             presenting: self.presentation.is_some(),
+            recent: self.start.as_ref().map(|start| crate::interface::Recents {
+                tiles: start.tiles.clone(),
+                selected: start.selected,
+                version: self.start_version,
+                hotkey: self.hotkey.as_ref().and(self.config.behaviour.hotkey).map(|hotkey| hotkey.to_string()),
+            }),
         }
     }
 
@@ -4454,7 +4895,9 @@ impl App {
         // reads and the compiler is right to say so.
         // Nothing is laid out until a picture has been on screen once: the
         // first frame belongs to the photograph.
-        if !self.shown_once {
+        // The start screen is the exception: it is the first frame when
+        // there is no photograph to come before it.
+        if !self.shown_once && self.start.is_none() {
             return None;
         }
 
@@ -4531,6 +4974,11 @@ impl App {
         if let Some(crate::interface::Cleaned::Copy { keep, bake_turn }) = self.interface.take_clean() {
             self.write_clean_copy(keep, bake_turn);
         }
+        // And what the start screen asked for: opening a tile shows a
+        // picture, which touches everything borrowed above.
+        if let Some(asked) = self.interface.take_recent() {
+            self.act_on_start(asked);
+        }
         // What the choice in the box would cost, refreshed while it is up: the
         // format can be changed in it, and a warning about the format chosen a
         // moment ago is worse than none.
@@ -4605,7 +5053,13 @@ impl App {
         // still clears to the background, so the window is never a hole
         // showing whatever was behind it. The orientation is what the file
         // asks for, then what the user asked for on top of it.
-        let planned = self.plan(self.window_size(), self.scale_factor(), now, false);
+        // The start screen has the window: the picture behind it, if there
+        // is one, is not drawn under it.
+        let planned = match self.start {
+            Some(_) => Vec::new(),
+            None => self.plan(self.window_size(), self.scale_factor(), now, false),
+        };
+        let starting = self.start.as_ref().map(|start| start.tiles.len());
 
         let Some(renderer) = self.renderer.as_mut() else {
             return;
@@ -4647,7 +5101,10 @@ impl App {
 
         // A frame carrying both the picture and the chrome is what the gate
         // waits for when it is checking the order of the two.
-        if drew_interface && carries_image && startup::exit_after_interface() {
+        if drew_interface && let Some(tiles) = starting {
+            startup::milestone(&format!("start screen drawn (tiles: {tiles})"));
+        }
+        if drew_interface && (carries_image || starting.is_some()) && startup::exit_after_interface() {
             startup::interface_drawn();
             event_loop.exit();
         }
@@ -4684,6 +5141,42 @@ impl App {
             }
         }
     }
+}
+
+/// Where a key moves the keyboard on the start screen, or `None` for a key that
+/// does not move it.
+///
+/// The grid is walked the way a folder of files is in Explorer: left and right
+/// along the reading order, up and down by a row of the width actually drawn.
+/// Down from a row with a shorter row below lands on that row's last tile
+/// rather than nowhere; from the last row, and up from the first, it stays.
+fn step_in_grid(key: &Key, selected: usize, count: usize, columns: usize) -> Option<usize> {
+    if count == 0 {
+        return None;
+    }
+    let last = count - 1;
+    let columns = columns.max(1);
+    let moved = match key {
+        Key::Named(NamedKey::ArrowRight) => (selected + 1).min(last),
+        Key::Named(NamedKey::ArrowLeft) => selected.saturating_sub(1),
+        Key::Named(NamedKey::ArrowDown) if selected / columns == last / columns => selected,
+        Key::Named(NamedKey::ArrowDown) => (selected + columns).min(last),
+        Key::Named(NamedKey::ArrowUp) => selected.checked_sub(columns).unwrap_or(selected),
+        Key::Named(NamedKey::Home) => 0,
+        Key::Named(NamedKey::End) => last,
+        _ => return None,
+    };
+    Some(moved.min(last))
+}
+
+/// Which tile the keyboard starts on.
+///
+/// Over a picture, the second: the first is the folder already on screen, and
+/// the one before it is where a person opening this screen wants to go — the
+/// way switching windows starts on the window before this one. Started with no
+/// picture, the first.
+fn first_tile(over_picture: bool, count: usize) -> usize {
+    if over_picture && count > 1 { 1 } else { 0 }
 }
 
 /// How to describe the colour of what is on screen, in a few words.
@@ -4772,6 +5265,8 @@ fn handled(key: &Key) -> bool {
                 | "N"
                 | "w"
                 | "W"
+                | "o"
+                | "O"
         ),
         _ => false,
     }
@@ -4803,6 +5298,8 @@ enum Chord {
     Pattern,
     /// Print the picture, through the system's dialog.
     Print,
+    /// Choose a picture with Windows' own open dialog.
+    Open,
 }
 
 /// Which way a key press goes, given the modifiers held.
@@ -4883,6 +5380,8 @@ fn chord_for(key: &Key) -> Option<Chord> {
         // The bare letter only: Ctrl+Shift+P is left for something that is
         // not printing, as Ctrl+Shift+S was left for saving as.
         "p" => Some(Chord::Print),
+        // The bare letter, as for printing: every program opens with it.
+        "o" => Some(Chord::Open),
         _ => None,
     }
 }
@@ -5192,6 +5691,8 @@ fn key_for(action: Action) -> Key {
         Action::Filter => Key::Character("m".into()),
         Action::Compare => Key::Character("v".into()),
         Action::Blink => Key::Character("V".into()),
+        Action::CopyPassport => Key::Character("K".into()),
+        Action::Recent => Key::Character("o".into()),
     }
 }
 
@@ -5429,6 +5930,10 @@ impl ApplicationHandler<Event> for App {
                 self.interface.toast(said, Instant::now());
                 self.request_redraw();
             }
+            Event::Pictured(made) => self.pictured(made),
+            Event::Hotkey => self.hotkey_pressed(),
+            Event::Newest(found) => self.newest_found(found),
+            Event::Chosen(chosen) => self.chosen(chosen),
         }
     }
 
@@ -5446,6 +5951,7 @@ impl ApplicationHandler<Event> for App {
         self.watch_the_display();
         self.watch_the_other_display();
         self.keep_watch();
+        self.keep_hotkey();
         if self.rescan_due.is_some_and(|due| Instant::now() >= due) {
             self.rescan_folder();
         }
@@ -5519,6 +6025,9 @@ impl ApplicationHandler<Event> for App {
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         self.remember_placement();
         self.config.save();
+        // The picture last looked at in the folder that was open: a step
+        // inside a folder is not written as it happens.
+        self.recent.save();
     }
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
@@ -5610,7 +6119,11 @@ impl ApplicationHandler<Event> for App {
         self.renderer = Some(renderer);
 
         let initial = std::mem::take(&mut self.initial);
-        if !initial.is_empty() {
+        if initial.is_empty() {
+            // Started with nothing to show — from the icon, the Start menu, a
+            // pinned taskbar button. Where the viewer has been is what there is.
+            self.open_start();
+        } else {
             self.open(&initial);
         }
 
@@ -5708,6 +6221,10 @@ impl ApplicationHandler<Event> for App {
                 }
             }
 
+            // The start screen scrolls itself, and a click on it is a choice
+            // of tile: egui has both, and the picture behind it gets neither.
+            WindowEvent::MouseWheel { .. } | WindowEvent::MouseInput { .. } if self.start.is_some() => {}
+
             WindowEvent::MouseWheel { delta, .. } => {
                 let mut notches = match delta {
                     MouseScrollDelta::LineDelta(_, lines) => lines,
@@ -5797,7 +6314,7 @@ impl ApplicationHandler<Event> for App {
                 if self.follow_pointer(Some(position)) {
                     self.request_redraw();
                 }
-                if self.picking {
+                if self.picking && self.start.is_none() {
                     self.take_reading();
                     self.request_redraw();
                 }
@@ -5874,6 +6391,36 @@ impl ApplicationHandler<Event> for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The start screen is walked the way Explorer walks a grid of files, by
+    /// the width the grid was actually drawn at.
+    #[test]
+    fn the_arrows_walk_the_grid_by_its_rows() {
+        let step = |key: NamedKey, selected: usize| step_in_grid(&Key::Named(key), selected, 7, 3);
+        // Seven tiles in rows of three: 0 1 2 / 3 4 5 / 6.
+        assert_eq!(step(NamedKey::ArrowRight, 1), Some(2));
+        assert_eq!(step(NamedKey::ArrowRight, 6), Some(6), "right past the last tile went somewhere");
+        assert_eq!(step(NamedKey::ArrowLeft, 0), Some(0));
+        assert_eq!(step(NamedKey::ArrowDown, 1), Some(4), "down did not move by a row");
+        assert_eq!(step(NamedKey::ArrowDown, 5), Some(6), "down onto a short row did not land on its last tile");
+        assert_eq!(step(NamedKey::ArrowDown, 6), Some(6), "down from the last row moved");
+        assert_eq!(step(NamedKey::ArrowUp, 4), Some(1), "up did not move by a row");
+        assert_eq!(step(NamedKey::ArrowUp, 2), Some(2), "up from the first row moved");
+        assert_eq!(step(NamedKey::Home, 5), Some(0));
+        assert_eq!(step(NamedKey::End, 0), Some(6));
+        // A key that is not a direction is not a step.
+        assert_eq!(step_in_grid(&Key::Named(NamedKey::Enter), 3, 7, 3), None);
+        // And an empty screen has nowhere to go.
+        assert_eq!(step_in_grid(&Key::Named(NamedKey::ArrowRight), 0, 0, 3), None);
+    }
+
+    #[test]
+    fn over_a_picture_the_keyboard_starts_on_the_folder_before() {
+        assert_eq!(first_tile(true, 5), 1);
+        assert_eq!(first_tile(false, 5), 0, "a bare start skipped the newest folder");
+        assert_eq!(first_tile(true, 1), 0, "a single tile was skipped");
+        assert_eq!(first_tile(true, 0), 0);
+    }
 
     /// A step to another picture closes the crop.
     ///
@@ -6425,7 +6972,7 @@ mod tests {
     /// trusted: a hand-kept list is one an added action is forgotten from, and
     /// the two tests over it would then pass while saying nothing about the
     /// new button. Adding a variant now fails to compile until it is listed.
-    const EVERY_ACTION: [Action; 23] = [
+    const EVERY_ACTION: [Action; 25] = [
         Action::Previous,
         Action::Next,
         Action::ZoomOut,
@@ -6449,6 +6996,8 @@ mod tests {
         Action::Filter,
         Action::Compare,
         Action::Blink,
+        Action::CopyPassport,
+        Action::Recent,
     ];
 
     /// What makes `EVERY_ACTION` exhaustive: this match has no catch-all, so a
@@ -6482,6 +7031,8 @@ mod tests {
                 Action::Filter => 20,
                 Action::Compare => 21,
                 Action::Blink => 22,
+                Action::CopyPassport => 23,
+                Action::Recent => 24,
             };
         }
 
@@ -6747,7 +7298,7 @@ mod tests {
             .map(|(key, _)| *key)
             .filter(|key| (key.starts_with("Ctrl+") || key.starts_with("Alt+")) && !key.contains("Drag") && !key.contains("Wheel"))
             .collect();
-        assert_eq!(advertised.len(), 13, "the sheet lists {advertised:?}, which is not the thirteen chords");
+        assert_eq!(advertised.len(), 14, "the sheet lists {advertised:?}, which is not the fourteen chords");
 
         // What each letter chord answers with, so two rows of the sheet
         // cannot quietly be the same key. Until v0.30.0 `chord_for` matched

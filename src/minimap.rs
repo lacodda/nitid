@@ -89,6 +89,68 @@ impl Thumbnail {
 
         Some(Self { width, height, pixels })
     }
+
+    /// A copy with its longer side at `longest`, each pixel the average of
+    /// the part of the picture it stands for.
+    ///
+    /// For a copy that is looked at as a picture rather than read as a map:
+    /// the start screen's tiles. Sampling one pixel per cell, the way the
+    /// minimap does, turns fine detail — foliage, a fabric, text in a
+    /// screenshot — into noise once the picture is shrunk thirtyfold, and a
+    /// tile is where a person decides whether this is the folder they meant.
+    /// The average is taken over a grid of up to four by four samples in the
+    /// cell rather than over every pixel in it: the noise is gone at sixteen,
+    /// and a sixty-megapixel photograph costs two million reads instead of
+    /// sixty. Off the event loop, so the difference is the grid filling in
+    /// sooner rather than a frame kept.
+    ///
+    /// Averaged in the stored values, before the colour transform: averaging
+    /// in light would be more correct at an edge between a bright and a dark
+    /// region, and invisible at the size a tile is drawn.
+    pub fn averaged(image: &DecodedImage, orientation: Orientation, transform: &ColorTransform, longest: u32) -> Option<Self> {
+        const SAMPLES: u64 = 4;
+
+        let shown = shown_size(image, orientation);
+        let (width, height) = fitted_to(shown, longest)?;
+
+        let mut pixels = Vec::with_capacity((width as usize) * (height as usize) * 3);
+        for row in 0..height as u64 {
+            for column in 0..width as u64 {
+                // The cell this pixel stands for, in the shown picture.
+                let left = column * shown.0 as u64 / width as u64;
+                let right = ((column + 1) * shown.0 as u64 / width as u64).max(left + 1);
+                let top = row * shown.1 as u64 / height as u64;
+                let bottom = ((row + 1) * shown.1 as u64 / height as u64).max(top + 1);
+                let across = (right - left).min(SAMPLES);
+                let down = (bottom - top).min(SAMPLES);
+
+                let mut sum = [0u64; 3];
+                let mut count = 0u64;
+                for step_y in 0..down {
+                    for step_x in 0..across {
+                        // Spread through the cell, each sample at the centre
+                        // of its own share of it.
+                        let x = left + ((2 * step_x + 1) * (right - left)) / (2 * across);
+                        let y = top + ((2 * step_y + 1) * (bottom - top)) / (2 * down);
+                        if let Some((raw, _)) = sample(image, orientation, shown, (x as u32, y as u32)) {
+                            for (total, value) in sum.iter_mut().zip(raw) {
+                                *total += u64::from(value);
+                            }
+                            count += 1;
+                        }
+                    }
+                }
+
+                let colour = match count {
+                    0 => [0, 0, 0],
+                    _ => through(transform, sum.map(|total| (total / count) as u16), image.depth),
+                };
+                pixels.extend_from_slice(&colour);
+            }
+        }
+
+        Some(Self { width, height, pixels })
+    }
 }
 
 /// The size of the small copy: the picture's own proportions, with the longer
@@ -98,17 +160,22 @@ impl Thumbnail {
 /// size — a sixteen-pixel icon blown up to a hundred and sixty would be a map
 /// four times the size of the thing it maps.
 fn fitted(shown: (u32, u32)) -> Option<(u32, u32)> {
-    if shown.0 == 0 || shown.1 == 0 {
+    fitted_to(shown, LONGEST_SIDE)
+}
+
+/// The same, for any longest side.
+fn fitted_to(shown: (u32, u32), longest: u32) -> Option<(u32, u32)> {
+    if shown.0 == 0 || shown.1 == 0 || longest == 0 {
         return None;
     }
-    if shown.0 <= LONGEST_SIDE && shown.1 <= LONGEST_SIDE {
+    if shown.0 <= longest && shown.1 <= longest {
         return Some(shown);
     }
 
     let (width, height) = if shown.0 >= shown.1 {
-        (LONGEST_SIDE, (shown.1 as u64 * LONGEST_SIDE as u64 / shown.0 as u64) as u32)
+        (longest, (shown.1 as u64 * longest as u64 / shown.0 as u64) as u32)
     } else {
-        ((shown.0 as u64 * LONGEST_SIDE as u64 / shown.1 as u64) as u32, LONGEST_SIDE)
+        ((shown.0 as u64 * longest as u64 / shown.1 as u64) as u32, longest)
     };
     // An extreme panorama rounds its short side to zero. One pixel is a
     // degenerate map, but it is a map; zero is a copy with nothing in it.
@@ -190,6 +257,54 @@ mod tests {
     fn an_empty_picture_has_no_copy() {
         let image = flat(0, 0, [0, 0, 0]);
         assert!(Thumbnail::of(&image, Orientation::Normal, &identity()).is_none());
+    }
+
+    /// The reason the averaged copy exists: detail finer than a cell comes
+    /// out as its average rather than as whichever pixel a sample hit. A
+    /// one-pixel checkerboard shrunk tenfold is grey; sampled, it would be
+    /// all black or all white — the same scene, reading as something else.
+    #[test]
+    fn an_averaged_copy_turns_fine_detail_into_its_average() {
+        let (width, height) = (400u32, 400u32);
+        let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                let value = if (x + y) % 2 == 0 { 255 } else { 0 };
+                pixels.extend_from_slice(&[value, value, value, 255]);
+            }
+        }
+        let image = DecodedImage {
+            width,
+            height,
+            pixels,
+            depth: Depth::Eight,
+        };
+
+        let averaged = Thumbnail::averaged(&image, Orientation::Normal, &identity(), 40).unwrap();
+        assert_eq!((averaged.width, averaged.height), (40, 40));
+        for value in &averaged.pixels {
+            assert!((100..=155).contains(value), "a checkerboard shrank to {value}, not to its grey");
+        }
+    }
+
+    #[test]
+    fn an_averaged_copy_keeps_proportions_and_turns_with_the_picture() {
+        let image = flat(4000, 2000, [200, 40, 90]);
+        let wide = Thumbnail::averaged(&image, Orientation::Normal, &identity(), 300).unwrap();
+        assert_eq!((wide.width, wide.height), (300, 150));
+        assert_eq!(&wide.pixels[..3], &[200, 40, 90]);
+
+        let turned = Thumbnail::averaged(&image, Orientation::Rotate90, &identity(), 300).unwrap();
+        assert_eq!((turned.width, turned.height), (150, 300));
+    }
+
+    /// A picture smaller than the tile is not blown up into one.
+    #[test]
+    fn an_averaged_copy_is_not_enlarged() {
+        let image = flat(16, 9, [1, 2, 3]);
+        let copy = Thumbnail::averaged(&image, Orientation::Normal, &identity(), 300).unwrap();
+        assert_eq!((copy.width, copy.height), (16, 9));
+        assert_eq!(&copy.pixels[..3], &[1, 2, 3]);
     }
 
     /// An extreme panorama still gets a map, even if it is one pixel tall.

@@ -336,6 +336,14 @@ pub struct Behaviour {
     /// Whether stepping past the last image comes back to the first.
     pub wrap: bool,
     pub order: Order,
+    /// The key that brings the newest picture up from anywhere in Windows.
+    /// `None` when it is turned off.
+    ///
+    /// A setting rather than a fixed key, which the line's rule against
+    /// settings allows here: a key taken from the whole desktop collides with
+    /// whatever else on that machine took it first, and only the person at
+    /// the machine knows which program should have it.
+    pub hotkey: Option<crate::hotkey::Hotkey>,
 }
 
 impl Default for Behaviour {
@@ -345,6 +353,7 @@ impl Default for Behaviour {
             hold_zoom: false,
             wrap: true,
             order: Order::default(),
+            hotkey: Some(crate::hotkey::Hotkey::default()),
         }
     }
 }
@@ -587,6 +596,16 @@ impl Config {
                 "hold_zoom" => config.behaviour.hold_zoom = value == "true",
                 "wrap" => config.behaviour.wrap = value != "false",
                 "order" => config.behaviour.order = Order::parse(value).unwrap_or_default(),
+                // `off` is the one word that turns it off. Anything else that
+                // does not read as a combination takes the default rather than
+                // nothing: a typo in a file edited by hand should not quietly
+                // take the key away.
+                "hotkey" => {
+                    config.behaviour.hotkey = match value {
+                        "off" => None,
+                        _ => Some(crate::hotkey::Hotkey::parse(value).unwrap_or_default()),
+                    }
+                }
 
                 // Held to what the settings offer: a file edited by hand to
                 // zero would show a picture for no time at all, which is a
@@ -664,6 +683,10 @@ impl Config {
         out.push_str(&format!("hold_zoom = {}\n", self.behaviour.hold_zoom));
         out.push_str(&format!("wrap = {}\n", self.behaviour.wrap));
         out.push_str(&format!("order = {}\n", self.behaviour.order.render()));
+        out.push_str(&format!(
+            "hotkey = {}\n",
+            self.behaviour.hotkey.map_or_else(|| "off".to_string(), |hotkey| hotkey.to_string())
+        ));
 
         out.push_str(&format!("slideshow_interval = {}\n", self.slideshow.interval));
 
@@ -834,6 +857,7 @@ mod tests {
                 hold_zoom: true,
                 wrap: false,
                 order: Order::Modified,
+                hotkey: Some(crate::hotkey::Hotkey::parse("Ctrl+Shift+F9").unwrap()),
             },
             // Neither is the default: a round trip that carried the default
             // through would pass even if the key were never written at all.
@@ -949,6 +973,32 @@ mod tests {
         assert!(Config::parse("").tools.magnifier);
         assert!(!Config::parse("magnifier = false").tools.magnifier);
         assert!(Config::parse("magnifier = off").tools.magnifier);
+    }
+
+    /// The hotkey is turned off by one word and only by it: a combination
+    /// written wrongly by hand takes the default rather than taking the key
+    /// away without a word.
+    #[test]
+    fn the_hotkey_is_off_only_when_the_file_says_off() {
+        assert_eq!(Config::parse("").behaviour.hotkey, Some(crate::hotkey::Hotkey::default()));
+        assert_eq!(Config::parse("hotkey = off").behaviour.hotkey, None);
+        assert_eq!(Config::parse("hotkey = Win+Banana").behaviour.hotkey, Some(crate::hotkey::Hotkey::default()));
+        assert_eq!(
+            Config::parse("hotkey = ctrl+alt+f13")
+                .behaviour
+                .hotkey
+                .map(|hotkey| hotkey.to_string())
+                .as_deref(),
+            Some("Ctrl+Alt+F13")
+        );
+        let off = Config {
+            behaviour: Behaviour {
+                hotkey: None,
+                ..Behaviour::default()
+            },
+            ..Config::default()
+        };
+        assert_eq!(Config::parse(&off.render()), off);
     }
 
     /// The defaults have to survive the file too: a viewer that wrote its
