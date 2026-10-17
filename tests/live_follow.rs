@@ -15,6 +15,8 @@
 
 #![cfg(windows)]
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
@@ -133,11 +135,9 @@ fn the_open_window_follows_the_folder() {
     let first = folder.path().join("a.png");
     picture(&first, 10);
 
-    let child = Command::new(viewer())
+    let child = common::keep_data_in(&mut Command::new(viewer()), settings.path())
         .arg(&first)
         .env("NITID_NO_SINGLE_INSTANCE", "1")
-        .env("APPDATA", settings.path())
-        .env("LOCALAPPDATA", settings.path())
         .spawn()
         .expect("starting the viewer");
     let running = Running(child);

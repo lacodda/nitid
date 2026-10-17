@@ -112,7 +112,7 @@ fn the_interface_arrives_after_the_picture_and_never_before_it() {
     let dir = tempfile::tempdir().expect("creating a temporary folder");
     let image = photo_sized_image(dir.path());
 
-    let output = Command::new(&exe)
+    let output = common::keep_data_in(&mut Command::new(&exe), dir.path())
         .arg(&image)
         .env("NITID_STARTUP_REPORT", "1")
         // Wait one frame longer than the other gates: for the chrome.
@@ -227,7 +227,7 @@ struct Measurement {
 
 /// Run the viewer once and read the time it reports.
 fn measure(exe: &Path, image: &Path) -> Result<Measurement, String> {
-    let output = Command::new(exe)
+    let output = common::keep_data_in(&mut Command::new(exe), image.parent().ok_or("the picture is in no folder")?)
         .arg(image)
         .env("NITID_STARTUP_REPORT", "1")
         .env("NITID_EXIT_AFTER_FIRST_FRAME", "1")

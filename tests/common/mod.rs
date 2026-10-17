@@ -1,5 +1,26 @@
 //! What more than one gate needs: fixtures kept as text, because the suite
-//! ships no binary files of its own making.
+//! ships no binary files of its own making, and the one way a gate starts a
+//! viewer without touching the files of whoever runs it.
+
+// Each gate is its own crate and takes what it needs from here; what one
+// does not use is not dead in the others.
+#![allow(dead_code)]
+
+use std::path::Path;
+use std::process::Command;
+
+/// Keep the viewer's own files — its settings, the folders it has been to —
+/// in `dir` while a gate runs it.
+///
+/// The viewer writes them as it goes and when it closes. Started with the
+/// real `APPDATA` and `LOCALAPPDATA`, every gate moved the developer's window
+/// to wherever the test's window ended up, and from v0.39 it would also fill
+/// their start screen with the test's temporary folders — which vanish, and
+/// push the folders that matter off the end of the list. Every launch of the
+/// viewer in the suite goes through here.
+pub fn keep_data_in<'a>(command: &'a mut Command, dir: &Path) -> &'a mut Command {
+    command.env("APPDATA", dir).env("LOCALAPPDATA", dir)
+}
 
 /// A small HEIC with a thumbnail item beside the picture, as libheif writes
 /// one and as a phone does.

@@ -7,6 +7,8 @@
 
 #![cfg(windows)]
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
@@ -38,7 +40,7 @@ fn picture(path: &Path, shade: u8) {
 /// The window is the process that claims the channel, so a test that raced it
 /// would be testing the race rather than the hand-over.
 fn open_window(id: &str, image: &Path) -> Child {
-    let child = Command::new(viewer())
+    let child = common::keep_data_in(&mut Command::new(viewer()), image.parent().expect("the picture is in a folder"))
         .arg(image)
         .env("NITID_INSTANCE_ID", id)
         .spawn()
@@ -69,6 +71,9 @@ fn open_window(id: &str, image: &Path) -> Child {
 fn handed_over(id: &str, paths: &[&Path], deadline: Duration) -> Result<Duration, String> {
     let started = Instant::now();
     let mut command = Command::new(viewer());
+    if let Some(dir) = paths.first().and_then(|path| path.parent()) {
+        common::keep_data_in(&mut command, dir);
+    }
     for path in paths {
         command.arg(path);
     }
@@ -167,7 +172,7 @@ fn a_messenger_offers_the_foreground_to_the_window_it_hands_the_file_to() {
     let window = Reaped(open_window(&id, &first));
     let window_pid = window.0.id();
 
-    let handover = Command::new(viewer())
+    let handover = common::keep_data_in(&mut Command::new(viewer()), directory.path())
         .arg(&second)
         .env("NITID_INSTANCE_ID", &id)
         .env("NITID_HANDOVER_REPORT", "1")
@@ -212,7 +217,7 @@ fn several_launches_at_once_all_reach_the_same_window() {
     let messengers: Vec<Child> = others
         .iter()
         .map(|path| {
-            Command::new(viewer())
+            common::keep_data_in(&mut Command::new(viewer()), directory.path())
                 .arg(path)
                 .env("NITID_INSTANCE_ID", &id)
                 .spawn()
@@ -258,7 +263,7 @@ fn the_lever_turns_sharing_off() {
 
     // Told not to share, this launch opens a window of its own, shows the
     // picture, and exits on the first frame.
-    let output = Command::new(viewer())
+    let output = common::keep_data_in(&mut Command::new(viewer()), directory.path())
         .arg(&image)
         .env("NITID_INSTANCE_ID", &id)
         .env("NITID_NO_SINGLE_INSTANCE", "1")
@@ -285,7 +290,7 @@ fn a_launch_with_nobody_listening_opens_a_window() {
     let image = directory.path().join("cold.png");
     picture(&image, 120);
 
-    let output = Command::new(viewer())
+    let output = common::keep_data_in(&mut Command::new(viewer()), directory.path())
         .arg(&image)
         .env("NITID_INSTANCE_ID", instance_id("cold"))
         .env("NITID_STARTUP_REPORT", "1")
