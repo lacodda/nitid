@@ -637,7 +637,7 @@ impl Interface {
             // it starts on; an ordinary sRGB one has nothing to bake and
             // starts off, where it changes nothing either way.
             bake: hdr || wide,
-            quality: 90,
+            quality: crate::export::QUALITY,
             losses: Vec::new(),
         });
         self.save_focused = false;

@@ -13,6 +13,7 @@
 mod animation;
 mod app;
 mod avif;
+mod batch;
 // Only Windows has the dialog; the list of what it filters on is shared.
 #[cfg_attr(not(windows), allow(dead_code))]
 mod browse;
@@ -23,6 +24,7 @@ mod com;
 mod compare;
 mod config;
 mod console;
+mod convert;
 mod crop;
 mod cull;
 mod drag;
@@ -42,11 +44,13 @@ mod histogram;
 mod hotkey;
 mod icon;
 mod image_source;
+mod info;
 #[cfg(windows)]
 mod install;
 mod interface;
 mod isobmff;
 mod jpeg_lossless;
+mod json;
 mod loader;
 mod metadata;
 mod minimap;
@@ -191,6 +195,12 @@ pub mod testing {
         crate::interface::KEYS
     }
 
+    /// What `--help` prints, for the test that holds the command-line page
+    /// to it.
+    pub fn usage() -> String {
+        crate::usage()
+    }
+
     /// Every extension the viewer opens and the installer registers.
     pub fn extensions() -> Vec<&'static str> {
         crate::image_source::supported_extensions()
@@ -236,6 +246,10 @@ enum Command {
     /// The desktop's picture: from a folder on a schedule, the next one now,
     /// or no longer changing. See `wallpaper`.
     Wallpaper(wallpaper::Asked),
+    /// What pictures say about themselves, printed. See `info`.
+    Info(info::Asked),
+    /// Pictures written again in another format. See `convert`.
+    Convert(convert::Asked),
     /// Something the command line does not take, said before anything is
     /// done rather than mistaken for a file to open.
     Mistake(String),
@@ -272,7 +286,7 @@ pub fn run(windowed: bool) -> ExitCode {
             view(paths)
         }
         Command::Help => {
-            print_usage();
+            println!("{}", usage());
             Ok(())
         }
         Command::Version => {
@@ -281,6 +295,8 @@ pub fn run(windowed: bool) -> ExitCode {
         }
         Command::Decode => sandbox::run_as_decoder(),
         Command::Wallpaper(asked) => wallpaper::command(asked),
+        Command::Info(asked) => info::command(asked),
+        Command::Convert(asked) => convert::command(asked),
         Command::Mistake(mistake) => Err(anyhow::anyhow!("{mistake} (nitid --help says what it takes)")),
         #[cfg(windows)]
         Command::Install => install::install().map(|_| ()),
@@ -292,6 +308,8 @@ pub fn run(windowed: bool) -> ExitCode {
 
     match result {
         Ok(()) => ExitCode::SUCCESS,
+        // Said already, file by file, where it happened.
+        Err(error) if error.is::<batch::Reported>() => ExitCode::FAILURE,
         Err(error) => {
             eprintln!("nitid: {error:#}");
             ExitCode::FAILURE
@@ -376,6 +394,16 @@ fn parse(args: impl Iterator<Item = OsString>) -> Command {
                 Err(error) => Command::Mistake(format!("{error:#}")),
             }
         }
+        // The paths stay as the system gave them: a name that is not valid
+        // Unicode is still a file somebody can ask about.
+        Some("info") => match info::Asked::parse(args) {
+            Ok(asked) => Command::Info(asked),
+            Err(error) => Command::Mistake(format!("{error:#}")),
+        },
+        Some("convert") => match convert::Asked::parse(args) {
+            Ok(asked) => Command::Convert(asked),
+            Err(error) => Command::Mistake(format!("{error:#}")),
+        },
         // Leading dashes, so it cannot be mistaken for a file: every other
         // unrecognised argument is treated as a path.
         Some(sandbox::DECODE_ARGUMENT) => Command::Decode,
@@ -387,8 +415,9 @@ fn parse(args: impl Iterator<Item = OsString>) -> Command {
     }
 }
 
-fn print_usage() {
-    println!(
+/// What `--help` prints: every command and option, and the keys.
+fn usage() -> String {
+    format!(
         "\
 nitid {version} — a fast image viewer with honest color
 
@@ -398,6 +427,8 @@ Usage:
   nitid uninstall
   nitid wallpaper [FOLDER] [--every 30m] [--only PATTERN] [--fit fill|fit]
   nitid wallpaper next | off
+  nitid info FILE... [--json]
+  nitid convert FILE... --to jpeg|png|webp [--quality 1-100] [--srgb] [--out FOLDER]
 
 Arguments:
   FILE...       images to open. One file browses its folder; several browse
@@ -416,6 +447,15 @@ Commands:
                 no FOLDER it changes how the running schedule works, or says
                 what it is doing; next puts the next picture up now, off
                 stops it
+  info          what each picture says about itself: size, format, colour
+                profile, camera, place. --json prints the same for a script
+  convert       write each picture again as JPEG, PNG or WebP, beside it or
+                in --out FOLDER, keeping its colour profile (--srgb converts
+                the colour instead), its EXIF and its mark. Nothing is
+                replaced: a name already taken is left alone
+
+  FILE can be a picture, a folder (its pictures) or a pattern such as
+  *.heic, expanded by nitid itself because Windows shells do not
 
 Options:
   -h, --help    print this message
@@ -433,7 +473,7 @@ Keys:
   F11           fullscreen
   Esc           quit",
         version = env!("CARGO_PKG_VERSION")
-    );
+    )
 }
 
 #[cfg(test)]
@@ -474,6 +514,10 @@ mod tests {
         assert!(matches!(parse_args(&["wallpaper"]), Command::Wallpaper(wallpaper::Asked::Status)));
         assert!(matches!(parse_args(&["wallpaper", "next"]), Command::Wallpaper(wallpaper::Asked::Next)));
         assert!(matches!(parse_args(&["wallpaper", "--every", "soon"]), Command::Mistake(_)));
+        assert!(matches!(parse_args(&["info", "a.jpg"]), Command::Info(_)));
+        assert!(matches!(parse_args(&["info"]), Command::Mistake(_)));
+        assert!(matches!(parse_args(&["convert", "*.heic", "--to", "jpeg"]), Command::Convert(_)));
+        assert!(matches!(parse_args(&["convert", "*.heic"]), Command::Mistake(_)));
         assert!(matches!(parse_args(&["--help"]), Command::Help));
         assert!(matches!(parse_args(&["-V"]), Command::Version));
     }

@@ -10,6 +10,8 @@ nitid photo.jpg
 Opening a file opens its folder: the arrow keys walk the images beside it.
 Started with no file, nitid opens on the folders it has been to — see
 [Where you left off](/nitid/guides/where-you-left-off/).
+From a prompt, nitid also describes and converts pictures - see
+[Command line](/nitid/reference/command-line/).
 
 | Key | Action |
 | --- | --- |

@@ -199,6 +199,18 @@ pub fn read(bytes: &[u8]) -> Metadata {
     }
 }
 
+/// The file's EXIF block, the TIFF structure without the container's framing,
+/// set upright (`set_upright`) — for a copy of the picture written the way up
+/// it is shown, where the old tag would turn it a second time.
+///
+/// `None` when the file carries no EXIF.
+pub fn exif_block_upright(bytes: &[u8]) -> Option<Vec<u8>> {
+    let exif = read_exif(bytes)?;
+    let mut block = exif.buf().to_vec();
+    set_upright(&mut block);
+    Some(block)
+}
+
 /// Say in a TIFF block that the picture is upright, for pixels that have just
 /// been turned to be: the orientation tag set to 1, and the thumbnail cut
 /// loose when it had to be turned too.
@@ -560,7 +572,9 @@ mod tests {
         assert_eq!(tiff.len(), length, "the block changed size, so offsets inside it moved");
 
         let exif = parsed(tiff);
-        let orientation = exif.get_field(exif::Tag::Orientation, exif::In::PRIMARY).and_then(|field| field.value.get_uint(0));
+        let orientation = exif
+            .get_field(exif::Tag::Orientation, exif::In::PRIMARY)
+            .and_then(|field| field.value.get_uint(0));
         assert_eq!(orientation, Some(1));
         assert!(
             exif.get_field(exif::Tag::JPEGInterchangeFormat, exif::In::THUMBNAIL).is_none(),

@@ -101,6 +101,23 @@ impl Orientation {
         }
     }
 
+    /// How the stored picture is turned to be shown, in the words a person
+    /// reads: on the clean-copy box's checkbox, and on `nitid info`.
+    ///
+    /// `None` when it is upright, which needs no saying.
+    pub fn words(self) -> Option<&'static str> {
+        match self {
+            Self::Normal => None,
+            Self::Rotate90 => Some("a quarter clockwise"),
+            Self::Rotate180 => Some("half round"),
+            Self::Rotate270 => Some("a quarter anticlockwise"),
+            Self::FlipHorizontal => Some("left to right"),
+            Self::FlipVertical => Some("top to bottom"),
+            Self::Transpose => Some("across the diagonal"),
+            Self::Transverse => Some("across the other diagonal"),
+        }
+    }
+
     /// The EXIF number for this orientation.
     ///
     /// The inverse of `from_exif`, for the decoder process: the orientation

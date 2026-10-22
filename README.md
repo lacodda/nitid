@@ -57,6 +57,10 @@ difference, not the function.
 - **A copy without the camera, the date and the place.** `Ctrl+M` strips EXIF,
   XMP and IPTC by not copying them - no encoder runs, so the photograph you send
   is the photograph you took.
+- **A console for scripts.** `nitid info` says what a picture is - in text,
+  or as JSON - and `nitid convert *.heic --to jpeg` writes a phone's pictures
+  again with their colour profile, their date and the right way up, replacing
+  nothing.
 - **Where you left off.** Started from its icon, nitid opens on the folders
   it has been to, each tile the picture you stopped at; `O` brings them up over
   a picture. `Win+Alt+N`, pressed in any program, puts the newest picture from

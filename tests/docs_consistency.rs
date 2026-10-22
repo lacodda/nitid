@@ -117,3 +117,56 @@ fn the_readme_names_the_version_in_the_manifest() {
     let readme = readme();
     assert!(readme.contains(&format!("v{version}")), "the README's status line does not name v{version}",);
 }
+
+fn command_line_page() -> String {
+    page("docs/src/content/docs/reference/command-line.md")
+}
+
+/// The command-line page shows what `--help` says the commands are: every
+/// line of the synopsis, word for word, and every option `--help` names.
+///
+/// The same arrangement the keys table has with the key sheet. A command or
+/// a flag added to the program and not to the page fails here, and so does
+/// one the page still promises after the program dropped it — the page's
+/// synopsis is held to `--help` line by line in both directions.
+#[test]
+fn the_command_line_page_shows_what_help_says() {
+    let usage = nitid::testing::usage();
+    let page = command_line_page();
+
+    let synopsis: Vec<&str> = usage
+        .split("Usage:")
+        .nth(1)
+        .expect("--help has no usage section")
+        .lines()
+        .skip(1)
+        .take_while(|line| !line.trim().is_empty())
+        .map(str::trim)
+        .collect();
+    assert!(!synopsis.is_empty(), "--help lists no commands");
+
+    let block: Vec<&str> = page
+        .split("```\n")
+        .nth(1)
+        .expect("the command-line page opens with no synopsis block")
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    for line in &synopsis {
+        assert!(block.contains(line), "--help lists `{line}` and the page's synopsis does not");
+    }
+    for line in block.iter().filter(|line| !line.ends_with("--help") && !line.ends_with("--version")) {
+        assert!(synopsis.contains(line), "the page's synopsis promises `{line}` and --help does not list it");
+    }
+
+    let options: BTreeSet<&str> = usage
+        .split(|character: char| character.is_whitespace() || matches!(character, '[' | ']' | ',' | '(' | ')'))
+        .filter(|word| word.starts_with("--") && word.len() > 2)
+        .collect();
+    let undocumented: Vec<&&str> = options
+        .iter()
+        .filter(|option| !page.contains(&format!("`{option}")) && !block.iter().any(|line| line.contains(*option)))
+        .collect();
+    assert!(undocumented.is_empty(), "--help names these options and the page does not: {undocumented:?}");
+}

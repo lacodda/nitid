@@ -84,6 +84,11 @@ impl Target {
     }
 }
 
+/// The quality a lossy save starts at, in the save box and on the command
+/// line alike: high enough that a photograph shows no blocks at a normal
+/// view, at about a third of the size of 100.
+pub const QUALITY: u8 = 90;
+
 /// How the colour is carried across.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Colour {
@@ -146,10 +151,11 @@ pub fn warnings(request: &Request<'_>) -> Vec<String> {
     }
 
     // What the viewer could not honour when it read the file, repeated at the
-    // moment it would be written into a new one. The colour passport, on `K`,
-    // says the same thing at more length.
+    // moment it would be written into a new one. As it stands, because two
+    // readers say it: the save box adds where to read more, and `nitid
+    // convert` has no key to point at.
     if let Some(caveat) = request.caveat {
-        said.push(format!("{caveat} See the colour passport (K)."));
+        said.push(caveat.to_string());
     }
 
     if request.colour == Colour::KeepProfile && !is_hdr(request.profile) && request.profile.is_some_and(|profile| profile.encode().is_err()) {

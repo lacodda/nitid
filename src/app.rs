@@ -3739,7 +3739,8 @@ impl App {
             return;
         }
 
-        self.interface.begin_clean(&name_of(&path), found, describe_turn(orientation), bakeable);
+        self.interface
+            .begin_clean(&name_of(&path), found, orientation.words().map(str::to_string), bakeable);
         self.request_redraw();
     }
 
@@ -4059,6 +4060,17 @@ impl App {
             orientation,
             exif: None,
         });
+        // The colour passport says the same thing at more length.
+        let losses = losses
+            .into_iter()
+            .map(|line| {
+                if Some(&line) == caveat.as_ref() {
+                    format!("{line} See the colour passport (K).")
+                } else {
+                    line
+                }
+            })
+            .collect();
         self.interface.set_save_losses(losses);
     }
 
@@ -5431,25 +5443,6 @@ fn free_name_tagged(folder: &Path, stem: &str, tag: &str, extension: &str) -> Op
     (2..1000)
         .map(|number| folder.join(format!("{stem}-{tag}-{number}.{extension}")))
         .find(|candidate| !candidate.exists())
-}
-
-/// How a picture has to be turned for its orientation tag to become
-/// unnecessary, in the words a person reads on a checkbox.
-///
-/// `None` when the file is already upright, in which case there is nothing to
-/// bake and the box says so.
-fn describe_turn(orientation: Orientation) -> Option<String> {
-    let words = match orientation {
-        Orientation::Normal => return None,
-        Orientation::Rotate90 => "a quarter clockwise",
-        Orientation::Rotate180 => "half round",
-        Orientation::Rotate270 => "a quarter anticlockwise",
-        Orientation::FlipHorizontal => "left to right",
-        Orientation::FlipVertical => "top to bottom",
-        Orientation::Transpose => "across the diagonal",
-        Orientation::Transverse => "across the other diagonal",
-    };
-    Some(words.to_string())
 }
 
 /// Put an orientation tag back into a file a scrub has just emptied.

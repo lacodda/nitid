@@ -184,6 +184,176 @@ fn profile_name(profile: &ColorProfile) -> Option<String> {
     if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
 }
 
+/// What a profile states, in the words a person reading about a file uses —
+/// the space it names and the curve it encodes with — rather than the tags it
+/// stores them in.
+///
+/// For `nitid info`, where the question is "what is this file", not "what is
+/// happening on this screen": nothing here depends on the display.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Described {
+    /// What the profile calls itself.
+    pub name: Option<String>,
+    /// The ICC version it was written to, `4.3`.
+    pub version: &'static str,
+    /// What kind of device or space it describes.
+    pub class: &'static str,
+    /// The colour model of the numbers it describes.
+    pub space: &'static str,
+    /// The standard space whose primaries these are, judged by whether the
+    /// viewer would convert between the two at all. `None` for primaries of
+    /// the profile's own — a calibrated monitor, a camera's working space — and
+    /// for anything that is not RGB.
+    pub primaries: Option<&'static str>,
+    /// How the stored numbers map to light: a named curve, a gamma, or the
+    /// shape the profile stores when it is neither.
+    pub transfer: Option<String>,
+    pub intent: &'static str,
+    /// Whether the numbers are high dynamic range: a PQ or HLG transfer.
+    pub hdr: bool,
+}
+
+/// Describe a profile the way `Described` says.
+pub fn describe(profile: &ColorProfile) -> Described {
+    use moxcms::{DataColorSpace, ProfileClass, ProfileVersion, RenderingIntent, TransferCharacteristics};
+
+    let rgb = profile.color_space == DataColorSpace::Rgb;
+    let stated = profile.cicp.map(|cicp| cicp.transfer_characteristics);
+    let hdr = matches!(stated, Some(TransferCharacteristics::Smpte2084 | TransferCharacteristics::Hlg));
+
+    // The code points come first where a file states them: an HDR picture's
+    // transfer is a formula the curve tags can only approximate, and the code
+    // is the file's own word for it.
+    let transfer = match stated {
+        Some(TransferCharacteristics::Smpte2084) => Some("PQ (SMPTE ST 2084)".to_string()),
+        Some(TransferCharacteristics::Hlg) => Some("HLG".to_string()),
+        Some(TransferCharacteristics::Srgb) => Some("sRGB curve".to_string()),
+        Some(TransferCharacteristics::Linear) => Some("linear".to_string()),
+        _ => {
+            let curves: Vec<&ToneReprCurve> = if rgb {
+                [&profile.red_trc, &profile.green_trc, &profile.blue_trc].into_iter().flatten().collect()
+            } else {
+                profile.gray_trc.iter().collect()
+            };
+            transfer_of(&curves)
+        }
+    };
+
+    let primaries = if rgb {
+        let known: [(&'static str, ColorProfile); 6] = [
+            ("sRGB", ColorProfile::new_srgb()),
+            ("Display P3", ColorProfile::new_display_p3()),
+            ("Adobe RGB (1998)", ColorProfile::new_adobe_rgb()),
+            ("BT.2020", ColorProfile::new_bt2020()),
+            ("DCI-P3", ColorProfile::new_dci_p3()),
+            ("ProPhoto RGB", ColorProfile::new_pro_photo_rgb()),
+        ];
+        known.into_iter().find_map(|(name, standard)| {
+            let matrix = profile.transform_matrix(&standard);
+            let matrix = matrix.v.map(|row| row.map(|value| value as f32));
+            is_near_identity(&matrix).then_some(name)
+        })
+    } else {
+        None
+    };
+
+    Described {
+        name: profile_name(profile),
+        version: match profile.version() {
+            ProfileVersion::V2_0 => "2.0",
+            ProfileVersion::V2_1 => "2.1",
+            ProfileVersion::V2_2 => "2.2",
+            ProfileVersion::V2_3 => "2.3",
+            ProfileVersion::V2_4 => "2.4",
+            ProfileVersion::V4_0 => "4.0",
+            ProfileVersion::V4_1 => "4.1",
+            ProfileVersion::V4_2 => "4.2",
+            ProfileVersion::V4_3 => "4.3",
+            ProfileVersion::V4_4 => "4.4",
+            ProfileVersion::Unknown => "unknown",
+        },
+        class: match profile.profile_class {
+            ProfileClass::InputDevice => "input device",
+            ProfileClass::DisplayDevice => "display",
+            ProfileClass::OutputDevice => "output device",
+            ProfileClass::DeviceLink => "device link",
+            ProfileClass::ColorSpace => "colour space",
+            ProfileClass::Abstract => "abstract",
+            ProfileClass::Named => "named colours",
+        },
+        space: match profile.color_space {
+            DataColorSpace::Rgb => "RGB",
+            DataColorSpace::Gray => "grey",
+            DataColorSpace::Cmyk => "CMYK",
+            DataColorSpace::Lab => "Lab",
+            DataColorSpace::Xyz => "XYZ",
+            _ => "other",
+        },
+        primaries,
+        transfer,
+        intent: match profile.rendering_intent {
+            RenderingIntent::Perceptual => "perceptual",
+            RenderingIntent::RelativeColorimetric => "relative colorimetric",
+            RenderingIntent::Saturation => "saturation",
+            RenderingIntent::AbsoluteColorimetric => "absolute colorimetric",
+        },
+        hdr,
+    }
+}
+
+/// Name the curve a profile encodes with, by how it behaves rather than how it
+/// is stored: an sRGB curve arrives as a table in one profile and as five
+/// parameters in the next, and both are the sRGB curve.
+fn transfer_of(curves: &[&ToneReprCurve]) -> Option<String> {
+    let first = curves.first()?;
+    let sampled = |curve: &ToneReprCurve| -> Vec<f32> {
+        (0..CURVE_SAMPLES)
+            .map(|index| evaluate(curve, index as f32 / (CURVE_SAMPLES - 1) as f32))
+            .collect()
+    };
+    let shape = sampled(first);
+    // The tolerance the identity test uses: below half a level of an
+    // eight-bit channel, so two curves that store the same values are one.
+    let close = |other: &[f32]| shape.iter().zip(other).all(|(a, b)| (a - b).abs() < 0.002);
+
+    if curves[1..].iter().any(|curve| !close(&sampled(curve))) {
+        return Some("different for each channel".to_string());
+    }
+
+    let power = |gamma: f32| -> Vec<f32> {
+        (0..CURVE_SAMPLES)
+            .map(|index| (index as f32 / (CURVE_SAMPLES - 1) as f32).powf(gamma))
+            .collect()
+    };
+    let srgb: Vec<f32> = (0..CURVE_SAMPLES)
+        .map(|index| srgb_to_linear(index as f32 / (CURVE_SAMPLES - 1) as f32))
+        .collect();
+    if close(&srgb) {
+        return Some("sRGB curve".to_string());
+    }
+    if close(&power(1.0)) {
+        return Some("linear".to_string());
+    }
+
+    // A pure power curve, whatever its exponent: read the exponent off the
+    // middle of the curve, then hold the whole curve to it.
+    let middle = shape[CURVE_SAMPLES / 2];
+    let at = (CURVE_SAMPLES / 2) as f32 / (CURVE_SAMPLES - 1) as f32;
+    if middle > 0.0 && middle < 1.0 {
+        let gamma = middle.ln() / at.ln();
+        if close(&power(gamma)) {
+            let rounded = format!("{gamma:.2}");
+            let trimmed = rounded.trim_end_matches('0').trim_end_matches('.');
+            return Some(format!("gamma {trimmed}"));
+        }
+    }
+
+    Some(match first {
+        ToneReprCurve::Lut(table) => format!("a table of {} points", table.len()),
+        ToneReprCurve::Parametric(_) => "a parametric curve".to_string(),
+    })
+}
+
 /// How far the matrix moves a colour, as the largest change to any one
 /// primary.
 ///
@@ -1068,5 +1238,63 @@ mod tests {
             let sum: f32 = transform.matrix[row].iter().sum();
             assert!((sum - 1.0).abs() < 0.02, "row {row} of an SDR transform sums to {sum}");
         }
+    }
+
+    /// The standard spaces are named by what they are, each by its own
+    /// primaries and its own curve — the six together, so a description that
+    /// named everything sRGB, or every curve a gamma, fails on the others.
+    #[test]
+    fn the_standard_spaces_are_named_by_their_primaries_and_curve() {
+        let cases: [(ColorProfile, Option<&str>, &str, bool); 7] = [
+            (ColorProfile::new_srgb(), Some("sRGB"), "sRGB curve", false),
+            (ColorProfile::new_display_p3(), Some("Display P3"), "sRGB curve", false),
+            (ColorProfile::new_adobe_rgb(), Some("Adobe RGB (1998)"), "gamma 2.2", false),
+            (ColorProfile::new_pro_photo_rgb(), Some("ProPhoto RGB"), "gamma 1.8", false),
+            (ColorProfile::new_bt2020_pq(), Some("BT.2020"), "PQ (SMPTE ST 2084)", true),
+            (ColorProfile::new_bt2020_hlg(), Some("BT.2020"), "HLG", true),
+            (ColorProfile::new_aces_cg_linear(), None, "linear", false),
+        ];
+        for (profile, primaries, transfer, hdr) in cases {
+            let described = describe(&profile);
+            assert_eq!(described.primaries, primaries, "{described:?}");
+            assert_eq!(described.transfer.as_deref(), Some(transfer), "{described:?}");
+            assert_eq!(described.hdr, hdr, "{described:?}");
+            assert_eq!(described.space, "RGB");
+        }
+    }
+
+    /// Primaries of a profile's own are not rounded to the nearest standard:
+    /// a calibrated monitor's profile is a few thousandths off sRGB, and
+    /// calling it sRGB would be the one wrong answer.
+    #[test]
+    fn primaries_of_its_own_are_not_given_a_standard_name() {
+        let mut own = ColorProfile::new_srgb();
+        own.red_colorant.x += 0.02;
+        assert_eq!(describe(&own).primaries, None);
+    }
+
+    /// A curve stored differently per channel is said to be, rather than
+    /// described by its red channel alone.
+    #[test]
+    fn channels_with_different_curves_are_said_to_differ() {
+        let mut uneven = ColorProfile::new_srgb();
+        // The built-in profile also states its curve as a code point, which
+        // is read first; a profile from a file mostly does not.
+        uneven.cicp = None;
+        uneven.blue_trc = Some(ToneReprCurve::Lut(vec![(1.8f32 * 256.0) as u16]));
+        assert_eq!(describe(&uneven).transfer.as_deref(), Some("different for each channel"));
+    }
+
+    /// A curve that is neither a named one nor a power is described by the
+    /// shape it is stored as.
+    #[test]
+    fn a_curve_of_no_known_shape_is_described_by_its_storage() {
+        let mut odd = ColorProfile::new_srgb();
+        odd.cicp = None;
+        let table: Vec<u16> = (0..16u32).map(|index| ((index * index * index) % 65536) as u16 * 16).collect();
+        for curve in [&mut odd.red_trc, &mut odd.green_trc, &mut odd.blue_trc] {
+            *curve = Some(ToneReprCurve::Lut(table.clone()));
+        }
+        assert_eq!(describe(&odd).transfer.as_deref(), Some("a table of 16 points"));
     }
 }
