@@ -137,8 +137,9 @@ without the camera and the place, make a clean copy with `Ctrl+M`.
 
 **Nothing is replaced.** A name already taken is left alone and said so -
 which also means a second run over the same folder finishes what an
-interrupted one started. `--quality` sets JPEG and WebP quality, 90 unless
-given.
+interrupted one started. `--quality` sets JPEG quality, 90 unless given. PNG
+and WebP are written without loss and take no quality: a WebP of a photograph
+is therefore large, and JPEG is the format for sending one.
 
 ## Exit codes
 
