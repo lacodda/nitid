@@ -4,8 +4,11 @@
 import sharp from "sharp";
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
-const ASSETS = "C:/Projects/nitid/assets";
+// The repository's assets, found from where this script lives rather than
+// from where it was run or whose machine it is on.
+const ASSETS = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "assets");
 
 // The three levels of the mark. Which one a raster takes is decided by
 // `levelFor` below, never by habit — the comment that used to sit here said
