@@ -199,6 +199,76 @@ pub fn read(bytes: &[u8]) -> Metadata {
     }
 }
 
+/// Say in a TIFF block that the picture is upright, for pixels that have just
+/// been turned to be: the orientation tag set to 1, and the thumbnail cut
+/// loose when it had to be turned too.
+///
+/// The thumbnail is the half that is easy to miss. A camera stores it the way
+/// it stores the picture, sideways with the tag to turn it, so once the tag
+/// says upright the thumbnail shows the picture on its side — in Explorer's
+/// small views, and in this viewer's own first frame, which is the thumbnail.
+/// It is cut loose by ending the chain of directories after the first, which
+/// is the only way a reader finds it; its bytes stay where they are, dead, so
+/// no offset anywhere in the block moves. An upright picture keeps its
+/// thumbnail: it is right, and it is what makes the first frame fast.
+///
+/// Only those two fields are touched: the orientation sits inside its own
+/// entry as a SHORT, which it always is. A block with no orientation entry is
+/// left alone — absent already means upright.
+pub(crate) fn set_upright(tiff: &mut [u8]) {
+    let Some(header) = tiff.get(..8) else {
+        return;
+    };
+    let little = match &header[..2] {
+        b"II" => true,
+        b"MM" => false,
+        _ => return,
+    };
+    let read_u16 = |bytes: &[u8]| {
+        let pair = [bytes[0], bytes[1]];
+        if little { u16::from_le_bytes(pair) } else { u16::from_be_bytes(pair) }
+    };
+    let read_u32 = |bytes: &[u8]| {
+        let quad = [bytes[0], bytes[1], bytes[2], bytes[3]];
+        if little { u32::from_le_bytes(quad) } else { u32::from_be_bytes(quad) }
+    };
+
+    let first = read_u32(&header[4..8]) as usize;
+    let Some(count_at) = tiff.get(first..first + 2) else {
+        return;
+    };
+    let count = usize::from(read_u16(count_at));
+
+    for index in 0..count {
+        let entry = first + 2 + index * 12;
+        let Some(tag) = tiff.get(entry..entry + 2).map(read_u16) else {
+            return;
+        };
+        if tag != 0x0112 {
+            continue;
+        }
+        // A SHORT sits in the first two bytes of the value field, in the
+        // block's own byte order.
+        let value_at = entry + 8;
+        let Some(slot) = tiff.get_mut(value_at..value_at + 2) else {
+            return;
+        };
+        if read_u16(slot) == 1 {
+            return;
+        }
+        let upright = if little { 1u16.to_le_bytes() } else { 1u16.to_be_bytes() };
+        slot.copy_from_slice(&upright);
+
+        // The offset of the next directory follows the entries; zero ends
+        // the chain.
+        let next_at = first + 2 + count * 12;
+        if let Some(next) = tiff.get_mut(next_at..next_at + 4) {
+            next.copy_from_slice(&[0; 4]);
+        }
+        return;
+    }
+}
+
 fn read_exif(bytes: &[u8]) -> Option<exif::Exif> {
     let mut cursor = Cursor::new(bytes);
     exif::Reader::new().read_from_container(&mut cursor).ok()
@@ -449,6 +519,63 @@ pub fn taken(raw: &str, subsec: Option<&str>, offset: Option<i32>) -> Taken {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A TIFF block with an orientation and a second directory, as a camera
+    /// writes one: IFD0 holds the orientation, IFD1 the thumbnail's place.
+    fn block_turned(orientation: u16) -> Vec<u8> {
+        let mut tiff = b"II*\0".to_vec();
+        tiff.extend_from_slice(&8u32.to_le_bytes());
+        // IFD0: one entry, then the offset of IFD1.
+        tiff.extend_from_slice(&1u16.to_le_bytes());
+        tiff.extend_from_slice(&0x0112u16.to_le_bytes());
+        tiff.extend_from_slice(&3u16.to_le_bytes());
+        tiff.extend_from_slice(&1u32.to_le_bytes());
+        tiff.extend_from_slice(&orientation.to_le_bytes());
+        tiff.extend_from_slice(&0u16.to_le_bytes());
+        let ifd1 = 8 + 2 + 12 + 4;
+        tiff.extend_from_slice(&(ifd1 as u32).to_le_bytes());
+        // IFD1: where the thumbnail is and how long, then the end.
+        tiff.extend_from_slice(&2u16.to_le_bytes());
+        for (tag, value) in [(0x0201u16, 100u32), (0x0202u16, 4u32)] {
+            tiff.extend_from_slice(&tag.to_le_bytes());
+            tiff.extend_from_slice(&4u16.to_le_bytes());
+            tiff.extend_from_slice(&1u32.to_le_bytes());
+            tiff.extend_from_slice(&value.to_le_bytes());
+        }
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+        tiff.resize(104, 0xD8);
+        tiff
+    }
+
+    fn parsed(tiff: Vec<u8>) -> exif::Exif {
+        exif::Reader::new().read_raw(tiff).expect("the block still parses")
+    }
+
+    /// Turned: upright now, and the thumbnail that was stored turned is gone.
+    #[test]
+    fn a_turned_block_is_set_upright_and_loses_its_thumbnail() {
+        let mut tiff = block_turned(6);
+        let length = tiff.len();
+        set_upright(&mut tiff);
+        assert_eq!(tiff.len(), length, "the block changed size, so offsets inside it moved");
+
+        let exif = parsed(tiff);
+        let orientation = exif.get_field(exif::Tag::Orientation, exif::In::PRIMARY).and_then(|field| field.value.get_uint(0));
+        assert_eq!(orientation, Some(1));
+        assert!(
+            exif.get_field(exif::Tag::JPEGInterchangeFormat, exif::In::THUMBNAIL).is_none(),
+            "the thumbnail stored for the old orientation is still found"
+        );
+    }
+
+    /// Already upright: the thumbnail is right, and stays.
+    #[test]
+    fn an_upright_block_keeps_its_thumbnail() {
+        let mut tiff = block_turned(1);
+        set_upright(&mut tiff);
+        let exif = parsed(tiff);
+        assert!(exif.get_field(exif::Tag::JPEGInterchangeFormat, exif::In::THUMBNAIL).is_some());
+    }
 
     /// Build an EXIF block by hand.
     ///

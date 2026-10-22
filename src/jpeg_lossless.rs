@@ -1308,12 +1308,12 @@ fn write_turned(bytes: &[u8], frame: &Frame, turned: &Frame, kept: &Coefficients
             transpose_quantisation_tables(&mut segment[4..]);
             out.extend_from_slice(&segment);
         } else if marker == 0xE1 && bytes[at + 4..at + 2 + length].starts_with(b"Exif\0\0") {
-            // The EXIF block, with its orientation set to upright. Rewritten in
-            // place rather than dropped: it also carries the camera, the lens
-            // and the date, and a bake is not a scrub. Someone who wants both
-            // asks for both.
+            // The EXIF block, set upright: the orientation, and the thumbnail
+            // that was stored turned. Rewritten in place rather than dropped:
+            // it also carries the camera, the lens and the date, and a bake
+            // is not a scrub. Someone who wants both asks for both.
             let mut segment = bytes[at..at + 2 + length].to_vec();
-            set_orientation_upright(&mut segment[10..]);
+            crate::metadata::set_upright(&mut segment[10..]);
             out.extend_from_slice(&segment);
         } else {
             out.extend_from_slice(&bytes[at..at + 2 + length]);
@@ -1373,55 +1373,6 @@ fn transpose_quantisation_tables(body: &mut [u8]) {
         }
 
         at = end;
-    }
-}
-
-/// Set the orientation tag in a TIFF block to 1, in place, if it has one.
-///
-/// Only the one field is touched: the value sits inside its own entry when it
-/// is a SHORT, which it always is, so nothing moves and no offset elsewhere in
-/// the block becomes wrong. A block with no orientation entry is left alone —
-/// absent already means upright.
-fn set_orientation_upright(tiff: &mut [u8]) {
-    let Some(header) = tiff.get(..8) else {
-        return;
-    };
-    let little = match &header[..2] {
-        b"II" => true,
-        b"MM" => false,
-        _ => return,
-    };
-    let read_u16 = |bytes: &[u8]| {
-        let pair = [bytes[0], bytes[1]];
-        if little { u16::from_le_bytes(pair) } else { u16::from_be_bytes(pair) }
-    };
-    let read_u32 = |bytes: &[u8]| {
-        let quad = [bytes[0], bytes[1], bytes[2], bytes[3]];
-        if little { u32::from_le_bytes(quad) } else { u32::from_be_bytes(quad) }
-    };
-
-    let first = read_u32(&header[4..8]) as usize;
-    let Some(count_at) = tiff.get(first..first + 2) else {
-        return;
-    };
-    let count = usize::from(read_u16(count_at));
-
-    for index in 0..count {
-        let entry = first + 2 + index * 12;
-        let Some(tag) = tiff.get(entry..entry + 2).map(read_u16) else {
-            return;
-        };
-        if tag != 0x0112 {
-            continue;
-        }
-        // A SHORT sits in the first two bytes of the value field, in the
-        // block's own byte order.
-        let value_at = entry + 8;
-        if let Some(slot) = tiff.get_mut(value_at..value_at + 2) {
-            let upright = if little { 1u16.to_le_bytes() } else { 1u16.to_be_bytes() };
-            slot.copy_from_slice(&upright);
-        }
-        return;
     }
 }
 
