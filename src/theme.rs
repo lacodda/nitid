@@ -206,13 +206,25 @@ pub fn text_styles() -> std::collections::BTreeMap<egui::TextStyle, egui::FontId
     .into()
 }
 
+/// The room inside a button, around its label or glyph.
+///
+/// Held here rather than left to egui: 0.37 doubled its default to make
+/// buttons roomier, which widens every one of the toolbar's buttons and drops
+/// the last groups off a window that held them before. dowel has no spacing
+/// scale to take this from, so the value is the one the chrome was laid out
+/// and measured at.
+pub const BUTTON_PADDING: egui::Vec2 = egui::vec2(4.0, 1.0);
+
 /// Both themes of the palette, handed to egui, which picks between them by the
 /// system's setting and switches when it changes.
 pub fn apply(context: &egui::Context) {
     context.set_visuals_of(egui::Theme::Dark, visuals(&dowel::DARK, true));
     context.set_visuals_of(egui::Theme::Light, visuals(&dowel::LIGHT, false));
     for theme in [egui::Theme::Dark, egui::Theme::Light] {
-        context.style_mut_of(theme, |style| style.text_styles = text_styles());
+        context.style_mut_of(theme, |style| {
+            style.text_styles = text_styles();
+            style.spacing.button_padding = BUTTON_PADDING;
+        });
     }
     context.options_mut(|options| options.theme_preference = egui::ThemePreference::System);
 }
@@ -247,6 +259,17 @@ mod tests {
         assert_eq!(dark.widgets.noninteractive.fg_stroke.color, dowel::DARK.text);
         assert_eq!(light.widgets.noninteractive.fg_stroke.color, dowel::LIGHT.text);
         assert_eq!(dark.selection.stroke.color, dowel::DARK.accent);
+    }
+
+    /// The padding reaches both themes: a light theme drawn at egui's own
+    /// default would lay the toolbar out wider than the dark one.
+    #[test]
+    fn buttons_keep_the_padding_the_toolbar_was_measured_at() {
+        let context = egui::Context::default();
+        apply(&context);
+        for theme in [egui::Theme::Dark, egui::Theme::Light] {
+            context.style_mut_of(theme, |style| assert_eq!(style.spacing.button_padding, BUTTON_PADDING, "{theme:?}"));
+        }
     }
 
     #[test]

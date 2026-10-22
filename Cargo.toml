@@ -82,19 +82,21 @@ avif-parse = "2.1"
 # nitid's own render pass rather than owning the surface — the swapchain has to
 # stay ours for HDR (ADR 0001), and `eframe` would configure it itself.
 #
-# 0.36 is the first release built against wgpu 30, and it is what raised the
+# 0.36 was the first release built against wgpu 30, and it is what raised the
 # MSRV to 1.95: the alternatives were holding wgpu back to 29 or drawing every
-# widget by hand.
+# widget by hand. 0.37 stays on wgpu 30 and on that MSRV; it doubled the
+# default button padding, which `theme::BUTTON_PADDING` holds where the
+# toolbar was measured.
 # `default_fonts` is the only default kept: without a font egui draws no
 # text at all, and the interface is almost entirely text.
-egui = { version = "0.36.1", default-features = false, features = ["default_fonts"] }
-egui-wgpu = "0.36.1"
+egui = { version = "0.37.0", default-features = false, features = ["default_fonts"] }
+egui-wgpu = "0.37.0"
 # `default-features = false` drops accessibility (`accesskit`) and the
 # X11/Wayland backends; `clipboard` is taken back because the Info panel copies
 # a field on click, which is what makes a coordinate or a lens name useful
 # rather than only visible. The full clipboard — the image itself, the path —
 # is still its own version later.
-egui-winit = { version = "0.36.1", default-features = false, features = ["clipboard"] }
+egui-winit = { version = "0.37.0", default-features = false, features = ["clipboard"] }
 
 kamadak-exif = "0.6"
 # Reading EXIF and writing it are different crates: `kamadak-exif` only

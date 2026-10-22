@@ -4009,7 +4009,7 @@ fn contained(well: egui::Rect, size: (f32, f32)) -> egui::Rect {
 }
 
 fn area(name: &'static str) -> egui::Area {
-    egui::Area::new(name.into()).fade_in(false)
+    egui::Area::new(egui::Id::unique(name)).fade_in(false)
 }
 
 fn separator(ui: &mut egui::Ui) {
@@ -4190,10 +4190,15 @@ mod tests {
     /// The arrow is drawn as an arrow, not as the replacement box.
     ///
     /// The family list is one fact; this is the other, and it is the one the
-    /// owner actually saw. epaint substitutes a white square for a character
-    /// no face in the family carries, so a message with a missing glyph and a
-    /// message with a box in it are the *same picture*. Laying both out and
-    /// comparing their widths tells them apart without a screenshot.
+    /// owner actually saw: a message with a missing glyph and a message with a
+    /// box in it are the *same picture*. Since egui 0.37 the font set answers
+    /// the question itself. Before that it was asked by laying the arrow out
+    /// beside the replacement box and comparing widths, which stopped meaning
+    /// anything once both came from Hack - a monospaced face, where every
+    /// glyph is the same width.
+    ///
+    /// A character none of the bundled faces carries is asked about too, so a
+    /// font set that answered yes to everything could not pass.
     #[test]
     fn an_arrow_in_ordinary_text_is_not_the_replacement_box() {
         let context = egui::Context::default();
@@ -4205,14 +4210,15 @@ mod tests {
         // on a dropped delta, as the layout tests already know.
         output.textures_delta.clear();
 
-        let width = |character: char| context.fonts_mut(|fonts| fonts.glyph_width(&egui::FontId::proportional(14.0), character));
+        let carried = |character: char| context.fonts_mut(|fonts| fonts.has_glyph(&egui::FontId::proportional(14.0), character));
 
-        let arrow = width('\u{2192}');
-        let replacement = width('\u{25FB}');
-        assert!(arrow > 0.0, "the arrow laid out to nothing at all");
         assert!(
-            (arrow - replacement).abs() > 0.01,
-            "the arrow measures the same as the replacement box ({arrow} vs {replacement}) — it is being substituted",
+            carried('\u{2192}'),
+            "no face in the proportional family carries the arrow: it is drawn as a box"
+        );
+        assert!(
+            !carried('\u{4E00}'),
+            "the font set claims a CJK ideograph, so its answer about the arrow proves nothing"
         );
     }
 
@@ -4330,7 +4336,7 @@ mod tests {
             let mut status = status();
             status.histogram = Some(counted_histogram());
 
-            let Some(plot) = laid_out_rect(&mut interface, &status, egui::Id::new("histogram"), height) else {
+            let Some(plot) = laid_out_rect(&mut interface, &status, egui::Id::unique("histogram"), height) else {
                 panic!("the histogram laid out nothing at a window height of {height}");
             };
             assert!(
@@ -4558,8 +4564,8 @@ mod tests {
             ..mapped((0.25, 0.25, 0.5, 0.5))
         };
 
-        let histogram = laid_out_rect(&mut interface, &status, egui::Id::new("histogram"), 700.0);
-        let minimap = laid_out_rect(&mut interface, &status, egui::Id::new("minimap"), 700.0);
+        let histogram = laid_out_rect(&mut interface, &status, egui::Id::unique("histogram"), 700.0);
+        let minimap = laid_out_rect(&mut interface, &status, egui::Id::unique("minimap"), 700.0);
         let (Some(histogram), Some(minimap)) = (histogram, minimap) else {
             panic!("a panel that is showing was not laid out: {histogram:?}, {minimap:?}");
         };
