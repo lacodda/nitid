@@ -601,6 +601,27 @@ fn decode_via_image_crate(bytes: &[u8]) -> Result<DecodedImage> {
     }
 
     let decoded = reader.decode().context("the image data is malformed")?;
+
+    // A sixteen-bit PNG or TIFF keeps its depth, as a ten-bit HEIC does: the
+    // texture, the histogram and the eyedropper all take sixteen bits, and
+    // narrowing here would throw away the precision the file was saved at
+    // and leave the Info panel and `nitid info` calling it an 8-bit file.
+    // Floating-point TIFF goes the same way, clamped to the range.
+    use image::ColorType;
+    if matches!(
+        decoded.color(),
+        ColorType::L16 | ColorType::La16 | ColorType::Rgb16 | ColorType::Rgba16 | ColorType::Rgb32F | ColorType::Rgba32F
+    ) {
+        let rgba = decoded.into_rgba16();
+        let (width, height) = rgba.dimensions();
+        return Ok(DecodedImage {
+            width,
+            height,
+            pixels: bytemuck::cast_slice(rgba.as_raw()).to_vec(),
+            depth: Depth::Sixteen,
+        });
+    }
+
     let rgba = decoded.into_rgba8();
     let (width, height) = rgba.dimensions();
 
@@ -1901,6 +1922,27 @@ mod tests {
 
         let small_steps = row.windows(2).filter(|pair| pair[1] > pair[0] && pair[1] - pair[0] < 200).count();
         assert!(small_steps > 0, "every step is 8-bit sized, so the depth was narrowed somewhere: {row:?}");
+    }
+
+    /// A sixteen-bit PNG keeps its sixteen bits, exactly, rather than being
+    /// narrowed at the decoder: a sample of 0x1234 is one an 8-bit pipeline
+    /// cannot carry, and it comes back as itself. An eight-bit PNG stays
+    /// eight, so the ordinary case pays nothing.
+    #[test]
+    fn a_sixteen_bit_png_keeps_its_depth() {
+        let mut deep = image::ImageBuffer::<image::Rgb<u16>, Vec<u16>>::new(3, 2);
+        deep.put_pixel(1, 1, image::Rgb([0x1234, 0xFFFF, 0x0001]));
+        let mut bytes = Cursor::new(Vec::new());
+        deep.write_to(&mut bytes, image::ImageFormat::Png).expect("encoding a sixteen-bit PNG");
+
+        let loaded = decode_here(bytes.get_ref()).unwrap();
+        assert_eq!(loaded.image.depth, Depth::Sixteen, "a sixteen-bit PNG was narrowed on the way in");
+        let at = ((loaded.image.width + 1) * 4 * 2) as usize;
+        let sample = |offset: usize| u16::from_ne_bytes([loaded.image.pixels[at + offset], loaded.image.pixels[at + offset + 1]]);
+        assert_eq!([sample(0), sample(2), sample(4), sample(6)], [0x1234, 0xFFFF, 0x0001, 0xFFFF]);
+
+        let shallow = decode_here(&encode(image::ImageFormat::Png, 2, 2)).unwrap();
+        assert_eq!(shallow.image.depth, Depth::Eight);
     }
 
     /// Cropping a sixteen-bit picture narrows it, which is exactly what the

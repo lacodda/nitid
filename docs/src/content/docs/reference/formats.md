@@ -34,7 +34,7 @@ rest, container and HEVC alike, and reaches the screen as fast as a JPEG: it
 carries a thumbnail as a second image inside its container, and nitid shows
 that first while the full picture decodes behind it. A 10- or 12-bit HEIC
 keeps its depth: the decoder hands over sixteen-bit samples and they reach the
-texture that wide.
+texture that wide. So does a sixteen-bit PNG or TIFF.
 
 One limitation remains, and only for some files. A HEIC states its colour
 either as a set of standard code points or as an embedded ICC profile. With a
