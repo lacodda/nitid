@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.40.0] - 2026-10-22
+
+### Bug Fixes
+- Write the kept profile and the picture the way up it is shown
+- Drop the thumbnail stored turned when a turn is baked in
+- Keep a sixteen-bit PNG or TIFF at sixteen bits
+
+### Build
+- Point the homepage at the docs site and find the assets from the script
+
+### Features
+- Describe pictures with nitid info and convert them with nitid convert
+- Name the code points a HEIC states its colour by
+
 ## [0.39.0] - 2026-10-17
 
 ### Documentation

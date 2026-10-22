@@ -120,12 +120,12 @@ app*. Full instructions: [Getting Started](https://lacodda.github.io/nitid/getti
 
 ## Status
 
-v0.39.0, in daily use on Windows. Startup, colour and HDR hold end to end;
+v0.40.0, in daily use on Windows. Startup, colour and HDR hold end to end;
 every modern still format opens, the animated ones play, and pictures past a
 GPU texture's limit are drawn as tiles. Cropping, turning and stripping
 metadata run without an encoder; frames are culled two at a time; prints come
-out in the colour on screen. Started with no file, it opens on where you left
-off. What landed in each
+out in the colour on screen. From a terminal it describes pictures and
+converts them, for a person or a script. What landed in each
 version: [CHANGELOG](https://github.com/lacodda/nitid/blob/main/CHANGELOG.md).
 
 ## Documentation
