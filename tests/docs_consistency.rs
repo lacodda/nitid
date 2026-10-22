@@ -21,9 +21,16 @@ use std::collections::BTreeSet;
 
 /// One documentation page, read from the source tree rather than embedded, so
 /// a failure names the file the author has to fix.
+///
+/// With its line endings made `\n`: the Windows runner checks the tree out
+/// with `\r\n`, and a page split on a fence followed by `\n` finds no block
+/// there at all — the gate passed on every machine but the one the release
+/// is built on.
 fn page(relative: &str) -> String {
     let path = format!("{}/{relative}", env!("CARGO_MANIFEST_DIR"));
-    std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("{path}: {error}"))
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("{path}: {error}"))
+        .replace("\r\n", "\n")
 }
 
 /// The page listing every key, and the one listing every format.
