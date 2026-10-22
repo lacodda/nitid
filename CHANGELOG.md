@@ -2,6 +2,11 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.40.1] - 2026-10-22
+
+### Testing
+- Read the docs pages whatever their line endings
+
 ## [0.40.0] - 2026-10-22
 
 ### Bug Fixes
