@@ -74,7 +74,9 @@ Adobe RGB (1998), BT.2020, DCI-P3, ProPhoto RGB - or says *its own* for a
 calibrated monitor's or a camera's. *Transfer* names the curve by how it
 behaves, so an sRGB curve stored as a table and one stored as five numbers
 both read *sRGB curve*. A file with no profile says so: it is shown exactly as
-stored, as every browser shows it.
+stored, as every browser shows it. A HEIC that states its colour as code
+points instead of a profile says which, as *Codes* - `1/13/6: BT.709
+primaries, sRGB curve` - and its decoder turns them into sRGB.
 
 ### `--json`
 
@@ -92,6 +94,7 @@ the order named.
 | `frames` | `1` for a still picture |
 | `mark` | `"kept"`, `"rejected"` or `null` |
 | `colour` | `null` when untagged, or `profile`, `primaries`, `transfer`, `hdr`, `version`, `class`, `space`, `intent` |
+| `codes` | the `primaries`, `transfer` and `matrix` code points a HEIC states its colour by, or `null` |
 | `caveat` | what the file states that nitid cannot honour, or `null` |
 | `camera` | `camera`, `lens`, `exposure` (seconds), `aperture`, `iso`, `compensation` (stops), `focal_length` (mm), `focal_length_35mm`, `taken` - each `null` when the file does not say |
 | `place` | `latitude` and `longitude` in decimal degrees, or `null` |

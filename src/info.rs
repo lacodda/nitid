@@ -109,6 +109,12 @@ struct Report {
     mark: Mark,
     /// `None` for an untagged file.
     colour: Option<Described>,
+    /// The code points a HEIC states its colour by instead of a profile.
+    ///
+    /// Its decoder reads them and hands over sRGB, so there is no profile to
+    /// describe — but the file did say something, and "says nothing" would be
+    /// wrong about it.
+    codes: Option<crate::isobmff::Cicp>,
     caveat: Option<String>,
     metadata: Metadata,
 }
@@ -132,6 +138,10 @@ fn read(path: &Path) -> Result<Report> {
         frames: loaded.animation.as_ref().map_or(1, |animation| animation.frames.len()),
         mark: loaded.mark,
         colour: loaded.profile.as_ref().map(crate::color::describe),
+        codes: match (loaded.format, &loaded.profile) {
+            (Format::Heic, None) => crate::isobmff::colour_box(&bytes).and_then(|colour| colour.cicp),
+            _ => None,
+        },
         caveat: loaded.caveat,
         metadata: loaded.metadata,
     })
@@ -170,10 +180,25 @@ impl Report {
 
         out.push_str("\n  Colour\n");
         let mut row = |label: &str, value: &str| out.push_str(&format!("  {label:<LABEL$}{value}\n"));
-        match &self.colour {
+        match (&self.colour, self.codes) {
+            (None, Some(codes)) => {
+                row("Profile", "none: the colour is stated as code points");
+                let named = |name: Option<&str>, what: &str| name.map_or_else(|| format!("unnamed {what}"), |name| format!("{name} {what}"));
+                row(
+                    "Codes",
+                    &format!(
+                        "{}/{}/{}: {}, {}",
+                        codes.primaries,
+                        codes.transfer,
+                        codes.matrix,
+                        named(crate::color::primaries_code_name(codes.primaries), "primaries"),
+                        crate::color::transfer_code_name(codes.transfer).map_or_else(|| "unnamed transfer".to_string(), str::to_string),
+                    ),
+                );
+            }
             // ADR 0005: said as what it means, not as an absence.
-            None => row("Profile", "none: the file does not say what its colours mean"),
-            Some(colour) => {
+            (None, None) => row("Profile", "none: the file does not say what its colours mean"),
+            (Some(colour), _) => {
                 row("Profile", colour.name.as_deref().unwrap_or("unnamed"));
                 row("Primaries", colour.primaries.unwrap_or("its own"));
                 if let Some(transfer) = &colour.transfer {
@@ -253,6 +278,17 @@ impl Report {
                     ]),
                 },
             ),
+            (
+                "codes",
+                match self.codes {
+                    None => Value::Null,
+                    Some(codes) => Value::Object(vec![
+                        ("primaries", Value::Count(codes.primaries.into())),
+                        ("transfer", Value::Count(codes.transfer.into())),
+                        ("matrix", Value::Count(codes.matrix.into())),
+                    ]),
+                },
+            ),
             ("caveat", Value::text(self.caveat.clone())),
             (
                 "camera",
@@ -328,6 +364,7 @@ mod tests {
             frames: 1,
             mark: Mark::Reject,
             colour: Some(crate::color::describe(&moxcms::ColorProfile::new_display_p3())),
+            codes: None,
             caveat: None,
             metadata,
         }
@@ -369,6 +406,27 @@ mod tests {
         for absent in ["Orientation", "Camera\n", "Place", "Mark"] {
             assert!(!text.contains(absent), "{absent:?} appeared in:\n{text}");
         }
+    }
+
+    /// A HEIC that states its colour as code points is said to, by name, and
+    /// not called silent.
+    #[test]
+    fn code_points_are_named_rather_than_called_silence() {
+        let mut report = report();
+        report.colour = None;
+        report.codes = Some(crate::isobmff::Cicp {
+            primaries: 12,
+            transfer: 13,
+            matrix: 6,
+        });
+        let text = report.text();
+        assert!(text.contains("  Codes        12/13/6: Display P3 primaries, sRGB curve\n"), "{text}");
+        assert!(!text.contains("does not say"), "{text}");
+        assert!(
+            report.json().render().contains("\"codes\": {\n    \"primaries\": 12,"),
+            "{}",
+            report.json().render()
+        );
     }
 
     /// The JSON carries values, not prose, and `null` for what is not said.

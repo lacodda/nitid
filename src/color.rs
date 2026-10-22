@@ -224,20 +224,14 @@ pub fn describe(profile: &ColorProfile) -> Described {
     // The code points come first where a file states them: an HDR picture's
     // transfer is a formula the curve tags can only approximate, and the code
     // is the file's own word for it.
-    let transfer = match stated {
-        Some(TransferCharacteristics::Smpte2084) => Some("PQ (SMPTE ST 2084)".to_string()),
-        Some(TransferCharacteristics::Hlg) => Some("HLG".to_string()),
-        Some(TransferCharacteristics::Srgb) => Some("sRGB curve".to_string()),
-        Some(TransferCharacteristics::Linear) => Some("linear".to_string()),
-        _ => {
-            let curves: Vec<&ToneReprCurve> = if rgb {
-                [&profile.red_trc, &profile.green_trc, &profile.blue_trc].into_iter().flatten().collect()
-            } else {
-                profile.gray_trc.iter().collect()
-            };
-            transfer_of(&curves)
-        }
-    };
+    let transfer = stated.and_then(|code| transfer_code_name(code as u16)).map(str::to_string).or_else(|| {
+        let curves: Vec<&ToneReprCurve> = if rgb {
+            [&profile.red_trc, &profile.green_trc, &profile.blue_trc].into_iter().flatten().collect()
+        } else {
+            profile.gray_trc.iter().collect()
+        };
+        transfer_of(&curves)
+    });
 
     let primaries = if rgb {
         let known: [(&'static str, ColorProfile); 6] = [
@@ -298,6 +292,33 @@ pub fn describe(profile: &ColorProfile) -> Described {
             RenderingIntent::AbsoluteColorimetric => "absolute colorimetric",
         },
         hdr,
+    }
+}
+
+/// The name of a CICP colour-primaries code, for the codes pictures use.
+///
+/// `None` for the rest, which are broadcast history, and for 2, which is
+/// "unspecified" — a file declining to say.
+pub fn primaries_code_name(code: u16) -> Option<&'static str> {
+    match code {
+        1 => Some("BT.709"),
+        9 => Some("BT.2020"),
+        11 => Some("DCI-P3"),
+        12 => Some("Display P3"),
+        _ => None,
+    }
+}
+
+/// The name of a CICP transfer code, on the same terms.
+pub fn transfer_code_name(code: u16) -> Option<&'static str> {
+    match code {
+        // The four codes the standard itself calls functionally the same.
+        1 | 6 | 14 | 15 => Some("BT.709 curve"),
+        8 => Some("linear"),
+        13 => Some("sRGB curve"),
+        16 => Some("PQ (SMPTE ST 2084)"),
+        18 => Some("HLG"),
+        _ => None,
     }
 }
 
