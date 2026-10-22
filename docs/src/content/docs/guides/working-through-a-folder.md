@@ -109,8 +109,12 @@ itself to keep the two from drifting apart. So a wide-gamut photograph can go
 out with its colour **baked into sRGB** — the numbers say what you were
 looking at, which is what a chat window or a forum will show, since neither
 reads a profile. Left unbaked, the file keeps its own numbers and its profile
-travels with them; that is the default for an ordinary picture, because it is
-the choice that can be undone.
+is written into it with them; that is the default for an ordinary picture,
+because it is the choice that can be undone. The rare profile that cannot be
+written back out is baked instead, and the box says so first. The picture also
+comes out the way up it is on screen, turns included: the new file carries no
+orientation tag of its own, so a photograph taken sideways is turned upright
+in the pixels.
 
 The box says what a save will cost before it writes anything. JPEG has no
 transparency, so a picture with any will be filled with white. Eight bits per

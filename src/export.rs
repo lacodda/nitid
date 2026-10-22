@@ -24,7 +24,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 
 use crate::color::ColorTransform;
-use crate::image_source::{DecodedImage, Depth};
+use crate::image_source::{DecodedImage, Depth, Orientation};
 
 /// A format a picture can be written as.
 ///
@@ -119,6 +119,18 @@ pub struct Request<'a> {
     /// off is something a person can live with until they notice, and the same
     /// colour baked into a file sent to somebody else is not.
     pub caveat: Option<&'a str>,
+    /// How the stored pixels are turned to be shown.
+    ///
+    /// The file is written the way up it is shown, with no tag to say so: the
+    /// new file carries no orientation of its own, so a photograph taken
+    /// sideways and written as stored would stay sideways in every program
+    /// that opened it.
+    pub orientation: Orientation,
+    /// The camera's account to carry into the new file, as an EXIF block
+    /// (the TIFF structure, without a container's framing), with its
+    /// orientation already upright. `None` writes none, which is what a save
+    /// does: ADR 0028.
+    pub exif: Option<&'a [u8]>,
 }
 
 /// What the picture will lose on the way out, in the words the interface says
@@ -138,6 +150,10 @@ pub fn warnings(request: &Request<'_>) -> Vec<String> {
     // says the same thing at more length.
     if let Some(caveat) = request.caveat {
         said.push(format!("{caveat} See the colour passport (K)."));
+    }
+
+    if request.colour == Colour::KeepProfile && !is_hdr(request.profile) && request.profile.is_some_and(|profile| profile.encode().is_err()) {
+        said.push("the file's colour profile cannot be written into another file: the colour is converted to sRGB".to_string());
     }
 
     if !request.target.keeps_alpha() && has_transparency(request.image) {
@@ -186,29 +202,47 @@ pub fn encode(request: &Request<'_>) -> Result<Vec<u8>> {
         bail!("there is no picture to save");
     }
 
-    let pixels = to_eight_bit(request);
-    let width = request.image.width;
-    let height = request.image.height;
+    let (pixels, profile) = written_colour(request);
+    let upright = upright(
+        DecodedImage {
+            width: request.image.width,
+            height: request.image.height,
+            pixels,
+            depth: Depth::Eight,
+        },
+        request.orientation,
+    )?;
+    let (width, height) = (upright.width, upright.height);
+    let profile = profile.unwrap_or_default();
+    let exif = request.exif.map(<[u8]>::to_vec).unwrap_or_default();
 
+    // An empty profile or EXIF block is what each encoder takes as "write
+    // none", so the untagged and the clean cases need no branch of their own.
     let mut out = Vec::new();
     match request.target {
         Target::Jpeg => {
             // JPEG carries no alpha, so the picture is composited onto white
             // first — the warning above says so before this runs.
-            let opaque = over_white(&pixels);
+            let opaque = over_white(&upright.pixels);
             let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(Cursor::new(&mut out), request.quality.clamp(1, 100));
+            image::ImageEncoder::set_icc_profile(&mut encoder, profile).context("a JPEG refused the colour profile")?;
+            image::ImageEncoder::set_exif_metadata(&mut encoder, exif).context("a JPEG refused the EXIF block")?;
             encoder
                 .encode(&opaque, width, height, image::ExtendedColorType::Rgb8)
                 .context("encoding a JPEG")?;
         }
         Target::Png => {
-            let encoder = image::codecs::png::PngEncoder::new(Cursor::new(&mut out));
-            image::ImageEncoder::write_image(encoder, &pixels, width, height, image::ExtendedColorType::Rgba8).context("encoding a PNG")?;
+            let mut encoder = image::codecs::png::PngEncoder::new(Cursor::new(&mut out));
+            image::ImageEncoder::set_icc_profile(&mut encoder, profile).context("a PNG refused the colour profile")?;
+            image::ImageEncoder::set_exif_metadata(&mut encoder, exif).context("a PNG refused the EXIF block")?;
+            image::ImageEncoder::write_image(encoder, &upright.pixels, width, height, image::ExtendedColorType::Rgba8).context("encoding a PNG")?;
         }
         Target::WebP => {
-            let encoder = image_webp::WebPEncoder::new(Cursor::new(&mut out));
+            let mut encoder = image_webp::WebPEncoder::new(Cursor::new(&mut out));
+            encoder.set_icc_profile(profile);
+            encoder.set_exif_metadata(exif);
             encoder
-                .encode(&pixels, width, height, image_webp::ColorType::Rgba8)
+                .encode(&upright.pixels, width, height, image_webp::ColorType::Rgba8)
                 .context("encoding a WebP")?;
         }
     }
@@ -227,7 +261,7 @@ pub fn encode(request: &Request<'_>) -> Result<Vec<u8>> {
 ///
 /// The result is upright: the orientation has been applied by the reading, so
 /// the file that is written needs no tag to look right.
-pub fn cut(image: &DecodedImage, orientation: crate::image_source::Orientation, rect: (u32, u32, u32, u32)) -> Result<DecodedImage> {
+pub fn cut(image: &DecodedImage, orientation: Orientation, rect: (u32, u32, u32, u32)) -> Result<DecodedImage> {
     let (x, y, width, height) = rect;
     if width == 0 || height == 0 {
         bail!("there is nothing to crop to");
@@ -377,15 +411,52 @@ fn copy_of<'a>(request: &Request<'a>) -> Request<'a> {
         colour: request.colour,
         quality: request.quality,
         caveat: request.caveat,
+        orientation: request.orientation,
+        exif: request.exif,
     }
 }
 
-/// Eight-bit RGBA, with the colour taken wherever the request asks for it.
-fn to_eight_bit(request: &Request<'_>) -> Vec<u8> {
-    match request.colour {
-        Colour::KeepProfile => narrow(request.image),
-        Colour::BakeToSrgb => to_srgb(request.image, request.profile),
+/// Eight-bit RGBA, with the colour taken wherever the request asks for it,
+/// and the profile that says what the numbers mean — `None` for sRGB, which
+/// a file says by saying nothing.
+///
+/// Keeping the profile means writing it: numbers in Display P3 written
+/// without the profile that names them claim to be sRGB, and every reader is
+/// then wrong in the same direction. Two cases cannot be kept and are baked
+/// instead, so the colour arrives right rather than as the file's numbers
+/// under the wrong name:
+///
+/// - an HDR picture, whose numbers are a PQ signal an eight-bit standard-range
+///   file has no way to carry as itself — converted the way the screen shows
+///   it, which is what the box's warning already says (ADR 0025);
+/// - a profile this build cannot write back out, which `warnings` names.
+fn written_colour(request: &Request<'_>) -> (Vec<u8>, Option<Vec<u8>>) {
+    let baked = || (to_srgb(request.image, request.profile), None);
+    match (request.colour, request.profile) {
+        (Colour::BakeToSrgb, _) => baked(),
+        // Untagged stays untagged: it stated nothing, and nothing is added
+        // (ADR 0005).
+        (Colour::KeepProfile, None) => (narrow(request.image), None),
+        (Colour::KeepProfile, Some(profile)) if is_hdr(Some(profile)) => baked(),
+        (Colour::KeepProfile, Some(profile)) => match profile.encode() {
+            Ok(bytes) => (narrow(request.image), Some(bytes)),
+            Err(_) => baked(),
+        },
     }
+}
+
+/// The picture turned the way it is shown.
+///
+/// Eight bits in and out: it runs after the colour, on the copy that is
+/// about to be encoded, so a sixteen-bit source is converted once from its
+/// full precision and only the narrow copy is turned.
+fn upright(image: DecodedImage, orientation: Orientation) -> Result<DecodedImage> {
+    if orientation == Orientation::Normal {
+        // Upright already; the turn would be a copy of every pixel.
+        return Ok(image);
+    }
+    let size = crate::eyedropper::shown_size(&image, orientation);
+    cut(&image, orientation, (0, 0, size.0, size.1))
 }
 
 /// The picture in sRGB at eight bits a channel, converted at the depth it was
@@ -410,20 +481,9 @@ pub fn baked(image: &DecodedImage, profile: Option<&moxcms::ColorProfile>) -> De
 /// first, so an HDR or sixteen-bit picture is mapped once from its full
 /// precision; made smaller next, which is cheap on eight bits; turned last,
 /// on the small copy.
-pub fn upright_srgb(
-    image: &DecodedImage,
-    profile: Option<&moxcms::ColorProfile>,
-    orientation: crate::image_source::Orientation,
-    longest: u32,
-) -> Result<DecodedImage> {
+pub fn upright_srgb(image: &DecodedImage, profile: Option<&moxcms::ColorProfile>, orientation: Orientation, longest: u32) -> Result<DecodedImage> {
     let srgb = baked(image, profile);
-    let small = shrink(&srgb, longest);
-    if orientation == crate::image_source::Orientation::Normal {
-        // Upright already; the turn would be a copy of every pixel.
-        return Ok(small);
-    }
-    let size = crate::eyedropper::shown_size(&small, orientation);
-    cut(&small, orientation, (0, 0, size.0, size.1))
+    upright(shrink(&srgb, longest), orientation)
 }
 
 /// Sixteen-bit samples down to eight, unchanged otherwise.
@@ -552,6 +612,8 @@ mod tests {
             colour: Colour::KeepProfile,
             quality: 90,
             caveat: None,
+            orientation: Orientation::Normal,
+            exif: None,
         }
     }
 
@@ -732,6 +794,8 @@ mod tests {
             colour: Colour::BakeToSrgb,
             quality: 90,
             caveat: None,
+            orientation: Orientation::Normal,
+            exif: None,
         };
 
         assert!(is_hdr(Some(&profile)), "a PQ profile was not recognised as HDR");
@@ -859,6 +923,8 @@ mod tests {
             colour: Colour::KeepProfile,
             quality: 90,
             caveat: None,
+            orientation: Orientation::Normal,
+            exif: None,
         };
 
         let budget = 6000;
@@ -900,6 +966,8 @@ mod tests {
             colour: Colour::KeepProfile,
             quality: 90,
             caveat: None,
+            orientation: Orientation::Normal,
+            exif: None,
         };
         assert_eq!(within_budget(&request, 200).expect("searching"), None, "a 200-byte budget was somehow met");
     }
@@ -927,5 +995,245 @@ mod tests {
             shader.contains("rgb = colour.matrix * linear;"),
             "the shader no longer converts between primaries by the matrix; the export still does"
         );
+    }
+
+    /// A PQ profile, the way an HDR file states its colour.
+    fn pq_profile() -> moxcms::ColorProfile {
+        let cicp = moxcms::CicpProfile {
+            color_primaries: 9u8.try_into().unwrap(),
+            transfer_characteristics: 16u8.try_into().unwrap(),
+            matrix_coefficients: 9u8.try_into().unwrap(),
+            full_range: true,
+        };
+        let mut profile = moxcms::ColorProfile::new_srgb();
+        profile.update_rgb_colorimetry_from_cicp(cicp);
+        profile
+    }
+
+    /// What a written file says its colour is, read by the viewer's own
+    /// front door.
+    fn profile_read_back(bytes: &[u8]) -> Option<moxcms::ColorProfile> {
+        crate::image_source::decode_here(bytes).expect("the written file does not open again").profile
+    }
+
+    /// Keeping the profile means the profile is in the file.
+    ///
+    /// Until v0.40 it was not: the box said "keep profile", the numbers were
+    /// the file's own, and nothing said what they meant — so a Display P3
+    /// photograph saved that way arrived in every other program as sRGB,
+    /// washed out, which is the one thing the export exists to prevent. The
+    /// profile that comes back has to convert exactly as the one that went in.
+    #[test]
+    fn a_kept_profile_is_written_into_every_target() {
+        let p3 = moxcms::ColorProfile::new_display_p3();
+        let srgb = moxcms::ColorProfile::new_srgb();
+        let expected = ColorTransform::for_image(Some(&p3), &srgb);
+        let image = picture(4, 4, [200, 120, 40, 255]);
+
+        for target in Target::ALL {
+            let bytes = encode(&Request {
+                profile: Some(&p3),
+                ..request(&image, *target)
+            })
+            .unwrap_or_else(|error| panic!("{}: {error:#}", target.label()));
+
+            let back = profile_read_back(&bytes).unwrap_or_else(|| panic!("{} was written without the profile it was asked to keep", target.label()));
+            let transform = ColorTransform::for_image(Some(&back), &srgb);
+            for (row, wanted) in transform.matrix.iter().zip(&expected.matrix) {
+                for (value, wanted) in row.iter().zip(wanted) {
+                    assert!(
+                        (value - wanted).abs() < 1e-3,
+                        "{}: the profile came back converting differently: {:?} against {:?}",
+                        target.label(),
+                        transform.matrix,
+                        expected.matrix
+                    );
+                }
+            }
+        }
+    }
+
+    /// An untagged picture states nothing, and nothing is added to it; a baked
+    /// one is sRGB, which a file says by saying nothing.
+    #[test]
+    fn only_a_kept_profile_is_written() {
+        let p3 = moxcms::ColorProfile::new_display_p3();
+        let image = picture(4, 4, [200, 120, 40, 255]);
+        for target in Target::ALL {
+            let untagged = encode(&request(&image, *target)).expect("encoding an untagged picture");
+            assert!(
+                profile_read_back(&untagged).is_none(),
+                "{}: an untagged picture came out tagged",
+                target.label()
+            );
+
+            let baked = encode(&Request {
+                profile: Some(&p3),
+                colour: Colour::BakeToSrgb,
+                ..request(&image, *target)
+            })
+            .expect("encoding a baked picture");
+            assert!(
+                profile_read_back(&baked).is_none(),
+                "{}: a picture baked to sRGB still names P3",
+                target.label()
+            );
+        }
+    }
+
+    /// An HDR picture cannot be kept as itself in an eight-bit file, so it is
+    /// written the way the screen shows it — what the box's warning says —
+    /// rather than as a PQ signal under no name, which reads as a flat, dark
+    /// picture everywhere.
+    #[test]
+    fn an_hdr_picture_kept_is_written_as_the_screen_shows_it() {
+        let pq = pq_profile();
+        let image = picture(2, 2, [148, 148, 148, 255]);
+        let kept = encode(&Request {
+            profile: Some(&pq),
+            ..request(&image, Target::Png)
+        })
+        .expect("encoding a kept HDR picture");
+        let baked = encode(&Request {
+            profile: Some(&pq),
+            colour: Colour::BakeToSrgb,
+            ..request(&image, Target::Png)
+        })
+        .expect("encoding a baked HDR picture");
+
+        assert_eq!(
+            crate::image_source::decode_here(&kept).unwrap().image.pixels,
+            crate::image_source::decode_here(&baked).unwrap().image.pixels,
+            "keeping an HDR picture wrote its PQ numbers rather than what the screen shows"
+        );
+        assert!(profile_read_back(&kept).is_none(), "an HDR picture written as SDR still carries its PQ profile");
+    }
+
+    /// A profile this build cannot write back out is not dropped quietly: the
+    /// colour is baked instead, so it arrives right, and the box says so
+    /// before the file is written.
+    ///
+    /// A parametric curve of two numbers is one the ICC format has no type
+    /// for, which is what makes the writer refuse it.
+    #[test]
+    fn a_profile_that_cannot_be_written_is_baked_and_said() {
+        let mut odd = moxcms::ColorProfile::new_display_p3();
+        odd.red_trc = Some(moxcms::ToneReprCurve::Parametric(vec![2.2, 1.0]));
+        assert!(odd.encode().is_err(), "the writer takes this profile now; the test needs one it refuses");
+
+        let image = picture(2, 2, [200, 120, 40, 255]);
+        let kept = Request {
+            profile: Some(&odd),
+            ..request(&image, Target::Png)
+        };
+        assert!(
+            warnings(&kept).iter().any(|line| line.contains("cannot be written")),
+            "a profile that will not be written went unmentioned: {:?}",
+            warnings(&kept)
+        );
+
+        let bytes = encode(&kept).expect("encoding with an unwritable profile");
+        let back = crate::image_source::decode_here(&bytes).expect("reading it back");
+        assert!(back.profile.is_none(), "a profile was written after all");
+        assert_eq!(
+            back.image.pixels,
+            to_srgb(&image, Some(&odd)),
+            "the colour was not baked in place of the profile"
+        );
+    }
+
+    /// The picture is written the way up it is shown.
+    ///
+    /// Until v0.40 it was written as stored: a phone photograph taken sideways
+    /// carries a tag that turns it, the new file carries no tag, and the save
+    /// came out on its side. Each of the eight orientations is checked by
+    /// where one marked corner lands, against the eyedropper — the one place
+    /// the viewer maps a shown pixel to a stored one.
+    #[test]
+    fn a_picture_is_written_the_way_up_it_is_shown() {
+        let mut image = picture(3, 2, [0, 0, 0, 255]);
+        for (index, pixel) in image.pixels.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            pixel[0] = (index * 40) as u8;
+        }
+
+        for orientation in [
+            Orientation::Normal,
+            Orientation::FlipHorizontal,
+            Orientation::Rotate180,
+            Orientation::FlipVertical,
+            Orientation::Transpose,
+            Orientation::Rotate90,
+            Orientation::Transverse,
+            Orientation::Rotate270,
+        ] {
+            let bytes = encode(&Request {
+                orientation,
+                ..request(&image, Target::Png)
+            })
+            .expect("encoding a turned picture");
+            let back = crate::image_source::decode_here(&bytes).expect("reading it back");
+
+            let shown = crate::eyedropper::shown_size(&image, orientation);
+            assert_eq!(
+                (back.image.width, back.image.height),
+                shown,
+                "{orientation:?}: the size is the stored one, not the shown one"
+            );
+            assert_eq!(back.orientation, Orientation::Normal, "{orientation:?}: the file carries a turn of its own");
+            for y in 0..shown.1 {
+                for x in 0..shown.0 {
+                    let (raw, _) = crate::eyedropper::sample(&image, orientation, shown, (x, y)).expect("inside the picture");
+                    let written = back.image.pixels[((y * shown.0 + x) * 4) as usize];
+                    assert_eq!(u16::from(written), raw[0], "{orientation:?}: the pixel shown at {x},{y} was not written there");
+                }
+            }
+        }
+    }
+
+    /// An EXIF block of one field, `Make`, the way a camera writes one.
+    fn exif_naming(make: &str) -> Vec<u8> {
+        let mut value = make.as_bytes().to_vec();
+        value.push(0);
+        let mut tiff = b"II*\0".to_vec();
+        tiff.extend_from_slice(&8u32.to_le_bytes());
+        tiff.extend_from_slice(&1u16.to_le_bytes());
+        tiff.extend_from_slice(&0x010Fu16.to_le_bytes());
+        tiff.extend_from_slice(&2u16.to_le_bytes());
+        tiff.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        // The value follows the directory: header, count, one entry, and the
+        // four bytes that say there is no next directory.
+        tiff.extend_from_slice(&(8u32 + 2 + 12 + 4).to_le_bytes());
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+        tiff.extend_from_slice(&value);
+        tiff
+    }
+
+    /// The camera's account is carried into each target when it is given,
+    /// where the viewer's own reader finds it — and left out when it is not.
+    #[test]
+    fn exif_is_carried_only_when_given() {
+        let exif = exif_naming("Synthetic Camera");
+        let image = picture(4, 4, [10, 20, 30, 255]);
+        for target in Target::ALL {
+            let carried = encode(&Request {
+                exif: Some(&exif),
+                ..request(&image, *target)
+            })
+            .expect("encoding with EXIF");
+            assert_eq!(
+                crate::metadata::read(&carried).shot.camera.as_deref(),
+                Some("Synthetic Camera"),
+                "{}: the EXIF block did not reach the file",
+                target.label()
+            );
+
+            let clean = encode(&request(&image, *target)).expect("encoding without EXIF");
+            assert_eq!(
+                crate::metadata::read(&clean).shot.camera,
+                None,
+                "{}: EXIF appeared from nowhere",
+                target.label()
+            );
+        }
     }
 }

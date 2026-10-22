@@ -107,6 +107,8 @@ pub mod testing {
             },
             quality,
             caveat: loaded.caveat.as_deref(),
+            orientation: loaded.orientation,
+            exif: None,
         })
     }
 

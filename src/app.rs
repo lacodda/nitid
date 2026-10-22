@@ -2470,6 +2470,7 @@ impl App {
         let Some(shown) = self.shown.as_ref() else {
             return;
         };
+        let orientation = shown.orientation.then(shown.turn);
 
         let image = if shown.pasted {
             self.pasted.clone()
@@ -2502,6 +2503,10 @@ impl App {
             // Nothing reads a warning on a copy: it goes straight onto the
             // clipboard with no box to say it in. The passport still does.
             caveat: None,
+            // The way up it is on screen: whoever receives it has no tag to
+            // turn it by.
+            orientation,
+            exif: None,
         };
 
         let budget = sending.budget_kb as usize * 1024;
@@ -2855,6 +2860,9 @@ impl App {
             colour: crate::export::Colour::KeepProfile,
             quality: 100,
             caveat: None,
+            // The cut is upright already.
+            orientation: Orientation::Normal,
+            exif: None,
         };
         crate::export::save(&request, destination)?;
         self.adopt(destination);
@@ -4020,6 +4028,7 @@ impl App {
         let Some(shown) = self.shown.as_ref() else {
             return;
         };
+        let orientation = shown.orientation.then(shown.turn);
 
         let image = if shown.pasted {
             self.pasted.clone()
@@ -4047,6 +4056,8 @@ impl App {
             },
             quality,
             caveat: caveat.as_deref(),
+            orientation,
+            exif: None,
         });
         self.interface.set_save_losses(losses);
     }
@@ -4093,6 +4104,7 @@ impl App {
         };
         let pasted = shown.pasted;
         let beside = shown.path.clone();
+        let orientation = shown.orientation.then(shown.turn);
 
         let image = if pasted {
             self.pasted.clone()
@@ -4122,6 +4134,10 @@ impl App {
             },
             quality,
             caveat: caveat.as_deref(),
+            // The way up it is on screen, turns included: the save is the
+            // screen (ADR 0025), and the new file has no tag to turn it by.
+            orientation,
+            exif: None,
         };
 
         // Beside the file it came from, which is where a person looking at

@@ -639,6 +639,8 @@ pub(crate) fn prepare(source: &Path, screens: &[(u32, u32)], fit: Fit) -> Result
         colour: crate::export::Colour::KeepProfile,
         quality: 95,
         caveat: None,
+        orientation: crate::image_source::Orientation::Normal,
+        exif: None,
     })
 }
 
