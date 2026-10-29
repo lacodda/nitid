@@ -166,6 +166,32 @@ impl Folder {
         })
     }
 
+    /// Browse a folder from its first picture.
+    ///
+    /// What "Open in nitid" on a folder asks for, and a folder named on the
+    /// command line or dropped on the window: the place itself rather than a
+    /// file in it, so the walk starts where the order begins — the first
+    /// picture by name, or the newest or the largest when the settings sort
+    /// that way. The listing is followed like any other.
+    ///
+    /// A folder with no picture in it gives an empty listing, which the
+    /// caller tells apart by `current` being `None`: there is nothing to put
+    /// on screen, and that is for the window to say rather than an error.
+    pub fn of_dir(dir: &Path, order: Order, wrap: bool) -> Result<Self> {
+        let dir = absolute(dir)?;
+        let entries = scan(&dir, order)?;
+        Ok(Self {
+            dir: Some(dir),
+            entries,
+            current: 0,
+            wrap,
+            order,
+            pattern: None,
+            marked: None,
+            shown: None,
+        })
+    }
+
     /// Browse an explicit selection rather than a folder.
     ///
     /// Selecting five files in the shell and pressing Enter should give one
@@ -909,6 +935,51 @@ mod tests {
         assert_eq!(folder.position(), 0);
         assert_eq!(name_of(folder.current()), "a.JPG");
         assert_eq!(folder.watched(), Some(dir.path()), "a folder that was read is followed");
+    }
+
+    /// A folder opened as a place starts at the beginning of its order, not
+    /// at whatever the filesystem listed first — and walks its own pictures,
+    /// not its parent's.
+    #[test]
+    fn a_folder_opens_on_its_first_picture() {
+        let parent = tempfile::tempdir().expect("a temporary folder");
+        std::fs::write(parent.path().join("beside.png"), b"placeholder").expect("writing a temporary file");
+        let dir = parent.path().join("shoot");
+        std::fs::create_dir(&dir).expect("creating a folder");
+        // Written last-first, so a listing that kept the filesystem's order
+        // by accident would not start on a.png.
+        for name in ["c.png", "notes.txt", "b.jpg", "a.png"] {
+            std::fs::write(dir.join(name), b"placeholder").expect("writing a temporary file");
+        }
+
+        let folder = Folder::of_dir(&dir, Order::Name, true).unwrap();
+
+        assert_eq!(names(&folder), ["a.png", "b.jpg", "c.png"]);
+        assert_eq!(name_of(folder.current()), "a.png");
+        assert_eq!(folder.watched(), Some(dir.as_path()), "a folder opened as a place is followed");
+    }
+
+    /// The order setting decides where "first" is: sorted newest-first, a
+    /// folder opens on the picture written last.
+    #[test]
+    fn a_folder_opens_where_the_order_begins() {
+        let dir = tempfile::tempdir().expect("a temporary folder");
+        for (name, bytes) in [("a.png", 100), ("b.png", 300), ("c.png", 200)] {
+            std::fs::write(dir.path().join(name), vec![0u8; bytes]).expect("writing a temporary file");
+        }
+
+        let folder = Folder::of_dir(dir.path(), Order::Size, true).unwrap();
+        assert_eq!(name_of(folder.current()), "b.png", "the largest file did not come first");
+    }
+
+    /// A folder with nothing in it to show is an empty listing, not an error:
+    /// the window says so, and the caller can tell by the cursor.
+    #[test]
+    fn a_folder_without_pictures_has_nothing_current() {
+        let (dir, _) = folder_with(&["notes.txt"]);
+        let folder = Folder::of_dir(dir.path(), Order::Name, true).unwrap();
+        assert!(folder.is_empty());
+        assert_eq!(folder.current(), None);
     }
 
     #[test]

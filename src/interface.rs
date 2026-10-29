@@ -3414,7 +3414,7 @@ fn separator_vertical(ui: &mut egui::Ui) {
 pub const KEYS: &[(&str, &str)] = &[
     ("← →", "previous / next image"),
     ("Home End", "first / last image"),
-    ("Space", "pause a slideshow or an animation, or the next image"),
+    ("Space", "pause a slideshow or an animation, the next image, or the end of a look from Explorer"),
     ("Wheel", "zoom around the cursor, or step through the folder"),
     ("Ctrl+Wheel", "whichever of the two the bare wheel is not"),
     ("Drag", "pan"),

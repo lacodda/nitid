@@ -129,7 +129,7 @@ impl Listener {
     /// `None` when the message was not one of ours, which the caller ignores
     /// rather than treating as fatal: something else on the machine is free to
     /// connect to a pipe, and the window carries on regardless.
-    fn accept(&self) -> Result<Option<Vec<PathBuf>>> {
+    fn accept(&self) -> Result<Option<super::Handover>> {
         // SAFETY: the handle is live for the duration of the call.
         let connected = unsafe { ConnectNamedPipe(self.pipe.0, None) };
         if let Err(error) = connected {
@@ -202,11 +202,11 @@ impl Listener {
     /// Hand every message to `deliver` until the pipe fails.
     ///
     /// Runs on its own thread; `deliver` is what wakes the event loop.
-    pub fn listen(self, deliver: impl Fn(Vec<PathBuf>) + Send + 'static) {
+    pub fn listen(self, deliver: impl Fn(super::Handover) + Send + 'static) {
         std::thread::spawn(move || {
             loop {
                 match self.accept() {
-                    Ok(Some(paths)) => deliver(paths),
+                    Ok(Some(handover)) => deliver(handover),
                     // A message that was not ours: ignored, and the next one
                     // is still served.
                     Ok(None) => {}
@@ -223,7 +223,7 @@ impl Listener {
 ///
 /// Fails when nobody is listening, which the caller treats as "open a window
 /// after all" rather than as an error worth showing.
-pub fn send(name: &str, paths: &[PathBuf], patience: std::time::Duration) -> Result<()> {
+pub fn send(name: &str, paths: &[PathBuf], kind: super::Kind, patience: std::time::Duration) -> Result<()> {
     // The whole hand-over runs on a thread this one gives up on, because
     // every step of it depends on a process this one does not control. A
     // window that has the pipe but has stopped reading — a wedged instance,
@@ -234,7 +234,7 @@ pub fn send(name: &str, paths: &[PathBuf], patience: std::time::Duration) -> Res
     let paths = paths.to_vec();
     let (report, outcome) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let _ = report.send(deliver(&name, &paths, patience));
+        let _ = report.send(deliver(&name, &paths, kind, patience));
     });
 
     match outcome.recv_timeout(patience) {
@@ -245,8 +245,8 @@ pub fn send(name: &str, paths: &[PathBuf], patience: std::time::Duration) -> Res
     }
 }
 
-fn deliver(name: &str, paths: &[PathBuf], patience: std::time::Duration) -> Result<()> {
-    let message = super::encode(paths);
+fn deliver(name: &str, paths: &[PathBuf], kind: super::Kind, patience: std::time::Duration) -> Result<()> {
+    let message = super::encode(paths, kind);
     // Refused before connecting rather than after: a message this large would
     // block the write until a reader drained it, and a window that is wedged
     // would hang this process for ever. Opening a window of our own is the
@@ -414,8 +414,8 @@ pub fn wait_until_listening(name: &str, timeout: std::time::Duration) -> bool {
 #[cfg(test)]
 pub fn collect(listener: Listener) -> std::sync::mpsc::Receiver<Vec<PathBuf>> {
     let (sender, receiver) = std::sync::mpsc::channel();
-    listener.listen(move |paths| {
-        let _ = sender.send(paths);
+    listener.listen(move |handover| {
+        let _ = sender.send(handover.paths);
     });
     receiver
 }
@@ -423,6 +423,7 @@ pub fn collect(listener: Listener) -> std::sync::mpsc::Receiver<Vec<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::single::Kind;
     use std::time::Duration;
 
     /// A pipe name of this test's own, so a run never talks to the viewer the
@@ -442,7 +443,7 @@ mod tests {
         assert!(wait_until_listening(&name, Duration::from_secs(5)), "the listener never came up");
 
         let paths = vec![PathBuf::from(r"C:\pictures\one.jpg"), PathBuf::from(r"C:\pictures\two.png")];
-        send(&name, &paths, Duration::from_secs(5)).expect("sending to a live listener");
+        send(&name, &paths, Kind::Open, Duration::from_secs(5)).expect("sending to a live listener");
 
         let delivered = received.recv_timeout(Duration::from_secs(5)).expect("the listener answered");
         assert_eq!(delivered, paths);
@@ -497,7 +498,7 @@ mod tests {
         let paths: Vec<PathBuf> = (0..200).map(|index| PathBuf::from(format!(r"C:\{long}\{index}.jpg"))).collect();
 
         let started = std::time::Instant::now();
-        let outcome = send(&name, &paths, Duration::from_secs(5));
+        let outcome = send(&name, &paths, Kind::Open, Duration::from_secs(5));
         assert!(outcome.is_err(), "an oversize selection was sent rather than refused");
         assert!(started.elapsed() < Duration::from_secs(1), "refusing took {:?}", started.elapsed());
     }
@@ -506,7 +507,7 @@ mod tests {
     fn sending_to_nobody_fails_rather_than_hanging() {
         let name = unique_name("nobody");
         let started = std::time::Instant::now();
-        let outcome = send(&name, &[PathBuf::from("a.jpg")], Duration::from_secs(5));
+        let outcome = send(&name, &[PathBuf::from("a.jpg")], Kind::Open, Duration::from_secs(5));
         assert!(outcome.is_err(), "sending into a pipe nobody owns appeared to succeed");
         // "Nobody is there" has to be answered at once rather than waited out:
         // that delay would be paid on every ordinary cold start, which is the
@@ -533,7 +534,7 @@ mod tests {
             // No retry loop here on purpose: waiting out a listener that is
             // busy with the previous messenger is `send`'s job, and a test
             // that retried by hand would hide it failing to.
-            send(&name, std::slice::from_ref(&path), Duration::from_secs(5)).unwrap_or_else(|error| panic!("messenger {index}: {error:#}"));
+            send(&name, std::slice::from_ref(&path), Kind::Open, Duration::from_secs(5)).unwrap_or_else(|error| panic!("messenger {index}: {error:#}"));
         }
 
         let mut seen = Vec::new();
@@ -562,7 +563,7 @@ mod tests {
         }
 
         let path = vec![PathBuf::from(r"C:\pictures\real.jpg")];
-        send(&name, &path, Duration::from_secs(5)).expect("the listener is still serving after rubbish");
+        send(&name, &path, Kind::Open, Duration::from_secs(5)).expect("the listener is still serving after rubbish");
 
         let delivered = received.recv_timeout(Duration::from_secs(5)).expect("the real message still arrived");
         assert_eq!(delivered, path);

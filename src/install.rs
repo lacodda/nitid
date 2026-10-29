@@ -53,6 +53,54 @@ const LEGACY_APPLICATION_KEYS: [&str; 1] = [r"Software\Classes\Applications\niti
 /// The registered-applications entry that puts nitid in Settings.
 const CAPABILITIES_KEY: &str = r"Software\lacodda\nitid\Capabilities";
 
+/// The verbs that put "Open with nitid" on a folder's menu: on a folder, and
+/// on the empty space inside an open one, where the folder is the one being
+/// looked at. `%1` is the folder clicked; `%V` is the folder the background
+/// belongs to.
+///
+/// Registry verbs rather than a shell extension: they need no DLL loaded into
+/// Explorer, and an `IExplorerCommand` in one reaches the top of Windows 11's
+/// menu only from a signed package — without one it lands under "Show more
+/// options" exactly where these do.
+const FOLDER_VERBS: [FolderVerb; 2] = [
+    FolderVerb {
+        key: r"Software\Classes\Directory\shell\nitid",
+        argument: "%1",
+        single: true,
+    },
+    FolderVerb {
+        key: r"Software\Classes\Directory\Background\shell\nitid",
+        argument: "%V",
+        single: false,
+    },
+];
+
+/// One entry of a folder's menu.
+struct FolderVerb {
+    key: &'static str,
+    argument: &'static str,
+    /// Offered only when one folder is selected. The viewer walks one folder
+    /// at a time, and five selected would start five launches with the last
+    /// one winning.
+    single: bool,
+}
+
+/// What the menu entry runs.
+fn verb_command(exe: &str, argument: &str) -> String {
+    format!("\"{exe}\" \"{argument}\"")
+}
+
+/// Where Windows reads what to start at sign-in, for this user.
+const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+
+/// The name nitid's entry carries there, and in Settings > Apps > Startup.
+const RUN_VALUE: &str = "nitid";
+
+/// What the sign-in entry runs: the resident, from the installed copy.
+fn resident_command(exe: &str) -> String {
+    format!("\"{exe}\" {}", crate::RESIDENT_ARGUMENT)
+}
+
 /// Where the per-user `PATH` lives.
 ///
 /// The user hive, not the machine one: an install that needs no administrator
@@ -68,6 +116,13 @@ pub fn install() -> Result<PathBuf> {
     let target_dir = install_dir()?;
 
     fs::create_dir_all(&target_dir).with_context(|| format!("creating {}", target_dir.display()))?;
+
+    // A resident already running is running the copy about to be replaced,
+    // and the one that should run afterwards is the new one: stopped first,
+    // started again below.
+    if let Err(error) = crate::resident::stop() {
+        eprintln!("nitid: {error:#}");
+    }
 
     if same_file(source_dir, &target_dir) {
         // Installing from the installed copy: the registry work below still
@@ -91,6 +146,7 @@ pub fn install() -> Result<PathBuf> {
 
     let extensions = supported_extensions();
     println!("Registered {} file types: {}", extensions.len(), extensions.join(", "));
+    println!("Added \"Open with nitid\" to folders");
 
     // Reported, never fatal: a viewer the shell can open pictures with is
     // installed even if its directory could not reach the PATH.
@@ -108,6 +164,14 @@ pub fn install() -> Result<PathBuf> {
         Err(error) => eprintln!("nitid: could not create the desktop shortcut: {error:#}"),
     }
 
+    // The resident is what answers Explorer's space bar; it also starts at
+    // every sign-in from the entry `register` wrote. Not fatal either: the
+    // viewer is installed whether or not the space bar is heard.
+    match crate::resident::start(&target_dir) {
+        Ok(()) => println!("Press Space on a picture in Explorer to look at it; Space again puts it away"),
+        Err(error) => eprintln!("nitid: could not start nitid in the background: {error:#}"),
+    }
+
     println!();
     println!("nitid is now offered in \"Open with\". Windows reserves the choice");
     println!("of default application for you: right-click an image, choose");
@@ -119,6 +183,14 @@ pub fn install() -> Result<PathBuf> {
 
 /// Remove the registration and the installed copy.
 pub fn uninstall() -> Result<()> {
+    // Before anything is taken away: a resident left running would answer the
+    // space bar with a program that is no longer there.
+    match crate::resident::stop() {
+        Ok(true) => println!("Stopped nitid in the background"),
+        Ok(false) => {}
+        Err(error) => eprintln!("nitid: {error:#}"),
+    }
+
     unregister()?;
     println!("Removed the file type registration");
 
@@ -429,7 +501,35 @@ fn register(exe: &Path) -> Result<()> {
         .context("registering the application")?
         .set_string("nitid", CAPABILITIES_KEY)?;
 
+    for verb in &FOLDER_VERBS {
+        let key = CURRENT_USER.create(verb.key).with_context(|| format!("creating {}", verb.key))?;
+        key.set_string("MUIVerb", "Open with nitid")?;
+        key.set_string("Icon", format!("\"{exe}\",0"))?;
+        if verb.single {
+            key.set_string("MultiSelectModel", "Single")?;
+        }
+        CURRENT_USER
+            .create(format!(r"{}\command", verb.key))?
+            .set_string("", verb_command(&exe, verb.argument))?;
+    }
+
+    CURRENT_USER
+        .create(RUN_KEY)
+        .context("opening the sign-in entries")?
+        .set_string(RUN_VALUE, resident_command(&exe))?;
+
+    announce_association_change();
     Ok(())
+}
+
+/// Tell Explorer the registration changed.
+///
+/// Without it a window already open keeps the menu and the icons it read
+/// before; with it they are read again at once. Best effort, like the PATH's
+/// announcement: the registry is right either way.
+fn announce_association_change() {
+    use windows::Win32::UI::Shell::{SHCNE_ASSOCCHANGED, SHCNF_IDLIST, SHChangeNotify};
+    unsafe { SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None) };
 }
 
 /// Undo everything `register` wrote.
@@ -463,6 +563,8 @@ fn unregister() -> Result<()> {
         format!(r"Software\Classes\{PROGID}"),
         APPLICATION_KEY.to_string(),
         r"Software\lacodda\nitid".to_string(),
+        FOLDER_VERBS[0].key.to_string(),
+        FOLDER_VERBS[1].key.to_string(),
     ];
     for tree in trees {
         if CURRENT_USER.open(&tree).is_ok()
@@ -479,10 +581,18 @@ fn unregister() -> Result<()> {
         failures.push(format!("RegisteredApplications: {error}"));
     }
 
+    if let Ok(run) = CURRENT_USER.options().read().write().open(RUN_KEY)
+        && run.get_string(RUN_VALUE).is_ok()
+        && let Err(error) = run.remove_value(RUN_VALUE)
+    {
+        failures.push(format!("the sign-in entry: {error}"));
+    }
+
     if !failures.is_empty() {
         bail!("some registry entries could not be removed:\n  {}", failures.join("\n  "));
     }
 
+    announce_association_change();
     Ok(())
 }
 
@@ -670,6 +780,34 @@ mod tests {
         let updated = path_with(r"C:\Windows;", dir).expect("nothing was added");
         assert_eq!(updated, r"C:\Windows;C:\Programs\nitid");
         assert!(!updated.contains(";;"), "an empty entry crept in: {updated}");
+    }
+
+    /// The menu entries hand the viewer the folder, quoted: a folder named
+    /// with a space is the ordinary case, and an unquoted one would arrive as
+    /// two paths, neither of them the folder.
+    #[test]
+    fn the_folder_menu_hands_over_the_folder_quoted() {
+        let exe = r"C:\Users\a b\AppData\Local\Programs\nitid\nitidw.exe";
+        let [on_folder, inside] = &FOLDER_VERBS;
+        assert_eq!(verb_command(exe, on_folder.argument), format!("\"{exe}\" \"%1\""));
+        // The background of a folder has no item to name; `%V` is the folder
+        // itself, where `%1` would be empty.
+        assert_eq!(verb_command(exe, inside.argument), format!("\"{exe}\" \"%V\""));
+        assert!(on_folder.key.ends_with(r"Directory\shell\nitid"));
+        assert!(inside.key.ends_with(r"Directory\Background\shell\nitid"));
+        assert!(on_folder.single && !inside.single);
+    }
+
+    /// The sign-in entry starts the resident, and only the resident: an
+    /// entry that started the viewer would open a window at every sign-in.
+    #[test]
+    fn the_sign_in_entry_starts_the_resident() {
+        let exe = r"C:\Users\a b\nitidw.exe";
+        assert_eq!(resident_command(exe), format!("\"{exe}\" --resident"));
+        assert!(matches!(
+            crate::parse(["--resident"].into_iter().map(std::ffi::OsString::from)),
+            crate::Command::Resident
+        ));
     }
 
     /// The registration covers exactly what the build can open, so a version

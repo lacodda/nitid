@@ -61,6 +61,10 @@ mod pattern;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod print;
 mod recent;
+// What stays behind once the windows close: Explorer's space bar, and the
+// icon to tell it to go. All of it is Windows shell behaviour.
+#[cfg(windows)]
+mod resident;
 mod rotate;
 mod sandbox;
 mod scrub;
@@ -206,6 +210,22 @@ pub mod testing {
         crate::image_source::supported_extensions()
     }
 
+    /// Whether a resident is running under the instance `id` names, and
+    /// telling it to go: for the test that starts two and expects one.
+    #[cfg(windows)]
+    pub fn resident_running(id: &str) -> bool {
+        // SAFETY: as for `instance_is_listening` below.
+        unsafe { std::env::set_var("NITID_INSTANCE_ID", id) };
+        crate::resident::running()
+    }
+
+    #[cfg(windows)]
+    pub fn stop_resident(id: &str) -> anyhow::Result<bool> {
+        // SAFETY: as for `instance_is_listening` below.
+        unsafe { std::env::set_var("NITID_INSTANCE_ID", id) };
+        crate::resident::stop()
+    }
+
     /// Whether a viewer is listening on the channel `id` names.
     ///
     /// The single-instance tests have to wait for the first viewer to be
@@ -233,6 +253,14 @@ enum Command {
     /// selecting five files and pressing Enter starts five processes, whose
     /// paths are gathered into one window. See `single`.
     View(Vec<PathBuf>),
+    /// Show the images named as a look from Explorer's space bar, which the
+    /// space bar ends. Not typed: the resident starts a window this way when
+    /// none is open (see `resident`).
+    Peek(Vec<PathBuf>),
+    /// Be the resident: stay behind, answer Explorer's space bar, keep an
+    /// icon in the notification area. Not typed either: the sign-in entry
+    /// `nitid install` writes starts it.
+    Resident,
     Install,
     Uninstall,
     Help,
@@ -272,7 +300,14 @@ pub fn run(windowed: bool) -> ExitCode {
     // `wallpaper next` is the exception that proves it: the scheduled task
     // runs the windowed binary precisely so that no console window flashes up
     // on the desktop every half hour, and it prints nothing when it succeeds.
-    if windowed && !matches!(command, Command::View(_) | Command::Decode | Command::Wallpaper(wallpaper::Asked::Next)) {
+    // The resident and a look from Explorer are the windowed binary's by the
+    // same right: nothing they do is printed, and a console would flash.
+    if windowed
+        && !matches!(
+            command,
+            Command::View(_) | Command::Peek(_) | Command::Resident | Command::Decode | Command::Wallpaper(wallpaper::Asked::Next)
+        )
+    {
         return delegate_to_console_binary();
     }
 
@@ -283,8 +318,18 @@ pub fn run(windowed: bool) -> ExitCode {
             if !windowed {
                 console::hide_if_ours();
             }
-            view(paths)
+            view(paths, false)
         }
+        Command::Peek(paths) => {
+            if !windowed {
+                console::hide_if_ours();
+            }
+            view(paths, true)
+        }
+        #[cfg(windows)]
+        Command::Resident => resident::run(),
+        #[cfg(not(windows))]
+        Command::Resident => Err(anyhow::anyhow!("the resident is a Windows-only part of nitid")),
         Command::Help => {
             println!("{}", usage());
             Ok(())
@@ -327,7 +372,10 @@ pub fn run(windowed: bool) -> ExitCode {
 /// Every way of failing to hand over ends in opening a window here: no window
 /// to talk to, a pipe that cannot be created, a message that will not send.
 /// Failing to share is never a reason to refuse to show a picture.
-fn view(paths: Vec<PathBuf>) -> anyhow::Result<()> {
+///
+/// `peek` is a look from Explorer's space bar, carried to whichever window
+/// shows it (see `resident`).
+fn view(paths: Vec<PathBuf>, peek: bool) -> anyhow::Result<()> {
     #[cfg(windows)]
     if single::enabled() {
         // Relative paths mean different things in different processes: the
@@ -339,10 +387,11 @@ fn view(paths: Vec<PathBuf>) -> anyhow::Result<()> {
         match single::channel::claim(&name) {
             // Nobody else is up: this process is the window. It keeps the
             // listener and hands it to the event loop.
-            Ok(Some(listener)) => return app::run_owning(paths, listener),
+            Ok(Some(listener)) => return app::run_owning(paths, peek, listener),
             // Somebody is. Hand over and go.
             Ok(None) => {
-                if !paths.is_empty() && single::channel::send(&name, &paths, single::HANDOVER_PATIENCE).is_ok() {
+                let kind = if peek { single::Kind::Peek } else { single::Kind::Open };
+                if !paths.is_empty() && single::channel::send(&name, &paths, kind, single::HANDOVER_PATIENCE).is_ok() {
                     return Ok(());
                 }
                 // Either there was nothing to hand over — a bare launch, which
@@ -355,7 +404,7 @@ fn view(paths: Vec<PathBuf>) -> anyhow::Result<()> {
         }
     }
 
-    app::run(paths)
+    app::run(paths, peek)
 }
 
 /// Re-run this command as `nitid.exe`, which has a console.
@@ -375,6 +424,14 @@ fn delegate_to_console_binary() -> ExitCode {
         _ => ExitCode::FAILURE,
     }
 }
+
+/// How the resident is started: by the sign-in entry and by `nitid install`.
+/// Dashed like the decoder's, so a file of that name is never taken for it.
+const RESIDENT_ARGUMENT: &str = "--resident";
+
+/// How the resident starts a window for a look from Explorer when none is
+/// open. The paths follow it.
+const PEEK_ARGUMENT: &str = "--peek";
 
 fn parse(args: impl Iterator<Item = OsString>) -> Command {
     let mut args = args.peekable();
@@ -407,6 +464,8 @@ fn parse(args: impl Iterator<Item = OsString>) -> Command {
         // Leading dashes, so it cannot be mistaken for a file: every other
         // unrecognised argument is treated as a path.
         Some(sandbox::DECODE_ARGUMENT) => Command::Decode,
+        Some(RESIDENT_ARGUMENT) => Command::Resident,
+        Some(PEEK_ARGUMENT) => Command::Peek(args.map(PathBuf::from).collect()),
         // Anything else is a path — including one that looks like a flag,
         // since a file may legitimately be named `--version`. Every remaining
         // argument is a path too: a command line naming several files opens
@@ -432,9 +491,10 @@ Usage:
 
 Arguments:
   FILE...       images to open. One file browses its folder; several browse
-                themselves. A viewer already open takes them rather than a
-                second window starting. With none, the folders opened lately
-                are shown, each at the picture last looked at there
+                themselves; a folder browses its pictures from the first. A
+                viewer already open takes them rather than a second window
+                starting. With none, the folders opened lately are shown,
+                each at the picture last looked at there
 
 Commands:
   install       copy nitid to %LOCALAPPDATA%\\Programs and register its file
@@ -464,7 +524,8 @@ Options:
 Keys:
   Left/Right    previous / next image in the folder
   Home/End      first / last image
-  Space         pause / resume an animation; next image on a still
+  Space         pause / resume an animation; next image on a still; in a
+                look from Explorer, put it away
   Wheel         zoom around the cursor
   Drag          pan
   Middle click  toggle fit and 100%
@@ -520,6 +581,20 @@ mod tests {
         assert!(matches!(parse_args(&["convert", "*.heic"]), Command::Mistake(_)));
         assert!(matches!(parse_args(&["--help"]), Command::Help));
         assert!(matches!(parse_args(&["-V"]), Command::Version));
+    }
+
+    /// The resident's own arguments are recognised, and a look carries its
+    /// paths like an open does.
+    #[test]
+    fn the_residents_arguments_are_recognised() {
+        assert!(matches!(parse_args(&[RESIDENT_ARGUMENT]), Command::Resident));
+        let Command::Peek(paths) = parse_args(&[PEEK_ARGUMENT, "one.jpg", "two.png"]) else {
+            panic!("a look should open the viewer");
+        };
+        assert_eq!(paths, vec![PathBuf::from("one.jpg"), PathBuf::from("two.png")]);
+        // Bare words of the same name are files, as every other bare word is.
+        assert!(matches!(parse_args(&["resident"]), Command::View(paths) if paths.len() == 1));
+        assert!(matches!(parse_args(&["peek"]), Command::View(paths) if paths.len() == 1));
     }
 
     /// The decoder argument is spelled with dashes precisely so a file cannot

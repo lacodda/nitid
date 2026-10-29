@@ -150,5 +150,14 @@ A picture left alone because its new name was taken is not a failure.
 ## Installing, and the desktop's picture
 
 `nitid install` and `nitid uninstall` are described in
-[Getting Started](/nitid/getting-started/); `nitid wallpaper` in
+[Getting Started](/nitid/getting-started/), and what they put in Explorer -
+the space bar and the folder menu - in
+[Working from Explorer](/nitid/guides/working-from-explorer/); `nitid wallpaper` in
 [The desktop's picture](/nitid/guides/the-desktop-picture/).
+
+## Opening a folder
+
+`nitid FOLDER` walks the folder's pictures from the first in the order the
+settings sort by, as *Open with nitid* on it does. A folder with no pictures
+says so and opens the start screen. Handed to a window already open, it
+takes the window over rather than joining what was being walked.

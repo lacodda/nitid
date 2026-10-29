@@ -7,9 +7,12 @@ description: Everything nitid answers to, in one table.
 nitid photo.jpg
 ```
 
-Opening a file opens its folder: the arrow keys walk the images beside it.
-Started with no file, nitid opens on the folders it has been to — see
-[Where you left off](/nitid/guides/where-you-left-off/).
+Opening a file opens its folder: the arrow keys walk the images beside it;
+opening a folder walks its pictures from the first. Started with no file,
+nitid opens on the folders it has been to — see
+[Where you left off](/nitid/guides/where-you-left-off/). In Explorer, `Space`
+on a picture is a look at it - see
+[Working from Explorer](/nitid/guides/working-from-explorer/).
 From a prompt, nitid also describes and converts pictures - see
 [Command line](/nitid/reference/command-line/).
 
@@ -17,7 +20,7 @@ From a prompt, nitid also describes and converts pictures - see
 | --- | --- |
 | `←` `→` | previous / next image in the folder |
 | `Home` `End` | first / last image |
-| `Space` | pause / resume a slideshow or an animation; next image on a still |
+| `Space` | pause / resume a slideshow or an animation; next image on a still; in a look from Explorer, put it away |
 | Wheel | zoom around the cursor, or step through the folder |
 | Ctrl+Wheel | whichever of the two the bare wheel is not |
 | Drag | pan |

@@ -70,8 +70,11 @@ const FOLDER_PATIENCE: Duration = Duration::from_secs(2);
 const FOLDER_RETRY: Duration = Duration::from_millis(400);
 
 /// Run the viewer, optionally opening a file straight away.
-pub fn run(paths: Vec<PathBuf>) -> Result<()> {
-    start(paths, None)
+///
+/// `peek` says the window is a look from Explorer's space bar, which the
+/// space bar sends away again (see `resident`).
+pub fn run(paths: Vec<PathBuf>, peek: bool) -> Result<()> {
+    start(paths, peek, None)
 }
 
 /// The same, for the process that owns the instance pipe.
@@ -80,14 +83,19 @@ pub fn run(paths: Vec<PathBuf>) -> Result<()> {
 /// needs the event loop's proxy to wake the window, and that does not exist
 /// until the loop is built.
 #[cfg(windows)]
-pub fn run_owning(paths: Vec<PathBuf>, listener: crate::single::channel::Listener) -> Result<()> {
-    start(paths, Some(listener))
+pub fn run_owning(paths: Vec<PathBuf>, peek: bool, listener: crate::single::channel::Listener) -> Result<()> {
+    start(paths, peek, Some(listener))
 }
 
 /// `listener` is `None` for a viewer that shares no window — either because
 /// nothing was claimed, or because this is not Windows, where the whole
 /// mechanism lives.
-fn start(paths: Vec<PathBuf>, #[cfg(windows)] listener: Option<crate::single::channel::Listener>, #[cfg(not(windows))] listener: Option<()>) -> Result<()> {
+fn start(
+    paths: Vec<PathBuf>,
+    peek: bool,
+    #[cfg(windows)] listener: Option<crate::single::channel::Listener>,
+    #[cfg(not(windows))] listener: Option<()>,
+) -> Result<()> {
     // A user event carries a finished background decode, a change in the
     // display, or files handed over by another instance, back to this thread.
     let event_loop = EventLoop::<Event>::with_user_event().build().context("creating the event loop")?;
@@ -99,8 +107,8 @@ fn start(paths: Vec<PathBuf>, #[cfg(windows)] listener: Option<crate::single::ch
     #[cfg(windows)]
     if let Some(listener) = listener {
         let proxy = event_loop.create_proxy();
-        listener.listen(move |paths| {
-            let _ = proxy.send_event(Event::Open(paths));
+        listener.listen(move |handover| {
+            let _ = proxy.send_event(Event::Open(handover));
         });
     }
     #[cfg(not(windows))]
@@ -114,6 +122,13 @@ fn start(paths: Vec<PathBuf>, #[cfg(windows)] listener: Option<crate::single::ch
     });
 
     let mut app = App::new(paths, loader, event_loop.create_proxy());
+    // A look from Explorer is a Windows thing, like the hand-over.
+    #[cfg(windows)]
+    if peek {
+        app.peek = Some(Peek::Started);
+    }
+    #[cfg(not(windows))]
+    let _ = peek;
     event_loop.run_app(&mut app).context("running the viewer")?;
 
     app.into_result()
@@ -135,7 +150,7 @@ enum Event {
     Counted(PathBuf, Box<Histogram>),
     /// Another instance handed these files over rather than opening a window.
     #[cfg(windows)]
-    Open(Vec<PathBuf>),
+    Open(crate::single::Handover),
     /// Something changed in a folder being listened to. The folder is named so
     /// that a word from a watch that has since been replaced — another folder
     /// opened in the meantime — is recognised and ignored.
@@ -572,6 +587,24 @@ struct App {
     /// Which setting `hotkey` was last made from — `None` until the first
     /// time — so a change in the settings is acted on once.
     hotkey_for: Option<Option<crate::hotkey::Hotkey>>,
+    /// The window is a look from Explorer's space bar, which the space bar
+    /// ends. `None` for every other window, and for this one once it has been
+    /// handed a file another way.
+    #[cfg(windows)]
+    peek: Option<Peek>,
+}
+
+/// How a look from Explorer ends, which depends on how it began.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Peek {
+    /// The look started this window, so ending it closes the window: nothing
+    /// of it was there before the space bar.
+    Started,
+    /// The look came to a window that was already open, and ending it gives
+    /// the foreground back to the window that asked — the window stays, with
+    /// what it was showing, behind it.
+    Raised { back: isize },
 }
 
 /// One laid-out interface frame, held between the layout and the draw.
@@ -641,6 +674,8 @@ impl App {
             pictured: HashMap::new(),
             hotkey: None,
             hotkey_for: None,
+            #[cfg(windows)]
+            peek: None,
         }
     }
 
@@ -723,6 +758,17 @@ impl App {
     fn open(&mut self, paths: &[PathBuf]) {
         let (folder, path) = match paths {
             [] => return,
+            // A folder is a place to walk, from where its order begins.
+            [dir] if dir.is_dir() => match Folder::of_dir(dir, self.config.behaviour.order, self.config.behaviour.wrap) {
+                Ok(folder) => match folder.current().map(Path::to_path_buf) {
+                    Some(path) => (Some(folder), path),
+                    None => return self.nothing_to_walk(dir, "has no pictures"),
+                },
+                Err(error) => {
+                    eprintln!("nitid: {error:#}");
+                    return self.nothing_to_walk(dir, "cannot be read");
+                }
+            },
             [single] => match Folder::open(single, self.config.behaviour.order, self.config.behaviour.wrap) {
                 Ok(folder) => {
                     let path = folder.current().map_or_else(|| single.clone(), Path::to_path_buf);
@@ -751,6 +797,20 @@ impl App {
         self.show(&path);
     }
 
+    /// A folder was asked for and there is nothing in it to walk.
+    ///
+    /// Said, and nothing else changes: a picture already on screen stays
+    /// there. A window that has nothing on screen yet — started on that
+    /// folder — opens on the folders it has been to rather than on an empty
+    /// canvas, which would look like a picture that failed to load.
+    fn nothing_to_walk(&mut self, dir: &Path, why: &str) {
+        self.interface.toast(format!("{} {why}", folder_name(dir)), Instant::now());
+        if self.shown.is_none() && self.start.is_none() {
+            self.open_start();
+        }
+        self.request_redraw();
+    }
+
     /// Files from another instance, which chose to hand them over rather than
     /// open a second window.
     ///
@@ -762,12 +822,38 @@ impl App {
     /// moves to the first of them, because that is the file that was just
     /// double-clicked.
     #[cfg(windows)]
-    fn handed_over(&mut self, paths: Vec<PathBuf>) {
+    fn handed_over(&mut self, handover: crate::single::Handover) {
         // A messenger is another process and its message is not trusted: only
         // files that exist are opened, so a stray sender cannot make the
         // window jump to an error for a file nobody chose.
-        let paths: Vec<PathBuf> = paths.into_iter().filter(|path| crate::single::openable(path)).collect();
+        let paths: Vec<PathBuf> = handover.paths.into_iter().filter(|path| crate::single::openable(path)).collect();
         if paths.is_empty() {
+            return;
+        }
+
+        self.peek = match handover.kind {
+            // Asked before the window comes forward, while the window that
+            // asked is still the one in front. A window the look started
+            // stays one: looked at again, it is still nothing that was there
+            // before.
+            crate::single::Kind::Peek => Some(match self.peek {
+                Some(Peek::Started) => Peek::Started,
+                _ => Peek::Raised {
+                    back: crate::resident::foreground(),
+                },
+            }),
+            // Opened on purpose — a double-click, "Open with" — the window is
+            // the person's now, and the space bar walks it again.
+            crate::single::Kind::Open => None,
+        };
+
+        // A folder is a place rather than a file to add to the walk: it takes
+        // the window over, the way it would have opened a window of its own.
+        if let [dir] = paths.as_slice()
+            && dir.is_dir()
+        {
+            self.open(&paths);
+            self.raise();
             return;
         }
 
@@ -800,6 +886,17 @@ impl App {
         // focusing alone leaves it in the taskbar.
         window.set_minimized(false);
         window.focus_window();
+    }
+
+    /// End a look from Explorer: close the window it opened, or step back
+    /// behind the window that asked for it.
+    #[cfg(windows)]
+    fn end_peek(&mut self, event_loop: &ActiveEventLoop) {
+        match self.peek.take() {
+            Some(Peek::Started) => event_loop.exit(),
+            Some(Peek::Raised { back }) => crate::resident::give_foreground(back),
+            None => {}
+        }
     }
 
     /// Put the embedded thumbnail on screen while the full decode runs.
@@ -2102,6 +2199,11 @@ impl App {
             // During a show the space bar is the show's pause, which is what
             // a person watching one reaches for.
             Key::Named(NamedKey::Space) if self.slideshow.is_some() => self.pause_slideshow(),
+            // A look from Explorer ends on the key that began it, the way a
+            // glance does: tap, look, tap. A comparison is a mode of its own
+            // and keeps the key, as a show does.
+            #[cfg(windows)]
+            Key::Named(NamedKey::Space) if self.peek.is_some() && self.comparing.is_none() => self.end_peek(event_loop),
             // Up for longer on each picture, down for shorter: the arrows
             // nothing else in the viewer uses, and only during a show.
             Key::Named(NamedKey::ArrowUp) => self.change_interval(true),
@@ -5924,7 +6026,7 @@ impl ApplicationHandler<Event> for App {
             Event::Decoded(decoded) => self.decoded(*decoded),
             Event::Counted(path, histogram) => self.counted(path, *histogram),
             #[cfg(windows)]
-            Event::Open(paths) => self.handed_over(paths),
+            Event::Open(handover) => self.handed_over(handover),
             Event::FolderChanged(dir) => self.folder_changed(&dir),
             Event::Wallpaper(outcome) => self.wallpaper_done(outcome),
             Event::Scheduled(status) => {
