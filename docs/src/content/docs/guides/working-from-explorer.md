@@ -38,7 +38,9 @@ time it takes to decode.
 ## nitid in the background
 
 The space bar is heard by a small part of nitid that keeps running when no
-picture is open. It holds no picture and no graphics device, and it shows
+picture is open. Of the keyboard it notes only whether a key was the space
+bar or a character, and when - nothing typed is kept, and nothing leaves the
+machine. It holds no picture and no graphics device, and it shows
 itself as nitid's mark in the notification area, beside the clock - in the
 overflow (`^`) unless you drag it out. Its menu has **Open nitid**, which is
 the desktop shortcut, and **Quit**.
