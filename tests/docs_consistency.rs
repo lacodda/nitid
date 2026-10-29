@@ -177,3 +177,55 @@ fn the_command_line_page_shows_what_help_says() {
         .collect();
     assert!(undocumented.is_empty(), "--help names these options and the page does not: {undocumented:?}");
 }
+
+/// The command the installer says it is run with, from its own header.
+fn install_command() -> String {
+    let script = page("tools/install.ps1");
+    let mut lines = script.lines();
+    lines
+        .find(|line| line.starts_with("# nitid installer for Windows:"))
+        .and_then(|_| lines.next())
+        .map(|line| line.trim_start_matches('#').trim().to_string())
+        .expect("tools/install.ps1 has no `installer for Windows:` header naming its command")
+}
+
+/// Installing is one command (owner's decision, 2026-10-07): the README and the
+/// getting-started page are where a person copies it from, so both carry
+/// exactly the command the script says it is run with, and neither offers a
+/// second way in that the script knows nothing about.
+#[test]
+fn nitid_is_installed_by_the_script_and_only_by_it() {
+    let command = install_command();
+    assert_eq!(command, "irm https://raw.githubusercontent.com/lacodda/nitid/main/tools/install.ps1 | iex");
+
+    for relative in ["README.md", "docs/src/content/docs/getting-started.md"] {
+        let text = page(relative);
+        assert!(text.contains(&command), "{relative} does not show `{command}`");
+        for other in ["Download the zip", "releases page", ".msi", "cargo install", "winget", "scoop install"] {
+            assert!(!text.contains(other), "{relative} mentions `{other}`, a way to install that the script is not");
+        }
+    }
+}
+
+/// The release is packed with exactly what the script fetches and runs: an
+/// asset renamed in one place is an installer that answers 404, and a zip
+/// without both binaries is one `nitid install` refuses to install.
+#[test]
+fn the_release_carries_what_the_script_downloads() {
+    let workflow = page(".github/workflows/release.yml");
+    assert!(
+        workflow.contains(r#"7z a "nitid-${GITHUB_REF_NAME}-x86_64-pc-windows-msvc.zip""#),
+        "the release no longer packs the zip the installer downloads"
+    );
+    assert!(
+        workflow.contains("cp target/release/nitid.exe target/release/nitidw.exe dist/"),
+        "the release no longer packs both binaries"
+    );
+
+    let script = page("tools/install.ps1");
+    assert!(script.contains(r#"$name = "nitid-$tag-x86_64-pc-windows-msvc.zip""#));
+    assert!(
+        script.contains("& $exe.FullName install"),
+        "the script no longer runs `nitid install` from the release"
+    );
+}

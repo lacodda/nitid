@@ -1,0 +1,44 @@
+name: Install
+
+# The installer, run the way a person runs it, against a real release: the one
+# just published, or the latest one when the script changes. The script checks
+# the bytes and the version it installed and fails when they are not the ones
+# it fetched, so a green run means the release can be installed from the
+# README.
+on:
+  release:
+    types: [published]
+  push:
+    branches: [main]
+    paths: ['tools/install.ps1', '.github/workflows/install.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Piped into iex, as the README says - not run as a file, which would
+      # forgive what iex does not.
+      - name: Install
+        shell: powershell
+        run: |
+          if ("${{ github.event_name }}" -eq "release") { $env:NITID_VERSION = "${{ github.event.release.tag_name }}" }
+          Get-Content -Raw tools/install.ps1 | Invoke-Expression
+      - name: Check what is installed
+        shell: powershell
+        run: |
+          $exe = Join-Path $env:LOCALAPPDATA "Programs\nitid\nitid.exe"
+          & $exe --version
+          if (-not (Test-Path "HKCU:\Software\Classes\lacodda.nitid.image")) { throw "nitid is not registered for pictures" }
+          # What v0.41 added to the registration. Asked of the release just
+          # published only: a change to the script alone installs whichever
+          # release is latest, which may predate it.
+          if ("${{ github.event_name }}" -eq "release") {
+            if (-not (Test-Path "HKCU:\Software\Classes\Directory\shell\nitid\command")) { throw "folders have no 'Open with nitid'" }
+            $run = (Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run").nitid
+            if ($run -notlike "*nitidw.exe*--resident") { throw "the sign-in entry is '$run'" }
+          }
