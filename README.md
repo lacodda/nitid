@@ -123,7 +123,7 @@ app*. Full instructions: [Getting Started](https://lacodda.github.io/nitid/getti
 
 ## Status
 
-v0.40.1, in daily use on Windows. Startup, colour and HDR hold end to end;
+v0.41.0, in daily use on Windows. Startup, colour and HDR hold end to end;
 every modern still format opens, the animated ones play, and pictures past a
 GPU texture's limit are drawn as tiles. Cropping, turning and stripping
 metadata run without an encoder; frames are culled two at a time; prints come

@@ -2,6 +2,15 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.41.0] - 2026-10-29
+
+### Documentation
+- Say that WebP is written without loss and takes no quality
+
+### Features
+- Open folders from their menu and look at pictures with the space bar
+- Install with one line of PowerShell
+
 ## [0.40.1] - 2026-10-22
 
 ### Testing
