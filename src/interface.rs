@@ -22,7 +22,8 @@ use std::path::PathBuf;
 use crate::color::Passport;
 use crate::compare::{Layout, Table, Which};
 use crate::config::{
-    Appearance, Behaviour, Chrome, Config, Copies, Gestures, MAX_ZOOM_STEP, MIN_ZOOM_STEP, Minimap, Opening, Order, Programs, Sorting, Tools, Units, Wheel,
+    Appearance, Behaviour, Chrome, Config, Copies, Gestures, MAX_ZOOM_STEP, MIN_ZOOM_STEP, Minimap, Opening, Order, Programs, Sorting, Tools, Units, Updates,
+    Wheel,
 };
 use crate::eyedropper::{NEIGHBOURHOOD_RADIUS, NEIGHBOURHOOD_SIDE, Neighbourhood, Reading};
 use crate::format::Format;
@@ -473,6 +474,8 @@ pub struct Interface {
     /// What the viewer says about the hotkey it is listening for — or why it
     /// is not — for the settings to show under the box.
     hotkey_status: Option<String>,
+    /// How keeping up to date stands, read when the settings open.
+    update_status: Option<String>,
     /// The last thing laid out, kept so an unchanged frame can be skipped.
     last: Option<String>,
 }
@@ -494,11 +497,12 @@ pub enum Section {
     Files,
     Programs,
     Desktop,
+    Updates,
 }
 
 impl Section {
     /// The sections down the left of the dialog, in the order they are shown.
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 10] = [
         Self::Gestures,
         Self::Appearance,
         Self::Opening,
@@ -508,6 +512,7 @@ impl Section {
         Self::Files,
         Self::Programs,
         Self::Desktop,
+        Self::Updates,
     ];
 
     /// What the section is called in its list.
@@ -522,6 +527,7 @@ impl Section {
             Self::Files => "Files",
             Self::Programs => "Programs",
             Self::Desktop => "Desktop",
+            Self::Updates => "Updates",
         }
     }
 }
@@ -573,6 +579,7 @@ impl Interface {
             recent_revealed: None,
             hotkey_text: None,
             hotkey_status: None,
+            update_status: None,
             last: None,
         }
     }
@@ -812,6 +819,15 @@ impl Interface {
         }
     }
 
+    /// What the settings should say about keeping up to date.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn set_update_status(&mut self, status: Option<String>) {
+        if self.update_status != status {
+            self.update_status = status;
+            self.owed_frame = true;
+        }
+    }
+
     /// Whether the colour passport is showing.
     ///
     /// Asked by the application before it builds one: the profiles are only
@@ -900,6 +916,7 @@ impl Interface {
         let mut recent_action = None;
         let mut hotkey_text = self.hotkey_text.take();
         let hotkey_status = self.hotkey_status.clone();
+        let update_status = self.update_status.clone();
         // The texture the minimap draws, kept across frames: uploading a copy
         // of the picture on every frame would put a texture upload inside a
         // drag, which is exactly where the viewer must not spend anything.
@@ -981,6 +998,7 @@ impl Interface {
                     &mut wallpaper_stop,
                     &mut hotkey_text,
                     hotkey_status.as_deref(),
+                    update_status.as_deref(),
                 );
             }
             if let Some(typing) = typing.as_mut() {
@@ -1178,7 +1196,7 @@ impl Interface {
                 "|{:?}|{:?}|{:?}",
                 status.recent.as_ref().map(|recents| (recents.version, recents.selected)),
                 self.hotkey_text,
-                self.hotkey_status
+                (&self.hotkey_status, &self.update_status)
             )
             // The crop box, rounded to a tenth of a point. This is what makes
             // a crop drag ask for frames: nothing else in the digest moves
@@ -2808,6 +2826,7 @@ fn settings_dialog(
     stop: &mut bool,
     hotkey_text: &mut Option<String>,
     hotkey_status: Option<&str>,
+    update_status: Option<&str>,
 ) -> bool {
     let mut edited = false;
 
@@ -2868,6 +2887,7 @@ fn settings_dialog(
                                 Section::Tools => tools_section(ui, &mut config.tools),
                                 Section::Sending => sending_section(ui, &mut config.sending),
                                 Section::Desktop => desktop_section(ui, &mut config.wallpaper, wallpaper, stop),
+                                Section::Updates => updates_section(ui, &mut config.updates, update_status),
                             };
                         });
                 });
@@ -3108,6 +3128,43 @@ fn opening_section(ui: &mut egui::Ui, behaviour: &mut Behaviour, hotkey_text: &m
 
     ui.add_space(14.0);
     edited |= hotkey_field(ui, &mut behaviour.hotkey, hotkey_text, hotkey_status);
+
+    edited
+}
+
+/// Whether nitid keeps itself current, and what that means.
+///
+/// Says everything that leaves the machine, here where the switch is: anyone
+/// wondering whether to leave this on is owed that sentence.
+fn updates_section(ui: &mut egui::Ui, updates: &mut Updates, status: Option<&str>) -> bool {
+    let mut edited = false;
+
+    ui.label(egui::RichText::new("Updates").strong());
+    ui.add_space(6.0);
+    if let Some(status) = status {
+        ui.label(status);
+        ui.add_space(6.0);
+    }
+
+    let mut automatic = *updates == Updates::Automatic;
+    if ui.checkbox(&mut automatic, "Keep nitid up to date").changed() {
+        *updates = if automatic { Updates::Automatic } else { Updates::Off };
+        edited = true;
+    }
+    ui.label(
+        egui::RichText::new(
+            "Once a day nitid asks GitHub whether there is a newer release, and installs it in the background. GitHub sees that someone asked, and from what address. \
+             Nothing else is sent, and no picture or file name ever leaves this machine.",
+        )
+        .weak()
+        .small(),
+    );
+    ui.add_space(6.0);
+    ui.label(
+        egui::RichText::new("Off, nitid asks nobody anything. `nitid update` in a terminal still does it once, when you ask.")
+            .weak()
+            .small(),
+    );
 
     edited
 }
@@ -5098,6 +5155,112 @@ mod tests {
 
         assert!(edited, "nothing in the settings dialog reported a change");
         assert_ne!(config, before, "the dialog reported an edit that changed no setting");
+    }
+
+    /// One frame of the dialog at `size`, and what it laid out.
+    fn settings_shapes(interface: &mut Interface, config: &mut Config, size: egui::Vec2, click: Option<egui::Pos2>) -> (Vec<egui::epaint::ClippedShape>, bool) {
+        let mut events = Vec::new();
+        if let Some(at) = click {
+            events.push(egui::Event::PointerMoved(at));
+            for pressed in [true, false] {
+                events.push(egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+        }
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            events,
+            ..Default::default()
+        };
+        let (mut output, _, edited) = interface.layout(raw, &status(), config, Instant::now());
+        output.textures_delta.clear();
+        (output.shapes, edited)
+    }
+
+    /// Where the words are on screen, read from what was laid out.
+    fn where_it_says(shapes: &[egui::epaint::ClippedShape], words: &str) -> Option<egui::Rect> {
+        shapes.iter().find_map(|clipped| match &clipped.shape {
+            egui::Shape::Text(text) if text.galley.job.text.contains(words) => Some(text.visual_bounding_rect()),
+            _ => None,
+        })
+    }
+
+    /// The Updates page's one control flips the one setting. A switch for
+    /// reaching the network that was painted and wired to nothing would be
+    /// worse than having none.
+    #[test]
+    fn the_updates_page_switches_updates() {
+        let mut interface = Interface::new();
+        interface.toggle_settings();
+        interface.section = Section::Updates;
+        let mut config = Config::default();
+        assert_eq!(config.updates, Updates::Automatic);
+        let size = egui::vec2(900.0, 600.0);
+
+        let mut shapes = Vec::new();
+        for _ in 0..3 {
+            shapes = settings_shapes(&mut interface, &mut config, size, None).0;
+        }
+        let switch = where_it_says(&shapes, "Keep nitid up to date").expect("the page shows no switch");
+
+        let (_, edited) = settings_shapes(&mut interface, &mut config, size, Some(switch.center()));
+        assert!(edited, "clicking the switch reported no change");
+        assert_eq!(config.updates, Updates::Off, "the switch did not switch updates off");
+        let mut back = config.clone();
+        back.updates = Updates::Automatic;
+        assert_eq!(back, Config::default(), "the switch changed something else as well");
+
+        settings_shapes(&mut interface, &mut config, size, None);
+        settings_shapes(&mut interface, &mut config, size, Some(switch.center()));
+        assert_eq!(config.updates, Updates::Automatic, "the switch did not switch updates back on");
+    }
+
+    /// The sentences that say what leaves the machine are no use cut off, so
+    /// they and the longest status there is stay inside the dialog, and the
+    /// dialog inside the window. Measured from what was laid out, at the
+    /// smallest window the viewer can reasonably be.
+    #[test]
+    fn the_updates_page_fits() {
+        let mut interface = Interface::new();
+        interface.toggle_settings();
+        interface.section = Section::Updates;
+        interface.set_update_status(Some(
+            "This is v0.42.0. The last update did not go through: the new copy did not work there, and the old one was put back".to_string(),
+        ));
+        let size = egui::vec2(800.0, 600.0);
+        let mut config = Config::default();
+        let mut shapes = Vec::new();
+        for _ in 0..3 {
+            shapes = settings_shapes(&mut interface, &mut config, size, None).0;
+        }
+
+        // The dialog's frame is the largest thing painted.
+        let dialog = shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Rect(rect) => Some(rect.rect),
+                _ => None,
+            })
+            .max_by(|a, b| a.area().total_cmp(&b.area()))
+            .expect("the dialog has a frame");
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+        assert!(screen.contains_rect(dialog), "the dialog {dialog:?} leaves the window");
+
+        // The page's own words: the status line behind the dialog is not its
+        // to keep inside.
+        for words in [
+            "Keep nitid up to date",
+            "no picture or file name ever leaves this machine",
+            "still does it once",
+            "did not go through",
+        ] {
+            let bounds = where_it_says(&shapes, words).unwrap_or_else(|| panic!("the page does not say `{words}`"));
+            assert!(dialog.expand(1.0).contains_rect(bounds), "`{words}` at {bounds:?} leaves the dialog {dialog:?}");
+        }
     }
 
     /// With the dialog closed, the same clicks change nothing: the settings

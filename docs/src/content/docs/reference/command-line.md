@@ -1,6 +1,6 @@
 ---
 title: Command line
-description: Every command nitid takes from a prompt - opening pictures, installing, the desktop's picture, describing pictures and converting them.
+description: Every command nitid takes from a prompt - opening pictures, installing, updating, the desktop's picture, describing pictures and converting them.
 ---
 
 Run these with `nitid`, the console binary. `nitidw` is the one Explorer
@@ -10,6 +10,7 @@ starts; given a command that prints, it hands it to `nitid`.
 nitid [FILE...]
 nitid install
 nitid uninstall
+nitid update [--check]
 nitid wallpaper [FOLDER] [--every 30m] [--only PATTERN] [--fit fill|fit]
 nitid wallpaper next | off
 nitid info FILE... [--json]
@@ -17,6 +18,15 @@ nitid convert FILE... --to jpeg|png|webp [--quality 1-100] [--srgb] [--out FOLDE
 nitid --help
 nitid --version
 ```
+
+## Updating
+
+`nitid update` asks GitHub for the newest release and, if it is newer than the
+copy running, downloads and installs it - now, whatever the settings say about
+doing so on its own. `--check` only says whether there is one, and changes
+nothing. It runs from the installed copy; any other copy says so and stops,
+because replacing an install from somewhere else is what `nitid install` is for.
+See [Staying up to date](/nitid/guides/staying-up-to-date/).
 
 ## Naming pictures
 

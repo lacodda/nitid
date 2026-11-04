@@ -14,6 +14,10 @@
 //! - **An icon in the notification area**, which is how someone who did not
 //!   ask for anything running in the background sees that it is, and tells it
 //!   to go.
+//! - **Keeping the installed copy current**, on a thread of its own: it is the
+//!   one part of nitid that is always there and has nothing on screen to
+//!   interrupt, and the viewer stays a program that reaches no network. See
+//!   `update`.
 //!
 //! See `docs/adr/0041-the-space-bar-in-explorer-is-heard-by-a-resident.md`.
 
@@ -21,6 +25,8 @@ mod explorer;
 mod keys;
 
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::Sender;
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result, bail};
 use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, POINT, WAIT_OBJECT_0, WPARAM};
@@ -29,14 +35,14 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateMutexW, OpenProcess, PROCESS_SYNCHRONIZE, ReleaseMutex, WaitForSingleObject};
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
 use windows::Win32::UI::Shell::{
-    NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_SETVERSION, NIN_SELECT, NOTIFY_ICON_DATA_FLAGS, NOTIFYICON_VERSION_4,
-    NOTIFYICONDATAW, Shell_NotifyIconW,
+    NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_NONE, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION, NIN_BALLOONUSERCLICK, NIN_SELECT,
+    NOTIFY_ICON_DATA_FLAGS, NOTIFYICON_VERSION_4, NOTIFYICONDATAW, Shell_NotifyIconW, ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW, FindWindowW, GetForegroundWindow, GetMessageW,
     GetSystemMetrics, GetWindowThreadProcessId, HICON, IMAGE_ICON, IsWindow, LR_DEFAULTCOLOR, LoadImageW, MF_SEPARATOR, MF_STRING, MSG, PostMessageW,
-    PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SM_CXSMICON, SM_CYSMICON, SetForegroundWindow, TPM_BOTTOMALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-    TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_NULL, WNDCLASSW,
+    PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SM_CXSMICON, SM_CYSMICON, SW_SHOWNORMAL, SetForegroundWindow, TPM_BOTTOMALIGN, TPM_RETURNCMD,
+    TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_NULL, WNDCLASSW,
 };
 use windows::core::{HSTRING, PCWSTR, w};
 
@@ -44,6 +50,9 @@ use crate::single::{self, Kind};
 
 /// The message the notification-area icon sends its window.
 const WM_TRAY: u32 = WM_APP + 2;
+
+/// The updater's thread has something for a person to read.
+const WM_UPDATE_SAID: u32 = WM_APP + 3;
 
 /// The icon's number among this window's icons: it has one.
 const TRAY_ID: u32 = 1;
@@ -55,12 +64,27 @@ const NIN_KEYSELECT: u32 = NIN_SELECT | 0x1;
 /// What the icon's menu offers.
 const MENU_OPEN: usize = 1;
 const MENU_QUIT: usize = 2;
+const MENU_CHECK: usize = 3;
+
+/// How to ask the updater's thread to ask now. Not there on a copy that is not
+/// the installed one, which has nothing to update.
+static CHECK: OnceLock<Sender<()>> = OnceLock::new();
+
+/// What the updater's thread last had to say, for the window's thread to show.
+static SAID: Mutex<Option<(String, String)>> = Mutex::new(None);
+
+/// Where a click on the notification on screen leads, if anywhere.
+static CLICK_LEADS_TO: Mutex<Option<String>> = Mutex::new(None);
 
 /// The resident's window class, and its lock, for this user's session.
 ///
 /// Both are per session already — a window class and a `Local\` name belong
 /// to the desktop they were made on — so no user name is needed, only the
 /// tests' own tag (see `single::instance_tag`).
+///
+/// The class never changes: it is how a new version finds an old version's
+/// resident to tell it to go, and an update that cannot would be refused the
+/// lock by the one it was replacing.
 fn class_name() -> String {
     format!("lacodda.nitid.resident{}", single::instance_tag())
 }
@@ -147,6 +171,8 @@ fn serve() -> Result<()> {
         eprintln!("nitid: {error:#}");
     }
 
+    keep_up_to_date(window);
+
     let mut message = MSG::default();
     while unsafe { GetMessageW(&mut message, None, 0, 0) }.as_bool() {
         unsafe {
@@ -160,6 +186,53 @@ fn serve() -> Result<()> {
     // the machine until it is noticed.
     drop(listening);
     Ok(())
+}
+
+/// Say what arrived, sweep up after it, and keep asking.
+fn keep_up_to_date(window: HWND) {
+    // Only the copy that is installed. A build run from anywhere else has
+    // nothing to replace, no news meant for it, and replacing the installed
+    // copy from under it is not what anybody running a build expected.
+    if !crate::install::is_installed_copy() {
+        return;
+    }
+    crate::update::tidy();
+    if let Some(version) = crate::update::take_news() {
+        *lock(&CLICK_LEADS_TO) = crate::update::notes(&version);
+        notify(window, &format!("nitid updated to v{version}"), "Click to read what changed.");
+    }
+
+    let target = window.0 as isize;
+    let asking = crate::update::watch(move |said| {
+        if let Some(words) = said.words() {
+            *lock(&SAID) = Some(words);
+            // SAFETY: a window that has gone refuses the post, and the process
+            // is on its way out with it.
+            let _ = unsafe { PostMessageW(Some(HWND(target as *mut _)), WM_UPDATE_SAID, WPARAM(0), LPARAM(0)) };
+        }
+    });
+    let _ = CHECK.set(asking);
+}
+
+/// A lock whose holder cannot have left anything half done: these only ever
+/// hold one value, whole.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// A notification from the icon.
+fn notify(window: HWND, title: &str, text: &str) {
+    let mut data = icon_data(window, NIF_INFO);
+    data.dwInfoFlags = NIIF_NONE;
+    let copy = |into: &mut [u16], from: &str| {
+        let words: Vec<u16> = from.encode_utf16().take(into.len() - 1).collect();
+        into[..words.len()].copy_from_slice(&words);
+    };
+    copy(&mut data.szInfoTitle, title);
+    copy(&mut data.szInfo, text);
+    unsafe {
+        let _ = Shell_NotifyIconW(NIM_MODIFY, &data);
+    }
 }
 
 /// What the notification area says when the pointer rests on the icon.
@@ -239,7 +312,20 @@ unsafe extern "system" fn window_proc(window: HWND, message: u32, wparam: WPARAM
             match (lparam.0 & 0xFFFF) as u32 {
                 WM_CONTEXTMENU => menu(window, wparam),
                 NIN_SELECT | NIN_KEYSELECT => open_viewer(),
+                NIN_BALLOONUSERCLICK => {
+                    if let Some(address) = lock(&CLICK_LEADS_TO).take() {
+                        open_address(&address);
+                    }
+                }
                 _ => {}
+            }
+            LRESULT(0)
+        }
+        WM_UPDATE_SAID => {
+            if let Some((title, text)) = lock(&SAID).take() {
+                // A click on this one goes nowhere, whatever the last did.
+                *lock(&CLICK_LEADS_TO) = None;
+                notify(window, &title, &text);
             }
             LRESULT(0)
         }
@@ -273,6 +359,10 @@ fn menu(window: HWND, at: WPARAM) {
     };
     unsafe {
         let _ = AppendMenuW(menu, MF_STRING, MENU_OPEN, w!("Open nitid"));
+        if CHECK.get().is_some() {
+            let check = HSTRING::from(format!("Check for updates - this is v{}", env!("CARGO_PKG_VERSION")));
+            let _ = AppendMenuW(menu, MF_STRING, MENU_CHECK, &check);
+        }
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         let _ = AppendMenuW(menu, MF_STRING, MENU_QUIT, w!("Quit - Space in Explorer stops showing pictures"));
         // A menu from the notification area closes when clicked away from
@@ -284,6 +374,11 @@ fn menu(window: HWND, at: WPARAM) {
         let _ = DestroyMenu(menu);
         match chosen.0 as usize {
             MENU_OPEN => open_viewer(),
+            MENU_CHECK => {
+                if let Some(asking) = CHECK.get() {
+                    let _ = asking.send(());
+                }
+            }
             MENU_QUIT => {
                 let _ = DestroyWindow(window);
             }
@@ -386,6 +481,13 @@ fn open_viewer() {
     let _ = quiet(&mut std::process::Command::new(viewer)).spawn();
 }
 
+/// Open an address in whatever opens addresses here.
+fn open_address(address: &str) {
+    unsafe {
+        let _ = ShellExecuteW(None, w!("open"), &HSTRING::from(address), None, None, SW_SHOWNORMAL);
+    }
+}
+
 /// The windowed binary beside this one: the resident is the windowed binary,
 /// so it is this one.
 fn viewer() -> Option<PathBuf> {
@@ -400,33 +502,61 @@ fn quiet(command: &mut std::process::Command) -> &mut std::process::Command {
 
 /// Start the resident from the installed copy in `dir`, detached from this
 /// process.
-///
-/// `nitid install` runs in a terminal, a script or a CI step, and whatever
-/// reads its output waits for every holder of that output to let go. A child
-/// that is meant to run until sign-out must not be one of them, so this
-/// process's own streams are kept out of what it inherits — naming the
-/// child's streams `null` is not enough, because Windows hands a child every
-/// inheritable handle, not only the three it is given.
 pub fn start(dir: &Path) -> Result<()> {
-    use windows::Win32::Foundation::{HANDLE_FLAG_INHERIT, HANDLE_FLAGS, SetHandleInformation};
-    use windows::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
+    detached(&dir.join("nitidw.exe"), &[crate::RESIDENT_ARGUMENT])
+}
 
-    for stream in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
-        if let Ok(handle) = unsafe { GetStdHandle(stream) }
-            && !handle.is_invalid()
-        {
-            // A stream that is not a handle at all — none was given — has
-            // nothing to keep out.
-            unsafe {
-                let _ = SetHandleInformation(handle, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0));
-            }
-        }
+/// Start a windowed executable that will outlive this process, owing it
+/// nothing.
+///
+/// `nitid install` and `nitid update` run in a terminal, a script or a CI step,
+/// and whatever reads their output waits for every holder of that output to let
+/// go, so a child meant to run until sign-out must hold none of it. Clearing the
+/// inherit flag on the three standard handles is not enough: a process started
+/// with redirected output carries that pipe under a second handle it has no name
+/// for, inherited from its own parent, and `std::process::Command` always asks
+/// Windows to pass on everything inheritable. So this asks Windows to pass on
+/// nothing.
+///
+/// It starts in the executable's own directory rather than the caller's, which
+/// it would otherwise keep from being deleted or renamed for as long as it runs.
+pub fn detached(exe: &Path, arguments: &[&str]) -> Result<()> {
+    use windows::Win32::System::Threading::{CreateProcessW, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTUPINFOW};
+    use windows::core::PWSTR;
+
+    let mut line = quoted(&exe.to_string_lossy());
+    for argument in arguments {
+        line.push(' ');
+        line.push_str(&quoted(argument));
     }
-
-    let exe = dir.join("nitidw.exe");
-    let mut command = std::process::Command::new(&exe);
-    command.arg(crate::RESIDENT_ARGUMENT);
-    quiet(&mut command).spawn().with_context(|| format!("starting {}", exe.display()))?;
+    let mut line: Vec<u16> = line.encode_utf16().chain(std::iter::once(0)).collect();
+    let directory = exe.parent().context("an executable with no directory")?;
+    let startup = STARTUPINFOW {
+        cb: size_of::<STARTUPINFOW>() as u32,
+        ..Default::default()
+    };
+    let mut process = PROCESS_INFORMATION::default();
+    // SAFETY: the command line is a writable, terminated buffer as the call
+    // requires, and both handles it returns are closed here.
+    unsafe {
+        CreateProcessW(
+            &HSTRING::from(exe.as_os_str()),
+            Some(PWSTR(line.as_mut_ptr())),
+            None,
+            None,
+            false,
+            PROCESS_CREATION_FLAGS(0),
+            None,
+            &HSTRING::from(directory.as_os_str()),
+            &startup,
+            &mut process,
+        )
+    }
+    .with_context(|| format!("starting {}", exe.display()))?;
+    unsafe {
+        let _ = CloseHandle(process.hProcess);
+        let _ = CloseHandle(process.hThread);
+    }
     Ok(())
 }
 

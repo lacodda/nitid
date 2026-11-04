@@ -305,7 +305,9 @@ fn expect_header(mut from: impl Read) -> Result<()> {
     from.read_exact(&mut version)?;
     let version = u16::from_le_bytes(version);
     if version != VERSION {
-        bail!("the other end speaks protocol version {version}, this one speaks {VERSION}");
+        // The two ends are one program, so this has one cause: the window was
+        // open when an update landed, and the decoder it starts is the new one.
+        bail!("nitid was updated while this window was open - close it to open this picture (protocol {version} and {VERSION})");
     }
 
     Ok(())
@@ -549,7 +551,12 @@ mod tests {
         wire.extend_from_slice(&MAGIC);
         wire.extend_from_slice(&(VERSION + 1).to_le_bytes());
         wire.push(TAG_IMAGE);
-        assert!(read_reply(&wire[..]).is_err());
+        let Err(error) = read_reply(&wire[..]) else {
+            panic!("another version was read");
+        };
+        // What someone looking at the window is told, so it has to say what
+        // to do about it.
+        assert!(format!("{error:#}").contains("close it"), "{error:#}");
     }
 
     #[test]

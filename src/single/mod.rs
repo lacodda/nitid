@@ -157,9 +157,16 @@ fn take<'a>(rest: &mut &'a [u8], count: usize) -> Option<&'a [u8]> {
 /// the pipe itself does not. `NITID_INSTANCE_ID` narrows it further, which is
 /// how the tests get a channel of their own rather than talking to whatever
 /// window the developer has open.
+///
+/// The protocol's version is in the name because a window can outlive the
+/// version it started as: an update lands while it stays open. A message in a
+/// shape it does not know is refused, and a sender that got through would have
+/// no way to learn that, so the picture would simply not appear. Under separate
+/// names, a viewer whose protocol has moved on finds nobody there and opens a
+/// window of its own, which is what should happen.
 pub fn pipe_name() -> String {
     let user = std::env::var("USERNAME").unwrap_or_else(|_| "user".into());
-    format!(r"\\.\pipe\nitid-{}{}", sanitise(&user), instance_tag())
+    format!(r"\\.\pipe\nitid-{}-v{VERSION}{}", sanitise(&user), instance_tag())
 }
 
 /// What `NITID_INSTANCE_ID` adds to every name the instances find each other
@@ -271,6 +278,14 @@ mod tests {
         let mut bytes = open(&[PathBuf::from("a.jpg")]);
         bytes[0] = b'X';
         assert!(paths_of(&bytes).is_none());
+    }
+
+    /// A window open across an update that changed this format must not be
+    /// found: it would refuse the message, and the sender would go away
+    /// believing the picture was shown.
+    #[test]
+    fn the_channel_is_named_for_the_format_it_speaks() {
+        assert!(pipe_name().contains(&format!("-v{VERSION}")), "{}", pipe_name());
     }
 
     #[test]

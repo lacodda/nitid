@@ -39,11 +39,14 @@ time it takes to decode.
 
 The space bar is heard by a small part of nitid that keeps running when no
 picture is open. Of the keyboard it notes only whether a key was the space
-bar or a character, and when - nothing typed is kept, and nothing leaves the
+bar or a character, and when - nothing typed is kept, and none of it leaves the
 machine. It holds no picture and no graphics device, and it shows
 itself as nitid's mark in the notification area, beside the clock - in the
 overflow (`^`) unless you drag it out. Its menu has **Open nitid**, which is
-the desktop shortcut, and **Quit**.
+the desktop shortcut, **Check for updates**, and **Quit**.
+
+It is also what [keeps nitid up to date](/nitid/guides/staying-up-to-date/), so
+after **Quit** that waits until it is running again too.
 
 It starts when you sign in. To stop that, switch nitid off in **Settings →
 Apps → Startup**, where Windows lists everything that starts with you. After

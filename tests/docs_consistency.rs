@@ -222,6 +222,19 @@ fn the_release_carries_what_the_script_downloads() {
         "the release no longer packs both binaries"
     );
 
+    // What every installed copy reads, by the name it asks for and with the
+    // keys it requires. A key renamed here strands every copy out there.
+    for line in [
+        "update.txt",
+        r#"echo "version = ${GITHUB_REF_NAME#v}""#,
+        r#"echo "archive = $archive""#,
+        r#"echo "sha256 = $(sha256sum "$archive" | cut -d' ' -f1)""#,
+        r#"echo "size = $(stat -c %s "$archive")""#,
+        r#"archive="nitid-${GITHUB_REF_NAME}-x86_64-pc-windows-msvc.zip""#,
+    ] {
+        assert!(workflow.contains(line), "the release no longer writes `{line}` for the updater");
+    }
+
     let script = page("tools/install.ps1");
     assert!(script.contains(r#"$name = "nitid-$tag-x86_64-pc-windows-msvc.zip""#));
     assert!(

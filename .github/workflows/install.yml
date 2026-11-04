@@ -5,6 +5,11 @@ name: Install
 # the bytes and the version it installed and fails when they are not the ones
 # it fetched, so a green run means the release can be installed from the
 # README.
+#
+# And the updater, the same way: the release before this one, installed and
+# asked to update, over the real network from the real address. A copy out
+# there cannot be corrected, so this is the check that a release can still be
+# reached from the last.
 on:
   release:
     types: [published]
@@ -42,3 +47,34 @@ jobs:
             $run = (Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run").nitid
             if ($run -notlike "*nitidw.exe*--resident") { throw "the sign-in entry is '$run'" }
           }
+
+  update:
+    # Only a release has one before it to come from.
+    if: github.event_name == 'release'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Update from the release before this one
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          $tags = gh release list --repo $env:GITHUB_REPOSITORY --exclude-drafts --limit 20 --json tagName --jq ".[].tagName"
+          $previous = $tags | Where-Object { $_ -ne $env:TAG } | Select-Object -First 1
+          # historical versions
+          # The first release with an updater has none before it to come from.
+          if ([version]$previous.TrimStart("v") -lt [version]"0.42.0") {
+            Write-Host "$previous has no updater; nothing to come from"
+            exit 0
+          }
+          # /historical versions
+          $env:NITID_VERSION = $previous
+          Get-Content -Raw tools/install.ps1 | Invoke-Expression
+          $exe = Join-Path $env:LOCALAPPDATA "Programs\nitid\nitid.exe"
+          & $exe --version
+          & $exe update
+          if ($LASTEXITCODE -ne 0) { throw "$previous could not update itself" }
+          $said = & $exe --version
+          if ($said -ne "nitid $($env:TAG.TrimStart('v'))") { throw "after updating from $previous it says '$said'" }
+          if (-not (Test-Path "HKCU:\Software\Classes\lacodda.nitid.image")) { throw "the update lost the registration" }

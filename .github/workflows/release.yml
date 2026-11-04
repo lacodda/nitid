@@ -55,6 +55,22 @@ jobs:
           cp README.md LICENSE dist/
           7z a "nitid-${GITHUB_REF_NAME}-x86_64-pc-windows-msvc.zip" ./dist/*
 
+      # What every installed copy reads to learn there is something newer
+      # (`src/update/feed.rs`). Copies already out there go on reading this
+      # for as long as they run: keys can be added, and these four keep their
+      # names and their meaning.
+      - name: Write the update manifest
+        shell: bash
+        run: |
+          archive="nitid-${GITHUB_REF_NAME}-x86_64-pc-windows-msvc.zip"
+          {
+            echo "version = ${GITHUB_REF_NAME#v}"
+            echo "archive = $archive"
+            echo "sha256 = $(sha256sum "$archive" | cut -d' ' -f1)"
+            echo "size = $(stat -c %s "$archive")"
+          } > update.txt
+          cat update.txt
+
       - name: Write the release notes
         uses: orhun/git-cliff-action@v4
         with:
@@ -70,4 +86,6 @@ jobs:
           # machine before anyone can download it.
           draft: true
           body_path: RELEASE_NOTES.md
-          files: nitid-*.zip
+          files: |
+            nitid-*.zip
+            update.txt

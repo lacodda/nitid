@@ -70,8 +70,10 @@ difference, not the function.
   *Open with nitid* on a folder walks its pictures from the first.
 - **One window.** Opening a second image hands it to the viewer already
   running, so a multi-select does not scatter windows across the desktop.
-- **Nothing that phones home.** The process that decodes the heavy formats has
-  no network in either direction.
+- **Nothing about you leaves the machine.** Once a day nitid asks GitHub whether
+  there is a newer release and installs it in the background - switch that off
+  in Settings and it asks nobody anything. The process that decodes the heavy
+  formats has no network in either direction.
 
 ## A day in the life
 
@@ -114,8 +116,8 @@ irm https://raw.githubusercontent.com/lacodda/nitid/main/tools/install.ps1 | iex
 This installs nitid to `%LOCALAPPDATA%\Programs\nitid` from the latest
 release, registers the file types it opens and *Open with nitid* on folders,
 puts it on your `PATH` and starts it in the background for Explorer's space
-bar - no administrator, nothing outside your own user account. Running it again
-upgrades; `nitid uninstall` removes all of it.
+bar - no administrator, nothing outside your own user account. From then on it
+keeps itself up to date; `nitid uninstall` removes all of it.
 
 Windows keeps the choice of default application to itself, so after installing,
 pick nitid under **Open with -> Choose another app** and tick *Always use this
@@ -123,12 +125,13 @@ app*. Full instructions: [Getting Started](https://lacodda.github.io/nitid/getti
 
 ## Status
 
-v0.41.0, in daily use on Windows. Startup, colour and HDR hold end to end;
+v0.42.0, in daily use on Windows. Startup, colour and HDR hold end to end;
 every modern still format opens, the animated ones play, and pictures past a
 GPU texture's limit are drawn as tiles. Cropping, turning and stripping
 metadata run without an encoder; frames are culled two at a time; prints come
 out in the colour on screen. From a terminal it describes pictures and
-converts them; from Explorer it is a space bar away. What landed in each
+converts them; from Explorer it is a space bar away; and it keeps itself up to
+date. What landed in each
 version: [CHANGELOG](https://github.com/lacodda/nitid/blob/main/CHANGELOG.md).
 
 ## Documentation

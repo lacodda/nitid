@@ -77,6 +77,10 @@ mod slideshow;
 mod startup;
 mod theme;
 mod tiles;
+// Asking GitHub for a newer release and installing it: the resident's and
+// `nitid update`'s, and through WinHTTP and the shell all Windows' own.
+#[cfg(windows)]
+mod update;
 mod vector;
 mod view;
 mod wallpaper;
@@ -226,6 +230,13 @@ pub mod testing {
         crate::resident::stop()
     }
 
+    /// The digest the updater believes a download by, for the gate that
+    /// publishes one.
+    #[cfg(windows)]
+    pub fn sha256(bytes: &[u8]) -> anyhow::Result<[u8; 32]> {
+        crate::update::sha256(bytes)
+    }
+
     /// Whether a viewer is listening on the channel `id` names.
     ///
     /// The single-instance tests have to wait for the first viewer to be
@@ -278,6 +289,13 @@ enum Command {
     Info(info::Asked),
     /// Pictures written again in another format. See `convert`.
     Convert(convert::Asked),
+    /// Install the newest release now, or say whether there is one. See
+    /// `update`.
+    #[cfg(windows)]
+    Update(update::Asked),
+    /// Be a new release, installing itself. Not typed: an older copy starts
+    /// its download this way.
+    ApplyUpdate,
     /// Something the command line does not take, said before anything is
     /// done rather than mistaken for a file to open.
     Mistake(String),
@@ -300,12 +318,13 @@ pub fn run(windowed: bool) -> ExitCode {
     // `wallpaper next` is the exception that proves it: the scheduled task
     // runs the windowed binary precisely so that no console window flashes up
     // on the desktop every half hour, and it prints nothing when it succeeds.
-    // The resident and a look from Explorer are the windowed binary's by the
-    // same right: nothing they do is printed, and a console would flash.
+    // The resident, a look from Explorer and an update landing are the windowed
+    // binary's by the same right: nothing they do is printed, and a console
+    // would flash.
     if windowed
         && !matches!(
             command,
-            Command::View(_) | Command::Peek(_) | Command::Resident | Command::Decode | Command::Wallpaper(wallpaper::Asked::Next)
+            Command::View(_) | Command::Peek(_) | Command::Resident | Command::Decode | Command::ApplyUpdate | Command::Wallpaper(wallpaper::Asked::Next)
         )
     {
         return delegate_to_console_binary();
@@ -342,6 +361,12 @@ pub fn run(windowed: bool) -> ExitCode {
         Command::Wallpaper(asked) => wallpaper::command(asked),
         Command::Info(asked) => info::command(asked),
         Command::Convert(asked) => convert::command(asked),
+        #[cfg(windows)]
+        Command::Update(asked) => update::command(asked),
+        #[cfg(windows)]
+        Command::ApplyUpdate => update::apply(),
+        #[cfg(not(windows))]
+        Command::ApplyUpdate => Err(anyhow::anyhow!("updating is a Windows-only command")),
         Command::Mistake(mistake) => Err(anyhow::anyhow!("{mistake} (nitid --help says what it takes)")),
         #[cfg(windows)]
         Command::Install => install::install().map(|_| ()),
@@ -433,6 +458,11 @@ const RESIDENT_ARGUMENT: &str = "--resident";
 /// open. The paths follow it.
 const PEEK_ARGUMENT: &str = "--peek";
 
+/// What an older copy starts this one with, once it has downloaded it. Dashed
+/// so a file of that name is never taken for it. Never changes: copies already
+/// out there pass exactly this.
+const APPLY_UPDATE_ARGUMENT: &str = "--apply-update";
+
 fn parse(args: impl Iterator<Item = OsString>) -> Command {
     let mut args = args.peekable();
     let Some(first) = args.next() else {
@@ -444,6 +474,14 @@ fn parse(args: impl Iterator<Item = OsString>) -> Command {
         Some("-V" | "--version") => Command::Version,
         Some("install") => Command::Install,
         Some("uninstall") => Command::Uninstall,
+        #[cfg(windows)]
+        Some("update") => {
+            let rest: Vec<String> = args.map(|arg| arg.to_string_lossy().into_owned()).collect();
+            match update::Asked::parse(&rest) {
+                Ok(asked) => Command::Update(asked),
+                Err(error) => Command::Mistake(format!("{error:#}")),
+            }
+        }
         Some("wallpaper") => {
             let rest: Vec<String> = args.map(|arg| arg.to_string_lossy().into_owned()).collect();
             match wallpaper::Asked::parse(&rest) {
@@ -466,6 +504,7 @@ fn parse(args: impl Iterator<Item = OsString>) -> Command {
         Some(sandbox::DECODE_ARGUMENT) => Command::Decode,
         Some(RESIDENT_ARGUMENT) => Command::Resident,
         Some(PEEK_ARGUMENT) => Command::Peek(args.map(PathBuf::from).collect()),
+        Some(APPLY_UPDATE_ARGUMENT) => Command::ApplyUpdate,
         // Anything else is a path — including one that looks like a flag,
         // since a file may legitimately be named `--version`. Every remaining
         // argument is a path too: a command line naming several files opens
@@ -484,6 +523,7 @@ Usage:
   nitid [FILE...]
   nitid install
   nitid uninstall
+  nitid update [--check]
   nitid wallpaper [FOLDER] [--every 30m] [--only PATTERN] [--fit fill|fit]
   nitid wallpaper next | off
   nitid info FILE... [--json]
@@ -500,6 +540,9 @@ Commands:
   install       copy nitid to %LOCALAPPDATA%\\Programs and register its file
                 types, so it is offered in \"Open with\"
   uninstall     undo the above
+  update        ask GitHub for the newest release and install it now, whatever
+                the settings say about doing so on its own. --check only says
+                whether there is one
   wallpaper     change the desktop's picture from FOLDER on a schedule, every
                 30 minutes unless --every says otherwise (5m, 2h, 1d). --only
                 takes names matching a pattern such as *.png; --fit fill

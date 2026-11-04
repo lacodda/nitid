@@ -1525,6 +1525,8 @@ impl App {
     /// afresh — the command line may have changed them — and ask what the
     /// schedule is doing.
     fn settings_opened(&mut self) {
+        #[cfg(windows)]
+        self.interface.set_update_status(Some(crate::update::status()));
         self.config.wallpaper = crate::wallpaper::Settings::load();
         self.wallpaper_written = self.config.wallpaper.clone();
         let proxy = self.proxy.clone();

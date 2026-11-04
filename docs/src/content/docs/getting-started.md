@@ -17,10 +17,14 @@ your `PATH` so `nitid` works as a command, starts nitid in the background for
 Explorer's space bar, and leaves a shortcut on your desktop - no
 administrator, nothing outside your own user account. The script then checks
 that the copy installed is byte for byte the one it downloaded. Running it
-again upgrades, even while the viewer is open, and does not add the directory
-to the `PATH` a second time or put a second shortcut beside the first.
+again repairs or upgrades, even while the viewer is open, and does not add the
+directory to the `PATH` a second time or put a second shortcut beside the first.
 Setting `$env:NITID_VERSION` to a release's tag first installs that release
 instead of the latest.
+
+From then on nitid keeps itself up to date, and says when it has - see
+[Staying up to date](/nitid/guides/staying-up-to-date/), which also says exactly
+what that sends and how to switch it off.
 
 A terminal that was already open keeps the environment it started with, so
 `nitid` becomes available there once it is restarted.
@@ -38,7 +42,8 @@ Default apps*.
 
 `nitid uninstall` stops nitid in the background and removes the files, the
 registration, the folder menu, the sign-in entry, the `PATH` entry, the
-desktop shortcut, and the desktop picture's schedule if one is running.
+desktop shortcut, what the updater keeps, and the desktop picture's schedule if
+one is running.
 
 ## The first minute
 

@@ -68,6 +68,37 @@ impl Wheel {
     }
 }
 
+/// Whether nitid keeps itself current.
+///
+/// A setting, which the line's rule against them allows here: this is the one
+/// thing nitid does that reaches the network, and on a machine that must not,
+/// no other behaviour will do.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Updates {
+    /// Ask GitHub once a day and install what is newer.
+    #[default]
+    Automatic,
+    /// Ask nobody anything.
+    Off,
+}
+
+impl Updates {
+    /// `automatic` is the one word that means yes. Someone who wrote
+    /// `updates = no` or `false` by hand meant off, and getting that wrong
+    /// would reach the network against an explicit wish, where getting the
+    /// opposite wrong only costs a release.
+    fn parse(value: &str) -> Self {
+        if value == "automatic" { Self::Automatic } else { Self::Off }
+    }
+
+    fn render(self) -> &'static str {
+        match self {
+            Self::Automatic => "automatic",
+            Self::Off => "off",
+        }
+    }
+}
+
 /// When a strip of chrome is on screen.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Chrome {
@@ -503,6 +534,9 @@ pub struct Config {
     pub slideshow: Slideshow,
     pub sorting: Sorting,
     pub programs: Programs,
+    /// Whether nitid keeps itself current. Read by the resident each time it
+    /// looks at the clock, so switching it needs no message and no restart.
+    pub updates: Updates,
     /// Where the desktop's picture comes from, as the settings dialog edits
     /// it.
     ///
@@ -592,6 +626,8 @@ impl Config {
                 "status_line" => config.appearance.status_line = Chrome::parse(value).unwrap_or_default(),
                 "minimap" => config.appearance.minimap = Minimap::parse(value).unwrap_or_default(),
 
+                "updates" => config.updates = Updates::parse(value),
+
                 "opening" => config.behaviour.opening = Opening::parse(value).unwrap_or_default(),
                 "hold_zoom" => config.behaviour.hold_zoom = value == "true",
                 "wrap" => config.behaviour.wrap = value != "false",
@@ -678,6 +714,8 @@ impl Config {
         out.push_str(&format!("toolbar = {}\n", self.appearance.toolbar.render()));
         out.push_str(&format!("status_line = {}\n", self.appearance.status_line.render()));
         out.push_str(&format!("minimap = {}\n", self.appearance.minimap.render()));
+
+        out.push_str(&format!("updates = {}\n", self.updates.render()));
 
         out.push_str(&format!("opening = {}\n", self.behaviour.opening.render()));
         out.push_str(&format!("hold_zoom = {}\n", self.behaviour.hold_zoom));
@@ -840,6 +878,7 @@ mod tests {
     fn every_setting_survives_a_round_trip() {
         let config = Config {
             placement: Placement::default(),
+            updates: Updates::Off,
             gestures: Gestures {
                 wheel: Wheel::Step,
                 invert_wheel: true,
@@ -980,6 +1019,23 @@ mod tests {
     /// away without a word.
     #[test]
     fn the_hotkey_is_off_only_when_the_file_says_off() {
+        assert_eq!(Config::parse("updates = off").updates, Updates::Off);
+        assert_eq!(Config::parse("updates = automatic").updates, Updates::Automatic);
+        assert_eq!(Config::parse("").updates, Updates::Automatic, "a file that says nothing did not mean off");
+        // Written by hand, anything but the one word that means yes is a wish
+        // to be left alone, and a wrong guess there reaches the network.
+        assert_eq!(Config::parse("updates = no").updates, Updates::Off);
+        assert_eq!(Config::parse("updates = false").updates, Updates::Off);
+        let switched = Config {
+            updates: Updates::Off,
+            ..Config::default()
+        };
+        assert_eq!(
+            Config::parse(&switched.render()).updates,
+            Updates::Off,
+            "the switch did not survive being written"
+        );
+
         assert_eq!(Config::parse("").behaviour.hotkey, Some(crate::hotkey::Hotkey::default()));
         assert_eq!(Config::parse("hotkey = off").behaviour.hotkey, None);
         assert_eq!(Config::parse("hotkey = Win+Banana").behaviour.hotkey, Some(crate::hotkey::Hotkey::default()));

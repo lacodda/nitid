@@ -195,10 +195,21 @@ pub fn run_as_decoder() -> Result<()> {
         }
     }
 
-    let (request, section_handle) = protocol::read_request(&input[..]).context("reading the request")?;
-
     let stdout = io::stdout();
     let mut out = stdout.lock();
+
+    // Answered rather than left to the exit code. A window open across an
+    // update starts the new executable to decode, and if their protocols have
+    // parted this reply in the new one's shape is what tells it so; silence
+    // would read as a file that crashed the decoder.
+    let (request, section_handle) = match protocol::read_request(&input[..]) {
+        Ok(read) => read,
+        Err(error) => {
+            protocol::write_failure(&mut out, &format!("{error:#}")).context("answering the request")?;
+            out.flush().context("flushing the reply")?;
+            return Ok(());
+        }
+    };
 
     // A decoder taught to try the network, on request. This is how "the
     // container closes the network" is a measurement rather than a belief —
