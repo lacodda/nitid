@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.42.0] - 2026-11-04
+
+### Documentation
+- Say what the resident notes of the keyboard
+
+### Features
+- Keep the installed copy current from the resident
+
 ## [0.41.0] - 2026-10-29
 
 ### Documentation
