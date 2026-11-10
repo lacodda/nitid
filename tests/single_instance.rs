@@ -301,3 +301,143 @@ fn a_launch_with_nobody_listening_opens_a_window() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("first pixels in"), "a cold start showed no picture; stderr was:\n{stderr}");
 }
+
+/// The viewer's visible window, once it has one.
+fn window_of(process: u32) -> Option<windows::Win32::Foundation::HWND> {
+    use windows::Win32::Foundation::{HWND, LPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowThreadProcessId, IsWindowVisible};
+    use windows::core::BOOL;
+
+    struct Search {
+        process: u32,
+        found: Option<HWND>,
+    }
+    unsafe extern "system" fn each(window: HWND, search: LPARAM) -> BOOL {
+        // SAFETY: `search` is the struct below, alive for the enumeration.
+        let search = unsafe { &mut *(search.0 as *mut Search) };
+        let mut owner = 0u32;
+        // SAFETY: plain queries about a window handle Windows just gave us.
+        unsafe { GetWindowThreadProcessId(window, Some(&mut owner)) };
+        if owner == search.process && unsafe { IsWindowVisible(window) }.as_bool() {
+            search.found = Some(window);
+            return false.into();
+        }
+        true.into()
+    }
+    let mut search = Search { process, found: None };
+    // SAFETY: the callback only touches `search`, which outlives the call.
+    let _ = unsafe { EnumWindows(Some(each), LPARAM(&mut search as *mut _ as isize)) };
+    search.found
+}
+
+/// A minimised window handed a file comes back in front, not only back.
+///
+/// The case the Jump List makes every day: the viewer sits minimised, a line
+/// of its Jump List is clicked, and the shell starts a messenger holding the
+/// foreground. Up to v0.42 the window was restored behind whatever was in
+/// front (live run 17.10): winit restores before it asks for the foreground,
+/// and a restore by a process that is not in front un-minimises the window
+/// and leaves it where it is.
+///
+/// Here the test plays the shell: it takes the foreground with a window of
+/// its own and starts the messenger, which a foreground process may hand the
+/// foreground on to. That needs an unlocked screen and moves the foreground
+/// for a moment, so it is run by hand: `cargo test --test single_instance
+/// -- --ignored`.
+#[test]
+#[ignore = "takes the foreground on an unlocked screen"]
+fn a_minimised_window_handed_a_file_comes_to_the_front() {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, VK_MENU};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, DispatchMessageW, GetForegroundWindow, IsIconic, MSG, PM_REMOVE, PeekMessageW, SW_MINIMIZE, SetForegroundWindow,
+        ShowWindow, WINDOW_EX_STYLE, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    };
+    use windows::core::w;
+
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let first = directory.path().join("first.png");
+    let second = directory.path().join("second.png");
+    picture(&first, 50);
+    picture(&second, 210);
+
+    let id = instance_id("minimised");
+    let window = Reaped(open_window(&id, &first));
+    let mut viewer_window = None;
+    assert!(
+        wait_for(Duration::from_secs(20), || {
+            viewer_window = window_of(window.0.id());
+            viewer_window.is_some()
+        }),
+        "the viewer never showed its window"
+    );
+    let viewer_window = viewer_window.unwrap();
+
+    let pump = || {
+        let mut message = MSG::default();
+        // SAFETY: messages of this thread's own window, handed straight on.
+        while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
+            unsafe { DispatchMessageW(&message) };
+        }
+    };
+
+    // SAFETY: a window of the viewer's that this test started.
+    let _ = unsafe { ShowWindow(viewer_window, SW_MINIMIZE) };
+    assert!(
+        wait_for(Duration::from_secs(5), || unsafe { IsIconic(viewer_window) }.as_bool()),
+        "the viewer would not minimise"
+    );
+
+    // The shell's part: a window in front, of the process that will start
+    // the messenger. An Alt press first, which makes this process the one
+    // the last input came from — the right to take the foreground.
+    // SAFETY: a window of this thread's, destroyed below.
+    let ours = unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("STATIC"),
+            w!("nitid test: the shell"),
+            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            100,
+            100,
+            320,
+            200,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+    .expect("a window of the test's own");
+    let alt = |flags| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VK_MENU,
+                dwFlags: flags,
+                ..Default::default()
+            },
+        },
+    };
+    // SAFETY: two key events, sized as the call expects.
+    unsafe { SendInput(&[alt(Default::default()), alt(KEYEVENTF_KEYUP)], std::mem::size_of::<INPUT>() as i32) };
+    pump();
+    let _ = unsafe { SetForegroundWindow(ours) };
+    pump();
+    if unsafe { GetForegroundWindow() } != ours {
+        let _ = unsafe { DestroyWindow(ours) };
+        panic!("the test could not take the foreground, so it cannot play the shell: is the screen locked?");
+    }
+
+    handed_over(&id, &[&second], Duration::from_secs(20)).expect("the second launch hands over and exits");
+
+    let in_front = wait_for(Duration::from_secs(5), || {
+        pump();
+        unsafe { GetForegroundWindow() == viewer_window && !IsIconic(viewer_window).as_bool() }
+    });
+    let (minimised, front) = unsafe { (IsIconic(viewer_window).as_bool(), GetForegroundWindow()) };
+    let _ = unsafe { DestroyWindow(ours) };
+    assert!(
+        in_front,
+        "the minimised viewer was handed a file and did not come to the front (minimised: {minimised}, in front: {front:?}, viewer: {viewer_window:?})"
+    );
+}

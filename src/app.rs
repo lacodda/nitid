@@ -880,11 +880,34 @@ impl App {
     /// happened at all.
     #[cfg(windows)]
     fn raise(&self) {
+        use windows::Win32::UI::WindowsAndMessaging::{IsIconic, SW_RESTORE, SetForegroundWindow, ShowWindow};
+
         let Some(window) = self.window.as_ref() else {
             return;
         };
-        // Restoring first: the window may be minimised, in which case
-        // focusing alone leaves it in the taskbar.
+        // A minimised window takes the foreground first and is restored
+        // after. The other way round — winit's, which restores and then asks —
+        // left it behind whatever was in front (live run 17.10, wish 5289),
+        // while the same request to a window that was not minimised came
+        // forward: a restore by a window that is not in front only
+        // un-minimises it, and the foreground asked for after it was refused.
+        // Asked while still minimised, the window becomes the foreground one,
+        // and a restore done by the foreground window brings it back in
+        // front. That is the case the Jump List makes every day: a minimised
+        // viewer and a line of its list clicked. `tests/single_instance.rs`
+        // holds it, on an unlocked screen, by hand.
+        if let Ok(handle) = crate::com::hwnd_of(window)
+            // SAFETY: plain calls on this process's own window.
+            && unsafe { IsIconic(handle) }.as_bool()
+        {
+            unsafe {
+                let _ = SetForegroundWindow(handle);
+                let _ = ShowWindow(handle, SW_RESTORE);
+            }
+        }
+        // winit's own way after it, for the window that was not minimised —
+        // which it brings forward — and to keep its idea of the window in
+        // step with what happened above.
         window.set_minimized(false);
         window.focus_window();
     }
