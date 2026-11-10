@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.43.0] - 2026-11-10
+
+### Bug Fixes
+- Keep a command going when its reader stops reading
+- Offer a quality only where it changes the file
+- Draw the first frame by the chrome the settings chose
+- Show a HEIC stating code points as the sRGB it decodes to
+- Bring a minimised window to the front when it is handed a file
+
+### Documentation
+- Give the release archive's real size
+
+### Features
+- List the recent folders in the taskbar's Jump List
+
 ## [0.42.0] - 2026-11-04
 
 ### Documentation
