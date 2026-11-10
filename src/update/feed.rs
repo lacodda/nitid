@@ -21,8 +21,9 @@ pub const MANIFEST: &str = "update.txt";
 /// Where releases are, unless a test says otherwise.
 const RELEASES: &str = "https://github.com/lacodda/nitid/releases";
 
-/// The largest archive a release may name. The real one is about ten
-/// megabytes, and a bad line must not have this process filling the disk.
+/// The largest archive a release may name. The real one is about eighteen
+/// megabytes (v0.42), and a bad line must not have this process filling the
+/// disk.
 const LARGEST_ARCHIVE: u64 = 256 * 1024 * 1024;
 
 /// A release's number. Ordered by its parts, as numbers: 0.9.0 is before
