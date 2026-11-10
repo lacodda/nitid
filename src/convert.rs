@@ -32,7 +32,7 @@ use crate::export::{Colour, Target};
 pub struct Asked {
     pub paths: Vec<PathBuf>,
     pub target: Target,
-    /// JPEG and WebP quality, 1-100.
+    /// JPEG quality, 1-100: the only target a quality means anything to.
     pub quality: u8,
     /// Convert the colour into sRGB rather than keep the file's profile.
     pub bake: bool,
@@ -44,7 +44,7 @@ impl Asked {
     /// Read what followed `nitid convert`.
     pub fn parse(args: impl Iterator<Item = OsString>) -> Result<Self> {
         let mut paths = Vec::new();
-        let (mut target, mut quality, mut bake, mut out) = (None, crate::export::QUALITY, false, None);
+        let (mut target, mut quality, mut bake, mut out) = (None, None, false, None);
 
         let mut args = args;
         while let Some(arg) = args.next() {
@@ -56,11 +56,12 @@ impl Asked {
                 }
                 Some("--quality") => {
                     let text = value("--quality")?.to_string_lossy().into_owned();
-                    quality = text
-                        .parse::<u8>()
-                        .ok()
-                        .filter(|quality| (1..=100).contains(quality))
-                        .with_context(|| format!("{text} is not a quality: it is a number from 1 to 100"))?;
+                    quality = Some(
+                        text.parse::<u8>()
+                            .ok()
+                            .filter(|quality| (1..=100).contains(quality))
+                            .with_context(|| format!("{text} is not a quality: it is a number from 1 to 100"))?,
+                    );
                 }
                 Some("--srgb") => bake = true,
                 Some("--out") => out = Some(PathBuf::from(value("--out")?)),
@@ -75,10 +76,18 @@ impl Asked {
         if paths.is_empty() {
             bail!("convert needs a picture, a folder or a pattern such as *.heic");
         }
+        // Refused rather than ignored: a person who asked for a WebP at 75
+        // expects a smaller file than they get, and finds out only after.
+        if quality.is_some() && !target.is_lossy() {
+            bail!(
+                "{} is written without loss, so --quality has nothing to set; it is for --to jpeg",
+                target.label()
+            );
+        }
         Ok(Self {
             paths,
             target,
-            quality,
+            quality: quality.unwrap_or(crate::export::QUALITY),
             bake,
             out,
         })
@@ -272,10 +281,10 @@ mod tests {
             }
         );
         assert_eq!(
-            parse(&["--to", "webp", "a.png", "--quality", "75", "--srgb", "--out", "sent", "b.png"]).unwrap(),
+            parse(&["--to", "jpeg", "a.png", "--quality", "75", "--srgb", "--out", "sent", "b.png"]).unwrap(),
             Asked {
                 paths: vec![PathBuf::from("a.png"), PathBuf::from("b.png")],
-                target: Target::WebP,
+                target: Target::Jpeg,
                 quality: 75,
                 bake: true,
                 out: Some(PathBuf::from("sent")),
@@ -290,8 +299,11 @@ mod tests {
             (&["--to", "jpeg"][..], "needs a picture"),
             (&["a.heic", "--to", "gif"][..], "not a format convert writes"),
             (&["a.heic", "--to"][..], "--to needs a value"),
-            (&["a.heic", "--to", "png", "--quality", "0"][..], "not a quality"),
-            (&["a.heic", "--to", "png", "--quality", "101"][..], "not a quality"),
+            (&["a.heic", "--to", "jpeg", "--quality", "0"][..], "not a quality"),
+            (&["a.heic", "--to", "jpeg", "--quality", "101"][..], "not a quality"),
+            // Lossless: a quality would be taken and change nothing.
+            (&["a.heic", "--to", "webp", "--quality", "75"][..], "WebP is written without loss"),
+            (&["a.heic", "--to", "png", "--quality", "90"][..], "PNG is written without loss"),
             (&["a.heic", "--to", "png", "--overwrite"][..], "not something convert takes"),
         ] {
             let error = parse(args).expect_err(&format!("{args:?} was taken"));

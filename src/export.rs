@@ -73,6 +73,19 @@ impl Target {
         }
     }
 
+    /// Whether a quality means anything to this format.
+    ///
+    /// JPEG only. PNG is lossless by definition, and the WebP encoder the
+    /// viewer carries writes only the lossless kind (`image-webp`'s VP8L) — so
+    /// up to v0.42 the save box offered a WebP quality slider that moved
+    /// nothing, and `convert --quality` was ignored for it without a word.
+    pub fn is_lossy(self) -> bool {
+        match self {
+            Target::Jpeg => true,
+            Target::Png | Target::WebP => false,
+        }
+    }
+
     /// The target matching an extension, for a name the user typed.
     pub fn from_extension(extension: &str) -> Option<Self> {
         match extension.to_ascii_lowercase().as_str() {
@@ -115,7 +128,8 @@ pub struct Request<'a> {
     pub profile: Option<&'a moxcms::ColorProfile>,
     pub target: Target,
     pub colour: Colour,
-    /// JPEG and WebP quality, 1-100. Ignored by PNG, which is lossless.
+    /// JPEG quality, 1-100. Ignored by the lossless targets: see
+    /// `Target::is_lossy`.
     pub quality: u8,
     /// What the file states about its colour that the decoder did not honour,
     /// carried through so a save can repeat it.
@@ -632,6 +646,39 @@ mod tests {
                 Target::from_extension(target.extension()),
                 Some(*target),
                 "{} does not survive a round trip through its extension",
+                target.label()
+            );
+        }
+    }
+
+    /// A quality is offered exactly where it changes the file. Asked of the
+    /// encoders rather than written down: a lossy WebP encoder arriving one
+    /// day makes this fail, and the save box and `convert` then offer the
+    /// slider and the flag for WebP by changing one line.
+    #[test]
+    fn a_quality_is_offered_where_it_changes_the_file() {
+        // Noise, so quality costs bytes: a flat colour encodes the same at
+        // any quality.
+        let mut image = picture(32, 32, [0, 0, 0, 255]);
+        let mut seed = 0x2545_f491u32;
+        for byte in image.pixels.iter_mut() {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            *byte = (seed >> 24) as u8;
+        }
+        for target in Target::ALL {
+            let at = |quality| {
+                encode(&Request {
+                    quality,
+                    ..request(&image, *target)
+                })
+                .expect("encoding")
+            };
+            assert_eq!(
+                at(10) != at(100),
+                target.is_lossy(),
+                "{}: whether quality changes the file disagrees with is_lossy",
                 target.label()
             );
         }

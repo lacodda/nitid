@@ -2255,7 +2255,8 @@ pub struct Saving {
     /// Whether to convert the colour to sRGB rather than hand the profile
     /// along with the numbers.
     bake: bool,
-    /// JPEG and WebP quality. PNG ignores it, and the box hides it there.
+    /// JPEG quality. The lossless formats ignore it, and the box hides it for
+    /// them (`Target::is_lossy`).
     quality: u8,
     /// What this choice would cost, as the export module words it. Refreshed
     /// each frame, because it changes with the format chosen in the box.
@@ -2321,7 +2322,7 @@ fn save_box(ui: &mut egui::Ui, saving: &mut Saving, focused: &mut bool) -> Optio
                 ui.label(egui::RichText::new(format!(".{}", saving.target.extension())).weak());
             });
 
-            if saving.target != crate::export::Target::Png {
+            if saving.target.is_lossy() {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.label("Quality");

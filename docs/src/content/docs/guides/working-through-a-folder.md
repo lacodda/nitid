@@ -100,7 +100,8 @@ those save the same way.
 
 **`Ctrl+Shift+S` saves the picture as something else.** JPEG, PNG or WebP,
 beside the file it came from, under a name you type — the original is never
-touched and an existing neighbour is never replaced.
+touched and an existing neighbour is never replaced. JPEG comes with a quality
+slider; PNG and WebP are written without loss, so they have none.
 
 What comes out is what was on screen. The colour path is the one the shader
 draws with, step for step: the same curves, the same matrix, the same clamp,
