@@ -618,6 +618,7 @@ impl App {
     fn new(initial: Vec<PathBuf>, loader: Loader, proxy: EventLoopProxy<Event>) -> Self {
         let config = Config::load();
         let hold_zoom = config.behaviour.hold_zoom;
+        let interface = Interface::new(config.appearance);
         let pictures = {
             let proxy = proxy.clone();
             crate::recent::pictures::Pictures::new(move |made| {
@@ -643,7 +644,7 @@ impl App {
             modifiers: winit::keyboard::ModifiersState::empty(),
             display_checked_at: None,
             failure: None,
-            interface: Interface::new(),
+            interface,
             input: None,
             overlay: None,
             painted: None,

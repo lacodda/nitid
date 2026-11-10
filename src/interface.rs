@@ -532,14 +532,14 @@ impl Section {
     }
 }
 
-impl Default for Interface {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Interface {
-    pub fn new() -> Self {
+    /// The interface, drawn by the chrome rules the settings hold.
+    ///
+    /// The rules are taken here rather than set afterwards: an interface built
+    /// on the default rules and told the real ones later drew its first frames
+    /// by the wrong ones — a status line turned off came back with every start,
+    /// and a toolbar pinned open waited for the pointer to move (v0.43).
+    pub fn new(chrome: Appearance) -> Self {
         let context = egui::Context::default();
         context.set_fonts(fonts());
         // The chrome is the line's, in whichever theme the system is in. The
@@ -563,10 +563,12 @@ impl Interface {
             minimap_texture: None,
             mark_texture: None,
             passport_shown: false,
-            toolbar_shown: false,
+            // Pinned open is shown from the first frame; the other two rules
+            // wait for the pointer, which has not moved yet.
+            toolbar_shown: chrome.toolbar == Chrome::Always,
             settings_shown: false,
             section: Section::default(),
-            chrome: Appearance::default(),
+            chrome,
             owed_frame: false,
             units: Units::default(),
             magnifier: true,
@@ -4385,7 +4387,7 @@ mod tests {
     #[test]
     fn the_histogram_does_not_cover_the_status_line() {
         for height in [500.0, 600.0, 900.0] {
-            let mut interface = Interface::new();
+            let mut interface = Interface::new(Appearance::default());
             interface.toggle_histogram();
             // A counted histogram, not the "counting…" placeholder: the plot
             // is three times the height of that, and measuring the placeholder
@@ -4426,7 +4428,7 @@ mod tests {
     /// This is what keeps a still picture costing nothing.
     #[test]
     fn an_unchanged_status_asks_for_no_redraw() {
-        let mut interface = Interface::new();
+        let mut interface = Interface::new(Appearance::default());
         assert!(interface.changed(&status()), "the first frame is always a change");
         assert!(!interface.changed(&status()), "the same status asked for a redraw");
         assert!(!interface.changed(&status()));
@@ -4434,7 +4436,7 @@ mod tests {
 
     #[test]
     fn every_part_of_the_status_is_noticed_when_it_changes() {
-        let mut interface = Interface::new();
+        let mut interface = Interface::new(Appearance::default());
         interface.changed(&status());
 
         let mut moved = status();
@@ -4459,7 +4461,7 @@ mod tests {
     /// the reference layout's rule that the chrome disappears rests on it.
     #[test]
     fn the_toolbar_follows_the_pointer_to_the_top_of_the_window() {
-        let mut interface = Interface::new();
+        let mut interface = Interface::new(Appearance::default());
         assert!(!interface.toolbar_shown, "the toolbar was up before the pointer moved");
 
         // Down over the picture: nothing.
@@ -4483,7 +4485,7 @@ mod tests {
     /// resting between the two does not flicker it.
     #[test]
     fn the_toolbar_stays_up_while_the_pointer_is_on_it() {
-        let mut interface = Interface::new();
+        let mut interface = Interface::new(Appearance::default());
         interface.follow_pointer(Some((400.0, 10.0)));
         assert!(interface.toolbar_shown);
 
@@ -4500,7 +4502,7 @@ mod tests {
     /// A pointer that has left the window is not reaching for anything.
     #[test]
     fn the_toolbar_goes_when_the_pointer_leaves_the_window() {
-        let mut interface = Interface::new();
+        let mut interface = Interface::new(Appearance::default());
         interface.follow_pointer(Some((400.0, 10.0)));
         assert!(interface.toolbar_shown);
 
@@ -4512,7 +4514,7 @@ mod tests {
     /// pointer leaving the window, which is what takes it away by default.
     #[test]
     fn a_pinned_toolbar_stays_whatever_the_pointer_does() {
-        let mut interface = Interface::new();
+        let mut interface = Interface::new(Appearance::default());
         interface.set_chrome(Appearance {
             toolbar: Chrome::Always,
             status_line: Chrome::Hover,
@@ -4527,11 +4529,37 @@ mod tests {
         assert!(interface.toolbar_shown, "the pointer leaving took the pinned toolbar away");
     }
 
+    /// The rules a person chose are the ones the first frame is drawn by, not
+    /// the defaults until the settings are next touched: up to v0.42 a status
+    /// line turned off came back with every start, and a pinned toolbar waited
+    /// for the pointer to move.
+    #[test]
+    fn the_chrome_chosen_is_the_chrome_of_the_first_frame() {
+        let chosen = Appearance {
+            toolbar: Chrome::Always,
+            status_line: Chrome::Never,
+            minimap: Minimap::Never,
+            ..Appearance::default()
+        };
+        let interface = Interface::new(chosen);
+        assert!(interface.toolbar_shown, "a toolbar pinned open was not up before the pointer moved");
+        assert_eq!(interface.chrome, chosen, "the interface was built on rules other than the ones given");
+
+        // And the frame itself: laid out by the defaults, the same status
+        // differs from what the chosen rules lay out.
+        let default = Interface::new(Appearance::default());
+        assert_ne!(
+            interface.digest(&status()),
+            default.digest(&status()),
+            "the first frame of the chosen rules is the default one"
+        );
+    }
+
     /// Turned off, it stays off even with the pointer in the band that would
     /// otherwise reveal it.
     #[test]
     fn a_toolbar_turned_off_does_not_come_back() {
-        let mut interface = Interface::new();
+        let mut interface = Interface::new(Appearance::default());
         interface.follow_pointer(Some((400.0, 10.0)));
         assert!(interface.toolbar_shown);
 
@@ -4588,7 +4616,7 @@ mod tests {
     /// works until you actually drag.
     #[test]
     fn a_pan_is_a_change() {
-        let mut interface = Interface::new();
+        let mut interface = Interface::new(Appearance::default());
         let before = mapped((0.25, 0.25, 0.5, 0.5));
         interface.changed(&before);
 
@@ -4600,7 +4628,7 @@ mod tests {
     /// redraws forever over a still picture.
     #[test]
     fn a_still_framing_is_not_a_change() {
-        let mut interface = Interface::new();
+        let mut interface = Interface::new(Appearance::default());
         let status = mapped((0.25, 0.25, 0.5, 0.5));
         interface.changed(&status);
 
@@ -4611,7 +4639,7 @@ mod tests {
     /// the layout rather than reasoned about, the way the histogram's place is.
     #[test]
     fn the_map_does_not_cover_the_histogram() {
-        let mut interface = Interface::new();
+        let mut interface = Interface::new(Appearance::default());
         interface.toggle_histogram();
         let status = Status {
             histogram: Some(crate::histogram::Histogram {
@@ -4671,7 +4699,7 @@ mod tests {
     /// nothing happens until something else asks for a frame.
     #[test]
     fn a_changed_chrome_rule_is_a_change() {
-        let mut interface = Interface::new();
+        let mut interface = Interface::new(Appearance::default());
         interface.changed(&status());
 
         interface.set_chrome(Appearance {
@@ -4686,7 +4714,7 @@ mod tests {
     /// The toolbar is chrome, so its coming and going has to be drawn.
     #[test]
     fn the_toolbar_appearing_is_a_change() {
-        let mut interface = Interface::new();
+        let mut interface = Interface::new(Appearance::default());
         interface.changed(&status());
         interface.follow_pointer(Some((400.0, 10.0)));
         assert!(interface.changed(&status()), "the toolbar appearing went unnoticed");
@@ -4696,7 +4724,7 @@ mod tests {
 
     #[test]
     fn showing_the_key_sheet_is_a_change() {
-        let mut interface = Interface::new();
+        let mut interface = Interface::new(Appearance::default());
         interface.changed(&status());
         interface.toggle_keys();
         assert!(interface.changed(&status()), "opening the key sheet went unnoticed");
@@ -4729,7 +4757,7 @@ mod tests {
     /// asks the loop to wake. When none is up, it asks for nothing.
     #[test]
     fn only_a_live_toast_asks_for_a_wakeup() {
-        let mut interface = Interface::new();
+        let mut interface = Interface::new(Appearance::default());
         let now = Instant::now();
 
         assert_eq!(interface.tick(now), None, "an idle interface asked to be woken");
@@ -4833,7 +4861,7 @@ mod tests {
     /// pressing it asks for the thing it is labelled with.
     #[test]
     fn a_toolbar_button_can_actually_be_pressed() {
-        let mut interface = Interface::new();
+        let mut interface = Interface::new(Appearance::default());
         interface.follow_pointer(Some((400.0, 10.0)));
 
         let at = find_button(&mut interface, Action::Next);
@@ -4855,7 +4883,7 @@ mod tests {
     /// made the answer necessary.
     #[test]
     fn a_press_changes_no_status_and_must_still_be_seen() {
-        let mut interface = Interface::new();
+        let mut interface = Interface::new(Appearance::default());
         interface.follow_pointer(Some((400.0, 10.0)));
         let at = find_button(&mut interface, Action::Next);
 
@@ -4929,7 +4957,7 @@ mod tests {
     /// is the part that wastes it.
     #[test]
     fn a_row_of_the_panel_copies_what_it_shows() {
-        let mut interface = Interface::new();
+        let mut interface = Interface::new(Appearance::default());
         interface.toggle_info();
         let status = photographed();
 
@@ -4960,7 +4988,7 @@ mod tests {
     /// A panel that is not up copies nothing, whatever is clicked.
     #[test]
     fn a_hidden_panel_copies_nothing() {
-        let mut interface = Interface::new();
+        let mut interface = Interface::new(Appearance::default());
         let status = photographed();
         info_frame(&mut interface, &status, None);
 
@@ -5027,7 +5055,7 @@ mod tests {
         let mut status = status();
         status.picking = true;
         status.reading = Some(reading);
-        let mut interface = Interface::new();
+        let mut interface = Interface::new(Appearance::default());
         let mut config = Config::default();
         assert!(config.tools.magnifier, "the magnifier is meant to be on by default");
 
@@ -5074,7 +5102,7 @@ mod tests {
         let mut status = status();
         status.picking = true;
         status.reading = Some(converted_reading());
-        let mut interface = Interface::new();
+        let mut interface = Interface::new(Appearance::default());
         let mut config = Config::default();
 
         painted_fills(&mut interface, &status, &mut config);
@@ -5089,7 +5117,7 @@ mod tests {
     /// The panel opening and closing is a change worth drawing.
     #[test]
     fn opening_the_panel_is_a_change() {
-        let mut interface = Interface::new();
+        let mut interface = Interface::new(Appearance::default());
         interface.changed(&status());
         interface.toggle_info();
         assert!(interface.changed(&status()), "opening the panel went unnoticed");
@@ -5129,7 +5157,7 @@ mod tests {
     /// pass every test that only asked whether it rendered.
     #[test]
     fn a_control_in_the_settings_actually_changes_a_setting() {
-        let mut interface = Interface::new();
+        let mut interface = Interface::new(Appearance::default());
         interface.toggle_settings();
         let mut config = Config::default();
 
@@ -5195,7 +5223,7 @@ mod tests {
     /// worse than having none.
     #[test]
     fn the_updates_page_switches_updates() {
-        let mut interface = Interface::new();
+        let mut interface = Interface::new(Appearance::default());
         interface.toggle_settings();
         interface.section = Section::Updates;
         let mut config = Config::default();
@@ -5226,7 +5254,7 @@ mod tests {
     /// smallest window the viewer can reasonably be.
     #[test]
     fn the_updates_page_fits() {
-        let mut interface = Interface::new();
+        let mut interface = Interface::new(Appearance::default());
         interface.toggle_settings();
         interface.section = Section::Updates;
         interface.set_update_status(Some(
@@ -5268,7 +5296,7 @@ mod tests {
     /// are only editable while they are on screen.
     #[test]
     fn a_closed_settings_dialog_changes_nothing() {
-        let mut interface = Interface::new();
+        let mut interface = Interface::new(Appearance::default());
         let mut config = Config::default();
         settings_frame(&mut interface, &mut config, None);
 
@@ -5286,7 +5314,7 @@ mod tests {
     /// exit from, which is what the owner found on the first cut.
     #[test]
     fn the_close_button_puts_the_settings_away() {
-        let mut interface = Interface::new();
+        let mut interface = Interface::new(Appearance::default());
         interface.toggle_settings();
         let mut config = Config::default();
 
@@ -5333,7 +5361,7 @@ mod tests {
     #[test]
     fn a_window_is_opaque_on_the_frame_it_appears() {
         let painted = |shown: fn(&mut Interface), status: Status, name: &str| {
-            let mut interface = Interface::new();
+            let mut interface = Interface::new(Appearance::default());
             shown(&mut interface);
             let mut config = Config::default();
 
@@ -5398,7 +5426,7 @@ mod tests {
     /// key path did not show it because a keypress asks for a frame anyway.
     #[test]
     fn closing_by_the_cross_asks_for_the_frame_that_drops_it() {
-        let mut interface = Interface::new();
+        let mut interface = Interface::new(Appearance::default());
         interface.toggle_settings();
         let mut config = Config::default();
 
@@ -5443,7 +5471,7 @@ mod tests {
     /// drawn at the end. A viewer that stopped one frame early fails here.
     #[test]
     fn a_panel_opened_by_a_button_finishes_without_further_input() {
-        let mut interface = Interface::new();
+        let mut interface = Interface::new(Appearance::default());
         let mut config = Config::default();
         interface.toolbar_shown = true;
 
@@ -5534,7 +5562,7 @@ mod tests {
     fn the_clean_box_names_what_the_file_carries() {
         /// Lay the box out over `found` and read back every word on screen.
         fn shown(found: crate::scrub::Found, turn: Option<&str>, bakeable: bool) -> String {
-            let mut interface = Interface::new();
+            let mut interface = Interface::new(Appearance::default());
             let mut config = Config::default();
             interface.begin_clean("photograph.jpg", found, turn.map(str::to_string), bakeable);
 
@@ -5622,7 +5650,7 @@ mod tests {
         // Every box that shows prose, laid out and read back.
         for (name, said) in [
             ("the clean-copy box", {
-                let mut interface = Interface::new();
+                let mut interface = Interface::new(Appearance::default());
                 let mut config = Config::default();
                 interface.begin_clean("photograph.jpg", carrying, Some("half round".to_string()), false);
                 let mut said = String::new();
@@ -5659,7 +5687,7 @@ mod tests {
     /// look exactly like a working one from the application's side.
     #[test]
     fn the_crop_overlay_is_drawn_where_the_box_is() {
-        let mut interface = Interface::new();
+        let mut interface = Interface::new(Appearance::default());
         let mut config = Config::default();
         let window = egui::vec2(900.0, 600.0);
 
@@ -5782,7 +5810,7 @@ mod tests {
     /// text has already become triangles. This is what lets a test assert what
     /// the interface *says* rather than how much it drew.
     fn words_on_screen(status: &Status) -> String {
-        let mut interface = Interface::new();
+        let mut interface = Interface::new(Appearance::default());
         let mut config = Config::default();
         let mut said = String::new();
 
@@ -5853,7 +5881,7 @@ mod tests {
     /// itself has to be asked for.
     #[test]
     fn every_section_can_be_reached_from_the_list() {
-        let mut interface = Interface::new();
+        let mut interface = Interface::new(Appearance::default());
         interface.toggle_settings();
         let mut config = Config::default();
         settings_frame(&mut interface, &mut config, None);
@@ -5891,7 +5919,7 @@ mod tests {
     /// nothing until something else wakes the loop.
     #[test]
     fn choosing_a_section_is_a_change() {
-        let mut interface = Interface::new();
+        let mut interface = Interface::new(Appearance::default());
         interface.toggle_settings();
         interface.changed(&status());
 
@@ -5902,7 +5930,7 @@ mod tests {
     /// The dialog opening and closing is a change worth drawing.
     #[test]
     fn opening_the_settings_is_a_change() {
-        let mut interface = Interface::new();
+        let mut interface = Interface::new(Appearance::default());
         interface.changed(&status());
         interface.toggle_settings();
         assert!(interface.changed(&status()), "opening the settings went unnoticed");
@@ -5922,7 +5950,7 @@ mod tests {
     /// A hidden toolbar has no buttons to hit, whatever the pointer does.
     #[test]
     fn a_hidden_toolbar_cannot_be_pressed() {
-        let mut interface = Interface::new();
+        let mut interface = Interface::new(Appearance::default());
         // The pointer is at the top, but `follow_pointer` was never told, so
         // the toolbar is not laid out at all.
         let at = egui::pos2(20.0, TOOLBAR_HEIGHT / 2.0);
@@ -5952,7 +5980,7 @@ mod tests {
             Action::Compare,
             Action::Blink,
         ] {
-            let mut interface = Interface::new();
+            let mut interface = Interface::new(Appearance::default());
             interface.follow_pointer(Some((400.0, 10.0)));
             find_button(&mut interface, wanted);
         }
@@ -5967,13 +5995,13 @@ mod tests {
         alone.position = None;
 
         // Find where the step buttons are while a folder is open...
-        let mut interface = Interface::new();
+        let mut interface = Interface::new(Appearance::default());
         interface.follow_pointer(Some((400.0, 10.0)));
         let next = find_button(&mut interface, Action::Next);
         let previous = find_button(&mut interface, Action::Previous);
 
         // ...then press the same places with a single file open.
-        let mut interface = Interface::new();
+        let mut interface = Interface::new(Appearance::default());
         interface.follow_pointer(Some((400.0, 10.0)));
         for at in [next, previous] {
             press_showing(&mut interface, at, false, &alone);
@@ -5986,7 +6014,7 @@ mod tests {
 
         // The rest of the strip is still live, or this would pass by drawing
         // no toolbar at all.
-        let mut interface = Interface::new();
+        let mut interface = Interface::new(Appearance::default());
         interface.follow_pointer(Some((400.0, 10.0)));
         let fit = find_button(&mut interface, Action::Fit);
         press_showing(&mut interface, fit, false, &alone);
@@ -6093,7 +6121,7 @@ mod tests {
     #[test]
     fn the_toolbar_reads_in_the_order_it_is_written() {
         let status = status();
-        let mut interface = Interface::new();
+        let mut interface = Interface::new(Appearance::default());
         interface.follow_pointer(Some((400.0, 10.0)));
         let texts = toolbar_texts(&mut interface, &status, Vec::new());
 
@@ -6116,7 +6144,7 @@ mod tests {
     fn the_separators_stay_on_the_frame_a_button_is_pressed() {
         let separators = |texts: &[(String, f32)]| texts.iter().filter(|(text, _)| text == "·").count();
         let status = status();
-        let mut interface = Interface::new();
+        let mut interface = Interface::new(Appearance::default());
         interface.follow_pointer(Some((400.0, 10.0)));
         let texts = toolbar_texts(&mut interface, &status, Vec::new());
         let still = separators(&texts);
@@ -6141,7 +6169,7 @@ mod tests {
                 modifiers: egui::Modifiers::NONE,
             },
         ];
-        let mut pressed = Interface::new();
+        let mut pressed = Interface::new(Appearance::default());
         pressed.follow_pointer(Some((400.0, 10.0)));
         let (texts, action) = toolbar_press(&mut pressed, &status, click);
         assert_eq!(action, Some(Action::Keys), "the press did not land on the button, so this proves nothing");
@@ -6215,7 +6243,7 @@ mod tests {
     /// must not ask for frames.
     #[test]
     fn a_blink_flipping_is_a_change_and_a_still_comparison_is_not() {
-        let mut interface = Interface::new();
+        let mut interface = Interface::new(Appearance::default());
         assert!(interface.changed(&comparing(Layout::Blink, Which::Current)));
         assert!(
             !interface.changed(&comparing(Layout::Blink, Which::Current)),
@@ -6245,7 +6273,7 @@ mod tests {
     /// change to them is a change worth drawing.
     #[test]
     fn a_slideshow_and_the_other_display_are_noticed() {
-        let mut interface = Interface::new();
+        let mut interface = Interface::new(Appearance::default());
         let mut showing = status();
         interface.changed(&showing);
 
@@ -6335,7 +6363,7 @@ mod tests {
     /// it shows, and a click on another tile to that one.
     #[test]
     fn a_click_on_a_tile_opens_its_picture() {
-        let mut interface = Interface::new();
+        let mut interface = Interface::new(Appearance::default());
         let status = start_screen(5);
         let top = first_tile_top(&mut interface, &status);
         let middle = top + TILE_PICTURE / 2.0;
@@ -6363,7 +6391,7 @@ mod tests {
     /// must not also open the picture under it.
     #[test]
     fn the_cross_forgets_the_folder_rather_than_opening_it() {
-        let mut interface = Interface::new();
+        let mut interface = Interface::new(Appearance::default());
         let status = start_screen(3);
         let top = first_tile_top(&mut interface, &status);
         let cross = egui::pos2(28.0 + TILE_WIDTH - TILE_PADDING - 15.0, top + TILE_PADDING + 15.0);
@@ -6378,7 +6406,7 @@ mod tests {
     /// arrow keys move by what is actually in a row.
     #[test]
     fn a_row_holds_what_the_window_has_room_for() {
-        let mut interface = Interface::new();
+        let mut interface = Interface::new(Appearance::default());
         let status = start_screen(8);
         press_showing(&mut interface, egui::pos2(1.0, 1.0), false, &status);
         // 900 points, less the margins: three tiles of 220 with their gaps.
@@ -6389,7 +6417,7 @@ mod tests {
     /// showing an empty grid, and the way to a picture is still there.
     #[test]
     fn an_empty_list_still_offers_a_way_to_a_picture() {
-        let mut interface = Interface::new();
+        let mut interface = Interface::new(Appearance::default());
         let status = start_screen(0);
         let mut found = None;
         'search: for y in 0..90 {
