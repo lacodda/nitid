@@ -62,11 +62,13 @@ still there as a setting, for anyone who wants the panel small.
 **The colour passport**, with `K` or by clicking the colour in the status line:
 what the file says its numbers mean, what the display says it can show, and
 what is being done between them — including anything the viewer could not
-honour. A HEIC that describes itself with wide primaries or an HDR transfer is
-resolved to sRGB inside the decoder before a pixel reaches the viewer, so the
-colour on screen is right for sRGB and wrong for the file; the passport says
-so, and so does the save box, because a colour that is quietly wrong is the one
-kind of wrong nobody can find by looking. Colour management is invisible when it works
+honour. A HEIC that states its colour as code points rather than a profile is
+named by them — `1/13/6: BT.709 primaries, sRGB curve` — not called silent.
+The decoder turns any such file into sRGB before a pixel reaches the viewer;
+one that describes itself with wide primaries or an HDR transfer is therefore
+right for sRGB and wrong for the file, and the passport says so, and so does
+the save box, because a colour that is quietly wrong is the one kind of wrong
+nobody can find by looking. Colour management is invisible when it works
 and inexplicable when it does not — a photograph that looks wrong here and
 right elsewhere is a question nobody can answer by looking harder at it.
 

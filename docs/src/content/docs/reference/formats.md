@@ -41,8 +41,11 @@ either as a set of standard code points or as an embedded ICC profile. With a
 profile, nitid reads it and applies it on the GPU like every other format.
 With code points — the more common case — the decoder resolves the colour
 itself before nitid sees the pixels, so a photograph tagged Display P3 is
-shown inside sRGB rather than across a wide-gamut display's full range. See
-[ADR 0007](https://github.com/lacodda/nitid/blob/main/docs/adr/0007-heic-decodes-in-rust.md).
+shown inside sRGB rather than across a wide-gamut display's full range. Those
+pixels are sRGB, and nitid treats them as sRGB: converted to the display's own
+profile on the GPU, like an sRGB JPEG. See
+[ADR 0007](https://github.com/lacodda/nitid/blob/main/docs/adr/0007-heic-decodes-in-rust.md)
+and [ADR 0044](https://github.com/lacodda/nitid/blob/main/docs/adr/0044-a-picture-stating-code-points-is-the-srgb-it-decodes-to.md).
 
 AVIF decodes through `rav1d` — dav1d translated to Rust by the ISRG — with the
 container read separately. It gets the full colour treatment: the file's

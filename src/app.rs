@@ -2529,7 +2529,11 @@ impl App {
             return None;
         };
         let transform = ColorTransform::for_image(image.profile.as_ref(), &self.display_profile);
-        Some(crate::color::Passport::new(image.profile.as_ref(), &self.display_profile, &transform).with_caveat(image.caveat.clone()))
+        Some(
+            crate::color::Passport::new(image.profile.as_ref(), &self.display_profile, &transform)
+                .with_caveat(image.caveat.clone())
+                .with_codes(image.codes),
+        )
     }
 
     /// Answer a key pressed with Ctrl held.

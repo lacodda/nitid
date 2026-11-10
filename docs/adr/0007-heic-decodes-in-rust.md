@@ -5,6 +5,8 @@ Date: 2026-08-19
 ## Status
 
 Accepted. Narrows [ADR 0002](0002-sandbox-c-decoders.md) without replacing it.
+Partly superseded by [ADR 0044](0044-a-picture-stating-code-points-is-the-srgb-it-decodes-to.md):
+the pixels of a HEIC stating code points now carry an sRGB profile.
 
 > **Two of the consequences below were settled in v0.10.0**, and one of them
 > turned out to be worse than described.

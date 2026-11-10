@@ -279,6 +279,13 @@ pub struct LoadedImage {
     /// and reading the file again for each of them to say the same thing would
     /// be paying for the answer over and over.
     pub caveat: Option<String>,
+    /// The code points the file states its colour with, when it states it
+    /// that way rather than with a profile (`stated_codes`).
+    ///
+    /// What the passport and `nitid info` say about the file: `profile` above
+    /// describes the pixels as decoded, which for a HEIC is sRGB whatever the
+    /// codes said.
+    pub codes: Option<crate::isobmff::Cicp>,
 }
 
 impl LoadedImage {
@@ -373,6 +380,7 @@ fn decode_with(bytes: &[u8], confinement: Confinement) -> Result<LoadedImage> {
             metadata: crate::metadata::read(bytes),
             mark: crate::cull::from_bytes(bytes),
             caveat: colour_caveat(bytes, format),
+            codes: stated_codes(bytes, format),
             fidelity: Fidelity::Full,
             format,
             profile: color::profile_from(bytes),
@@ -398,6 +406,7 @@ fn decode_with(bytes: &[u8], confinement: Confinement) -> Result<LoadedImage> {
             metadata: crate::metadata::read(bytes),
             mark: crate::cull::from_bytes(bytes),
             caveat: colour_caveat(bytes, format),
+            codes: stated_codes(bytes, format),
             profile: None,
             vector: Some(vector),
             animation: None,
@@ -445,6 +454,7 @@ fn decode_with(bytes: &[u8], confinement: Confinement) -> Result<LoadedImage> {
         metadata: crate::metadata::read(bytes),
         mark: crate::cull::from_bytes(bytes),
         caveat: colour_caveat(bytes, format),
+        codes: stated_codes(bytes, format),
         profile,
         // A raster format is its pixels; there is nothing to redraw from.
         vector: None,
@@ -499,6 +509,7 @@ pub fn decode_thumbnail(bytes: &[u8]) -> Option<LoadedImage> {
         metadata: crate::metadata::read(bytes),
         mark: crate::cull::from_bytes(bytes),
         caveat: colour_caveat(bytes, format),
+        codes: stated_codes(bytes, format),
         // The orientation tag lives in the primary IFD and applies to both the
         // full image and its thumbnail, so the quick frame is not shown
         // sideways for the moment before the real one replaces it.
@@ -550,6 +561,7 @@ fn decode_heic_thumbnail(bytes: &[u8]) -> Option<LoadedImage> {
         metadata: crate::metadata::read(bytes),
         mark: crate::cull::from_bytes(bytes),
         caveat: colour_caveat(bytes, Format::Heic),
+        codes: stated_codes(bytes, Format::Heic),
         // HEIC states its rotation in the container and the decoder applies
         // it — to the thumbnail as much as to the full image, since both are
         // items in the same file. See `Format::orients_itself`.
@@ -557,9 +569,9 @@ fn decode_heic_thumbnail(bytes: &[u8]) -> Option<LoadedImage> {
         fidelity: Fidelity::Thumbnail,
         // Only reached through the HEIC branch above.
         format: Format::Heic,
-        // The pixels arrive as sRGB, the same as the full decode: attaching a
-        // profile would convert them twice (ADR 0007).
-        profile: None,
+        // The profile of the full decode, so the quick frame and the picture
+        // replacing it are the same colour (ADR 0044).
+        profile: heic_pixels_profile(bytes),
         vector: None,
         animation: None,
     })
@@ -710,12 +722,44 @@ pub fn colour_caveat(bytes: &[u8], format: Format) -> Option<String> {
     ))
 }
 
+/// The code points a file states its colour with, where it states them that
+/// way: a HEIC's `nclx` box.
+///
+/// Kept beside the profile rather than folded into it. The profile says what
+/// the pixels the viewer holds are; this says what the file claimed, and for a
+/// HEIC the two differ — the decoder resolves every code it reads to sRGB.
+pub fn stated_codes(bytes: &[u8], format: Format) -> Option<crate::isobmff::Cicp> {
+    if format != Format::Heic {
+        return None;
+    }
+    crate::isobmff::colour_box(bytes)?.cicp
+}
+
+/// The profile of the pixels the HEIC decoder delivers for this file.
+///
+/// - **ICC profile in the file:** that profile. The decoder reads no profile,
+///   so the pixels are the file's own numbers (`decode_heic_with_colour`
+///   keeps it from guessing at them).
+/// - **Code points:** sRGB, because that is what the decoder resolves every
+///   code to (ADR 0007). Said rather than left untagged: an untagged picture
+///   is shown untouched (ADR 0005), and on a wide-gamut display sRGB numbers
+///   shown untouched are oversaturated — up to v0.42 every such HEIC was
+///   (ADR 0044).
+/// - **Nothing stated:** nothing, as for any untagged file.
+fn heic_pixels_profile(bytes: &[u8]) -> Option<ColorProfile> {
+    let colour = crate::isobmff::colour_box(bytes)?;
+    match (colour.is_icc, colour.cicp) {
+        (true, _) => color::profile_from(bytes),
+        (false, Some(_)) => Some(ColorProfile::new_srgb()),
+        (false, None) => None,
+    }
+}
+
 fn decode_heic_with_colour(bytes: &[u8]) -> Result<(DecodedImage, Option<ColorProfile>)> {
     let Some(colour) = crate::isobmff::colour_box(bytes).filter(|colour| colour.is_icc) else {
         // The ordinary case: the file states CICP codes, the decoder reads
-        // them and resolves the colour itself. Nothing to attach — see
-        // `color::raw_profile`.
-        return Ok((decode_heic(bytes)?, color::profile_from(bytes)));
+        // them and resolves the colour to sRGB itself.
+        return Ok((decode_heic(bytes)?, heic_pixels_profile(bytes)));
     };
 
     let mut rewritten = bytes.to_vec();
@@ -724,7 +768,7 @@ fn decode_heic_with_colour(bytes: &[u8]) -> Result<(DecodedImage, Option<ColorPr
     // the front of the profile and the rest of the box is left as it lies —
     // the decoder reads the codes and stops.
     let Some(body) = rewritten.get_mut(colour.kind_offset..colour.kind_offset + 11) else {
-        return Ok((decode_heic(bytes)?, color::profile_from(bytes)));
+        return Ok((decode_heic(bytes)?, heic_pixels_profile(bytes)));
     };
 
     body[..4].copy_from_slice(b"nclx");
@@ -739,7 +783,7 @@ fn decode_heic_with_colour(bytes: &[u8]) -> Result<(DecodedImage, Option<ColorPr
     body[10] = 0x80;
 
     let image = decode_heic(&rewritten)?;
-    Ok((image, color::profile_from(bytes)))
+    Ok((image, heic_pixels_profile(bytes)))
 }
 
 /// Decode a HEIC — the format a modern iPhone photographs in.
@@ -749,12 +793,12 @@ fn decode_heic_with_colour(bytes: &[u8]) -> Result<(DecodedImage, Option<ColorPr
 /// confine. See `docs/adr/0007-heic-decodes-in-rust.md`.
 ///
 /// The decoder delivers sRGB. A photograph tagged Display P3 has therefore
-/// already been converted by the time it arrives, which is why no profile is
-/// attached to it: the pixels are in the space the profile would convert them
-/// *to*. That costs a wide-gamut photograph the part of the display's gamut
-/// sRGB cannot reach, and it is the one place in the viewer where colour is
-/// resolved on the way in rather than in the shader — recorded as a
-/// limitation, not left to be discovered.
+/// already been converted to sRGB by the time it arrives, and the profile
+/// attached to it is sRGB's (`heic_pixels_profile`): the shader then takes it
+/// from sRGB to the display like any other sRGB picture. That costs a
+/// wide-gamut photograph the part of the display's gamut sRGB cannot reach,
+/// and it is the one place in the viewer where colour is resolved on the way
+/// in — recorded as a limitation, not left to be discovered.
 fn decode_heic(bytes: &[u8]) -> Result<DecodedImage> {
     // The container is parsed by the same crate that decodes the pixels, so a
     // file that opens elsewhere and not here fails as one error rather than
@@ -1314,12 +1358,25 @@ mod tests {
         );
     }
 
-    /// A HEIC stating CICP codes is the ordinary case and must not be touched:
-    /// the decoder resolves its colour, and attaching a profile on top would
-    /// convert the pixels a second time.
+    /// A HEIC stating CICP codes is the ordinary case and its bytes are not
+    /// touched: the decoder resolves its colour from the codes, and what it
+    /// resolves to is sRGB — the profile the pixels then carry, and none of
+    /// the file's own (ADR 0044).
     #[test]
     fn a_cicp_tagged_heic_is_still_left_to_the_decoder() {
-        assert!(decode(&from_base64(HEIC_GRADIENT)).unwrap().profile.is_none());
+        let bytes = from_base64(HEIC_GRADIENT);
+        let loaded = decode(&bytes).unwrap();
+        assert_eq!(
+            loaded.image.pixels,
+            decode_heic(&bytes).unwrap().pixels,
+            "the file was rewritten before the decoder read it"
+        );
+        let profile = loaded.profile.expect("the pixels carry no profile");
+        let srgb = ColorProfile::new_srgb();
+        assert!(
+            crate::color::ColorTransform::for_image(Some(&profile), &srgb).is_identity,
+            "the pixels are called something other than the sRGB the decoder delivers"
+        );
     }
 
     /// A 64x48 gradient with a 16-pixel thumbnail beside it, as libheif writes
@@ -1463,20 +1520,36 @@ mod tests {
         "z3o/jwTUM/3cds7RHx+FIxDBvX9YPrGDQ6OpJeWsNVi2oOcyXcSSXhmg",
     );
 
-    /// A HEIC's colour is finished in one of two places, and which one depends
-    /// on how the file describes itself.
+    /// A HEIC's pixels carry the profile of what they are, which depends on
+    /// how the file describes itself.
     ///
-    /// With CICP codes the decoder resolves it and the pixels arrive as sRGB,
-    /// so nothing may be attached — applying a profile on top would convert
-    /// them twice (ADR 0007). With an ICC profile the decoder resolves
-    /// nothing, so the profile is carried through to the shader instead.
+    /// With CICP codes the decoder resolves the colour and the pixels arrive
+    /// as sRGB — so they are sRGB, said as such, and the shader takes them to
+    /// the display (ADR 0044). Up to v0.42 nothing was attached, which showed
+    /// them untouched, as an untagged file is: oversaturated on a wide-gamut
+    /// display. The codes themselves are kept for what the file is said to
+    /// state. With an ICC profile the decoder resolves nothing, so the profile
+    /// is carried through to the shader instead.
     ///
     /// Both halves are asserted here: the first alone would pass for a build
-    /// that never reads a profile at all.
+    /// that attached sRGB to everything.
     #[test]
-    fn a_heic_carries_a_profile_only_when_the_decoder_did_not_use_one() {
-        // Stated with CICP codes: resolved on the way in, nothing to attach.
-        assert!(decode(&from_base64(HEIC_GRADIENT)).unwrap().profile.is_none());
+    fn a_heic_carries_the_profile_of_the_pixels_it_decodes_to() {
+        // Stated with CICP codes: sRGB, and converted to a display that is not.
+        let coded = decode(&from_base64(HEIC_GRADIENT)).unwrap();
+        let codes = coded.codes.expect("the fixture states its colour as code points");
+        assert_eq!((codes.primaries, codes.transfer), (1, 13), "the codes the fixture states were misread");
+        let profile = coded
+            .profile
+            .as_ref()
+            .expect("a HEIC stating code points was left untagged, so it is shown untouched");
+        let to_wide = crate::color::ColorTransform::for_image(Some(profile), &moxcms::ColorProfile::new_display_p3());
+        assert!(!to_wide.is_identity, "sRGB pixels would go to a Display P3 screen unconverted");
+        let to_srgb = crate::color::ColorTransform::for_image(Some(profile), &moxcms::ColorProfile::new_srgb());
+        assert!(
+            to_srgb.is_identity,
+            "sRGB pixels are converted on an sRGB screen, which means they are not called sRGB"
+        );
 
         // Stated with an ICC profile: carried to the shader.
         let tagged = from_base64(HEIC_GRADIENT_TAGGED);
@@ -1884,6 +1957,7 @@ mod tests {
             orientation: Orientation::Rotate90,
             fidelity: Fidelity::Full,
             caveat: None,
+            codes: None,
             // Irrelevant to this test; any variant would do.
             format: Format::Png,
             metadata: Default::default(),

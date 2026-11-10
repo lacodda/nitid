@@ -53,6 +53,10 @@ pub struct Passport {
     /// colour on screen is then right for sRGB and wrong for the file, and
     /// nothing in the numbers says so — see ADR 0007.
     pub caveat: Option<String>,
+    /// The code points the file states its colour with, when it uses them
+    /// rather than a profile: what "this file" says, where `source` names
+    /// only the space the pixels were decoded into.
+    pub codes: Option<crate::isobmff::Cicp>,
 }
 
 impl Passport {
@@ -64,6 +68,7 @@ impl Passport {
             converting: !transform.is_identity,
             distance: matrix_distance(&transform.matrix),
             caveat: None,
+            codes: None,
         }
     }
 
@@ -71,6 +76,25 @@ impl Passport {
     pub fn with_caveat(mut self, caveat: Option<String>) -> Self {
         self.caveat = caveat;
         self
+    }
+
+    /// Note the code points the file states its colour with.
+    ///
+    /// Up to v0.42 a HEIC stating them was described as saying nothing at
+    /// all — "untagged" — when it says a great deal, only in numbers rather
+    /// than in a profile.
+    pub fn with_codes(mut self, codes: Option<crate::isobmff::Cicp>) -> Self {
+        self.codes = codes;
+        self
+    }
+
+    /// What the file says about its colour, for the row that says it.
+    fn stated(&self) -> String {
+        match (self.codes, &self.source) {
+            (Some(codes), _) => format!("code points {} (decoded as sRGB)", codes_said(codes)),
+            (None, Some(source)) => source.clone(),
+            (None, None) => "says nothing (untagged, shown untouched)".to_string(),
+        }
     }
 
     /// One line saying what is happening, for a panel that has room for a
@@ -96,7 +120,7 @@ impl Passport {
         let mut out = format!("**Colour passport: {}**\n\n{}\n\n", code(about.name), self.summary());
         out.push_str("| | |\n| --- | --- |\n");
         let mut row = |label: &str, value: &str| out.push_str(&format!("| {label} | {} |\n", cell(value)));
-        row("This file", self.source.as_deref().unwrap_or("says nothing (untagged, shown untouched)"));
+        row("This file", &self.stated());
         row("This display", self.display.as_deref().unwrap_or("unnamed"));
         row(
             "Between them",
@@ -119,6 +143,18 @@ impl Passport {
 
     /// The colour path itself, before any caveat about it.
     fn described(&self) -> String {
+        if let Some(codes) = self.codes {
+            let stated = format!(
+                "The file states its colour as code points {}; the decoder turns them into sRGB",
+                codes_said(codes)
+            );
+            return if self.converting {
+                let display = self.display.as_deref().unwrap_or("the display");
+                format!("{stated}, which is converted to {display}.")
+            } else {
+                format!("{stated}, which matches the display, so nothing more is converted.")
+            };
+        }
         match (&self.source, self.converting) {
             // An untagged file states nothing about its numbers, so nothing is
             // assumed and nothing is converted.
@@ -293,6 +329,15 @@ pub fn describe(profile: &ColorProfile) -> Described {
         },
         hdr,
     }
+}
+
+/// Code points as a person reads them: `1/13/6: BT.709 primaries, sRGB
+/// curve`. Shared by the passport and `nitid info`, so the two say a file's
+/// codes in the same words.
+pub fn codes_said(codes: crate::isobmff::Cicp) -> String {
+    let primaries = primaries_code_name(codes.primaries).map_or_else(|| "unnamed primaries".to_string(), |name| format!("{name} primaries"));
+    let transfer = transfer_code_name(codes.transfer).unwrap_or("unnamed transfer");
+    format!("{}/{}/{}: {primaries}, {transfer}", codes.primaries, codes.transfer, codes.matrix)
 }
 
 /// The name of a CICP colour-primaries code, for the codes pictures use.
@@ -614,11 +659,12 @@ fn raw_profile(bytes: &[u8]) -> Option<Vec<u8>> {
         Format::Avif => None,
         // HEIC states its colour one of two ways. With CICP codes — the usual
         // case — the decoder resolves the colour itself and the pixels arrive
-        // as sRGB, so attaching anything would convert them twice; that is the
-        // limitation ADR 0007 records. With an ICC profile, the decoder reads
-        // no such thing, so the profile is read here and applied on the GPU
-        // like any other format's. `image_source::decode_heic_with_colour`
-        // decides which case a file is and makes the pixels match.
+        // as sRGB: the file carries no profile to read here, and the one the
+        // pixels get is sRGB's (`image_source::heic_pixels_profile`, ADR
+        // 0044). With an ICC profile, the decoder reads no such thing, so the
+        // profile is read here and applied on the GPU like any other format's.
+        // `image_source::decode_heic_with_colour` decides which case a file is
+        // and makes the pixels match.
         Format::Heic => heic_profile(bytes),
         // SVG states colours as sRGB values in the markup itself; there is no
         // profile to read, and none to attach.
@@ -949,6 +995,40 @@ mod tests {
             "an untagged file was described as though it had a profile: {}",
             passport.summary(),
         );
+    }
+
+    /// A file that states its colour as code points says so in the passport,
+    /// in numbers and in names, and is never called untagged: up to v0.42 a
+    /// HEIC stating 1/13/6 was "a file that does not say what its colours
+    /// mean".
+    #[test]
+    fn a_file_stating_code_points_is_not_called_untagged() {
+        let codes = crate::isobmff::Cicp {
+            primaries: 1,
+            transfer: 13,
+            matrix: 6,
+        };
+        let srgb = ColorProfile::new_srgb();
+        let wide = ColorProfile::new_display_p3();
+        for (display, converting) in [(&srgb, false), (&wide, true)] {
+            let passport = Passport::new(Some(&srgb), display, &ColorTransform::new(&srgb, display)).with_codes(Some(codes));
+            let said = passport.summary();
+            assert!(said.contains("1/13/6: BT.709 primaries, sRGB curve"), "the codes went unsaid: {said}");
+            assert!(!said.contains("does not say"), "a file stating codes was called silent: {said}");
+            assert_eq!(passport.converting, converting, "{said}");
+            assert_eq!(said.contains("converted to"), converting, "{said}");
+
+            let markdown = passport.markdown(&About {
+                name: "phone.heic",
+                picture: None,
+                hdr: false,
+            });
+            assert!(
+                markdown.contains("| This file | code points 1/13/6: BT.709 primaries, sRGB curve (decoded as sRGB) |"),
+                "{markdown}"
+            );
+            assert!(!markdown.contains("untagged"), "{markdown}");
+        }
     }
 
     /// The distance is a sense of scale, so spaces further apart have to

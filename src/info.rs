@@ -137,11 +137,14 @@ fn read(path: &Path) -> Result<Report> {
         orientation: loaded.orientation,
         frames: loaded.animation.as_ref().map_or(1, |animation| animation.frames.len()),
         mark: loaded.mark,
-        colour: loaded.profile.as_ref().map(crate::color::describe),
-        codes: match (loaded.format, &loaded.profile) {
-            (Format::Heic, None) => crate::isobmff::colour_box(&bytes).and_then(|colour| colour.cicp),
-            _ => None,
+        // A file stating code points has no profile of its own: the one its
+        // pixels carry is the sRGB they decode to, and describing that as the
+        // file's would put words in its mouth.
+        colour: match loaded.codes {
+            Some(_) => None,
+            None => loaded.profile.as_ref().map(crate::color::describe),
         },
+        codes: loaded.codes,
         caveat: loaded.caveat,
         metadata: loaded.metadata,
     })
@@ -183,18 +186,7 @@ impl Report {
         match (&self.colour, self.codes) {
             (None, Some(codes)) => {
                 row("Profile", "none: the colour is stated as code points");
-                let named = |name: Option<&str>, what: &str| name.map_or_else(|| format!("unnamed {what}"), |name| format!("{name} {what}"));
-                row(
-                    "Codes",
-                    &format!(
-                        "{}/{}/{}: {}, {}",
-                        codes.primaries,
-                        codes.transfer,
-                        codes.matrix,
-                        named(crate::color::primaries_code_name(codes.primaries), "primaries"),
-                        crate::color::transfer_code_name(codes.transfer).map_or_else(|| "unnamed transfer".to_string(), str::to_string),
-                    ),
-                );
+                row("Codes", &crate::color::codes_said(codes));
             }
             // ADR 0005: said as what it means, not as an absence.
             (None, None) => row("Profile", "none: the file does not say what its colours mean"),
