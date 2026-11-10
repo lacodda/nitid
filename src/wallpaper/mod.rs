@@ -436,12 +436,12 @@ impl Asked {
 pub fn command(asked: Asked) -> Result<()> {
     match asked {
         Asked::Status => {
-            println!("{}", status());
+            crate::console::say!("{}", status());
             Ok(())
         }
         Asked::Next => next(),
         Asked::Off => {
-            println!("{}", carry_out(Request::Stop)?);
+            crate::console::say!("{}", carry_out(Request::Stop)?);
             Ok(())
         }
         Asked::Set { folder, every, only, fit } => {
@@ -475,7 +475,7 @@ pub fn command(asked: Asked) -> Result<()> {
             let same_source = settings.folder == before.folder && settings.only == before.only;
             if !named_a_folder && same_source && schedule::registered()? {
                 carry_out(Request::Settings(settings.clone()))?;
-                println!(
+                crate::console::say!(
                     "The desktop changes every {} from {}, {}.",
                     settings.every.text(),
                     settings.source(),
@@ -498,7 +498,7 @@ pub fn command(asked: Asked) -> Result<()> {
             schedule::register(settings.every, &scheduled_program()?)?;
             deck.registered = Some(settings.every);
             deck.save()?;
-            println!(
+            crate::console::say!(
                 "The desktop changes every {} from {}, {}. On it now: {picked}",
                 settings.every.text(),
                 settings.source(),

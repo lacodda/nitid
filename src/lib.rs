@@ -350,11 +350,11 @@ pub fn run(windowed: bool) -> ExitCode {
         #[cfg(not(windows))]
         Command::Resident => Err(anyhow::anyhow!("the resident is a Windows-only part of nitid")),
         Command::Help => {
-            println!("{}", usage());
+            crate::console::say!("{}", usage());
             Ok(())
         }
         Command::Version => {
-            println!("nitid {}", env!("CARGO_PKG_VERSION"));
+            crate::console::say!("nitid {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         Command::Decode => sandbox::run_as_decoder(),

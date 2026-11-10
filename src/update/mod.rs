@@ -89,15 +89,15 @@ pub fn command(asked: Asked) -> Result<()> {
     let feed = Feed::new()?;
     let release = newest(&feed).context("asking GitHub for the newest release")?;
     if release.version <= current {
-        println!("nitid {current} is the latest.");
+        crate::console::say!("nitid {current} is the latest.");
         return Ok(());
     }
     if asked == Asked::Check {
-        println!("nitid {} is out; this is {current}. `nitid update` installs it.", release.version);
+        crate::console::say!("nitid {} is out; this is {current}. `nitid update` installs it.", release.version);
         return Ok(());
     }
 
-    println!("Downloading nitid {}", release.version);
+    crate::console::say!("Downloading nitid {}", release.version);
     let stage = fetch(&feed, &release).inspect_err(note_failure)?;
     // The console binary, whose report lands in this terminal.
     let status = std::process::Command::new(stage.join("nitid.exe"))
@@ -108,7 +108,7 @@ pub fn command(asked: Asked) -> Result<()> {
     if !status?.success() {
         bail!("nitid {} did not install; {current} is still in place", release.version);
     }
-    println!(
+    crate::console::say!(
         "nitid {} is installed. A window already open keeps its version until it closes.",
         release.version
     );

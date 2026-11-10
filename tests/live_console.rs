@@ -208,3 +208,36 @@ fn convert_writes_a_heic_as_a_jpeg() {
         assert_eq!((back.image.width, back.image.height), shown, "{name}");
     }
 }
+
+/// A reader that stops reading does not stop the work. `nitid install |
+/// Select-Object -First 2` closed the pipe after two lines, and the panic of
+/// the third stopped the install halfway (v0.43); `convert` reports a line a
+/// file and would have stopped after the first. Here the pipe is closed
+/// before the command starts, so its very first line has nobody to go to.
+#[test]
+fn a_reader_that_goes_away_does_not_stop_the_command() {
+    let dir = tempfile::tempdir().expect("a scratch folder");
+    for (name, shade) in [("a.png", 40u8), ("b.png", 200)] {
+        image::RgbImage::from_pixel(16, 12, image::Rgb([shade, 255 - shade, 128]))
+            .save(dir.path().join(name))
+            .expect("writing a picture");
+    }
+    let (reader, writer) = std::io::pipe().expect("a pipe");
+    drop(reader);
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_nitid"));
+    common::keep_data_in(&mut command, dir.path());
+    let output = command
+        .current_dir(dir.path())
+        .args(["convert", "a.png", "b.png", "--to", "jpeg", "--out", "converted"])
+        .stdout(writer)
+        .output()
+        .expect("running nitid");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "the command stopped when its reader went away: {stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    for name in ["a.jpg", "b.jpg"] {
+        assert!(dir.path().join("converted").join(name).exists(), "{name} was never written: {stderr}");
+    }
+}

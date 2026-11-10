@@ -66,7 +66,7 @@ pub fn command(asked: Asked) -> Result<()> {
                 entries.push(unreadable(path, &format!("{error:#}")));
             }
         });
-        print!("{}", Value::List(entries).render());
+        crate::console::put(&Value::List(entries).render());
     } else {
         for (path, why) in &named.missing {
             eprintln!("nitid: {}: {why}", path.display());
@@ -75,10 +75,10 @@ pub fn command(asked: Asked) -> Result<()> {
         batch::each(&named.files, read, |path, result| match result {
             Ok(report) => {
                 if !first {
-                    println!();
+                    crate::console::say!();
                 }
                 first = false;
-                print!("{}", report.text());
+                crate::console::put(&report.text());
             }
             Err(error) => {
                 failed = true;

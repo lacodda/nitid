@@ -163,23 +163,23 @@ pub fn install() -> Result<PathBuf> {
     if same_file(source_dir, &target_dir) {
         // Installing from the installed copy: the registry work below still
         // runs, which is how a re-register repairs a broken association.
-        println!("nitid is already installed in {}", target_dir.display());
+        crate::console::say!("nitid is already installed in {}", target_dir.display());
     } else {
         put_in_place(source_dir, &target_dir)?;
-        println!("Copied nitid to {}", target_dir.display());
+        crate::console::say!("Copied nitid to {}", target_dir.display());
     }
 
     remove_legacy_keys()?;
     register(&target_dir.join(WINDOWED_EXE), Asked::Install)?;
 
     let extensions = supported_extensions();
-    println!("Registered {} file types: {}", extensions.len(), extensions.join(", "));
-    println!("Added \"Open with nitid\" to folders");
+    crate::console::say!("Registered {} file types: {}", extensions.len(), extensions.join(", "));
+    crate::console::say!("Added \"Open with nitid\" to folders");
 
     // Reported, never fatal: a viewer the shell can open pictures with is
     // installed even if its directory could not reach the PATH.
     match add_to_path(&target_dir) {
-        Ok(true) => println!("Added {} to your PATH", target_dir.display()),
+        Ok(true) => crate::console::say!("Added {} to your PATH", target_dir.display()),
         Ok(false) => {}
         Err(error) => eprintln!("nitid: could not add {} to your PATH: {error:#}", target_dir.display()),
     }
@@ -187,7 +187,7 @@ pub fn install() -> Result<PathBuf> {
     // Likewise: a desktop without a shortcut is an inconvenience, not a
     // failed install.
     match create_desktop_shortcut(&target_dir.join(WINDOWED_EXE)) {
-        Ok(Some(path)) => println!("Put a shortcut on your desktop: {}", path.display()),
+        Ok(Some(path)) => crate::console::say!("Put a shortcut on your desktop: {}", path.display()),
         Ok(None) => {}
         Err(error) => eprintln!("nitid: could not create the desktop shortcut: {error:#}"),
     }
@@ -196,17 +196,17 @@ pub fn install() -> Result<PathBuf> {
     // every sign-in from the entry `register` wrote. Not fatal either: the
     // viewer is installed whether or not the space bar is heard.
     match crate::resident::start(&target_dir) {
-        Ok(()) => println!("Press Space on a picture in Explorer to look at it; Space again puts it away"),
+        Ok(()) => crate::console::say!("Press Space on a picture in Explorer to look at it; Space again puts it away"),
         Err(error) => eprintln!("nitid: could not start nitid in the background: {error:#}"),
     }
 
-    println!("Once a day nitid asks GitHub for a newer release and installs it; Settings > Updates switches that off");
+    crate::console::say!("Once a day nitid asks GitHub for a newer release and installs it; Settings > Updates switches that off");
 
-    println!();
-    println!("nitid is now offered in \"Open with\". Windows reserves the choice");
-    println!("of default application for you: right-click an image, choose");
-    println!("\"Open with\" > \"Choose another app\", pick nitid and tick");
-    println!("\"Always use this app\". Settings > Apps > Default apps works too.");
+    crate::console::say!();
+    crate::console::say!("nitid is now offered in \"Open with\". Windows reserves the choice");
+    crate::console::say!("of default application for you: right-click an image, choose");
+    crate::console::say!("\"Open with\" > \"Choose another app\", pick nitid and tick");
+    crate::console::say!("\"Always use this app\". Settings > Apps > Default apps works too.");
 
     Ok(target_dir)
 }
@@ -531,23 +531,23 @@ pub fn uninstall() -> Result<()> {
     // Before anything is taken away: a resident left running would answer the
     // space bar with a program that is no longer there.
     match crate::resident::stop() {
-        Ok(true) => println!("Stopped nitid in the background"),
+        Ok(true) => crate::console::say!("Stopped nitid in the background"),
         Ok(false) => {}
         Err(error) => eprintln!("nitid: {error:#}"),
     }
 
     unregister()?;
-    println!("Removed the file type registration");
+    crate::console::say!("Removed the file type registration");
 
     let dir = install_dir()?;
     match remove_from_path(&dir) {
-        Ok(true) => println!("Removed {} from your PATH", dir.display()),
+        Ok(true) => crate::console::say!("Removed {} from your PATH", dir.display()),
         Ok(false) => {}
         Err(error) => eprintln!("nitid: could not remove {} from your PATH: {error:#}", dir.display()),
     }
 
     match remove_desktop_shortcut() {
-        Ok(true) => println!("Removed the desktop shortcut"),
+        Ok(true) => crate::console::say!("Removed the desktop shortcut"),
         Ok(false) => {}
         Err(error) => eprintln!("nitid: could not remove the desktop shortcut: {error:#}"),
     }
@@ -558,7 +558,7 @@ pub fn uninstall() -> Result<()> {
         // A schedule left behind would start a program that is no longer
         // there, every half hour, for as long as the machine lives.
         match crate::wallpaper::forget_schedule() {
-            Ok(true) => println!("Removed the desktop picture's schedule"),
+            Ok(true) => crate::console::say!("Removed the desktop picture's schedule"),
             Ok(false) => {}
             Err(error) => eprintln!("nitid: could not remove the desktop picture's schedule: {error:#}"),
         }
@@ -568,7 +568,7 @@ pub fn uninstall() -> Result<()> {
         // that never decoded a HEIC has nothing to remove, which is not an
         // error.
         if crate::sandbox::remove_container_profile().is_ok() {
-            println!("Removed the decoder's container profile");
+            crate::console::say!("Removed the decoder's container profile");
         }
     }
 
@@ -598,17 +598,17 @@ pub fn uninstall() -> Result<()> {
     }
 
     if !removed && !deferred {
-        println!("Nothing installed in {}", dir.display());
+        crate::console::say!("Nothing installed in {}", dir.display());
         return Ok(());
     }
 
     if deferred {
-        println!("Marked the running executable for removal on exit");
+        crate::console::say!("Marked the running executable for removal on exit");
     }
     sweep_retired_in(&dir);
     // Only succeeds once the directory is empty, which is the point.
     let _ = fs::remove_dir(&dir);
-    println!("Removed {}", dir.display());
+    crate::console::say!("Removed {}", dir.display());
 
     Ok(())
 }

@@ -111,14 +111,14 @@ pub fn command(asked: Asked) -> Result<()> {
         |source, outcome| match outcome {
             Ok(Outcome::Written { to, warnings }) => {
                 written += 1;
-                println!("{} -> {}", source.display(), to.display());
+                crate::console::say!("{} -> {}", source.display(), to.display());
                 for warning in warnings {
-                    println!("  {warning}");
+                    crate::console::say!("  {warning}");
                 }
             }
             Ok(Outcome::Left { to, why }) => {
                 left += 1;
-                println!("{} -> {}: {why}, left alone", source.display(), to.display());
+                crate::console::say!("{} -> {}: {why}, left alone", source.display(), to.display());
             }
             Err(error) => {
                 failed += 1;
@@ -129,7 +129,7 @@ pub fn command(asked: Asked) -> Result<()> {
 
     let total = named.files.len() + named.missing.len();
     if total > 1 {
-        println!("{}", summary(written, left, failed, total));
+        crate::console::say!("{}", summary(written, left, failed, total));
     }
     if failed > 0 { Err(batch::Reported.into()) } else { Ok(()) }
 }
