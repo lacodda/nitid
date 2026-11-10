@@ -75,6 +75,9 @@ mod scrub;
 mod single;
 mod slideshow;
 mod startup;
+// The taskbar's button and its Jump List: Windows' own, through the shell.
+#[cfg(windows)]
+mod taskbar;
 mod theme;
 mod tiles;
 // Asking GitHub for a newer release and installing it: the resident's and

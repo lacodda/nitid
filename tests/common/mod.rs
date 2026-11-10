@@ -18,8 +18,20 @@ use std::process::Command;
 /// their start screen with the test's temporary folders — which vanish, and
 /// push the folders that matter off the end of the list. Every launch of the
 /// viewer in the suite goes through here.
+///
+/// From v0.43 the list also goes to the taskbar's Jump List, which is the
+/// shell's and not under `APPDATA`: it is written to a file in `dir` instead
+/// (`jump_list_file`), or every gate would replace the developer's own.
 pub fn keep_data_in<'a>(command: &'a mut Command, dir: &Path) -> &'a mut Command {
-    command.env("APPDATA", dir).env("LOCALAPPDATA", dir)
+    command
+        .env("APPDATA", dir)
+        .env("LOCALAPPDATA", dir)
+        .env("NITID_JUMP_LIST_RECORD", jump_list_file(dir))
+}
+
+/// Where a viewer started by `keep_data_in` writes its Jump List.
+pub fn jump_list_file(dir: &Path) -> std::path::PathBuf {
+    dir.join("jump-list")
 }
 
 /// A small HEIC with a thumbnail item beside the picture, as libheif writes

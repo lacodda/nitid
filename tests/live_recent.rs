@@ -153,3 +153,109 @@ fn a_picture_shown_is_remembered_for_the_next_start() {
         "the picture shown is not the one remembered:\n{list}"
     );
 }
+
+/// What a viewer started by the gates wrote to its stand-in for the Jump
+/// List: a line a folder, its title and what it passes, newest first.
+fn jump_list(data: &Path) -> Vec<String> {
+    std::fs::read_to_string(common::jump_list_file(data))
+        .expect("the viewer wrote no Jump List")
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The Jump List is the start screen's list: the folders the viewer has been
+/// to that are there, newest first, the one just opened on top, each passing
+/// the picture it opens on — and the folder that is not plugged in left off.
+#[test]
+fn the_jump_list_is_where_the_viewer_has_been() {
+    let data = tempfile::tempdir().expect("a place for the viewer's own files");
+    let pictures = tempfile::tempdir().expect("a place for pictures");
+    let (shoot, screens, today) = (pictures.path().join("shoot"), pictures.path().join("screens"), pictures.path().join("today"));
+    for folder in [&shoot, &screens, &today] {
+        std::fs::create_dir_all(folder).unwrap();
+    }
+    let (first, second, opened) = (shoot.join("a.png"), screens.join("b.png"), today.join("c.png"));
+    for (path, shade) in [(&first, 40), (&second, 120), (&opened, 200)] {
+        picture(path, shade);
+    }
+    let gone = pictures.path().join("unplugged").join("d.png");
+    let file = recent_file(data.path());
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(
+        &file,
+        format!(
+            "1760000300\t{}\n1760000200\t{}\n1760000100\t{}\n",
+            second.display(),
+            gone.display(),
+            first.display()
+        ),
+    )
+    .unwrap();
+
+    let said = run(
+        common::keep_data_in(&mut Command::new(viewer()), data.path())
+            .arg(&opened)
+            .env("NITID_NO_SINGLE_INSTANCE", "1")
+            .env("NITID_STARTUP_REPORT", "1")
+            .env("NITID_EXIT_AFTER_FIRST_FRAME", "1"),
+        Duration::from_secs(30),
+    )
+    .expect("the viewer never showed the picture");
+    if !said.contains("first pixels in") {
+        eprintln!("skipping: the viewer could not open a window here:\n{said}");
+        return;
+    }
+
+    let lines = jump_list(data.path());
+    let expected: Vec<String> = [("today", &opened), ("screens", &second), ("shoot", &first)]
+        .iter()
+        .map(|(title, path)| format!("{title}\t\"{}\"", path.display()))
+        .collect();
+    assert_eq!(lines, expected, "the Jump List is not the list of where the viewer has been");
+}
+
+/// A line the person took off the Jump List takes its folder off the start
+/// screen's list too — one list, not two that drift apart.
+#[test]
+fn a_folder_taken_off_the_jump_list_is_forgotten() {
+    let data = tempfile::tempdir().expect("a place for the viewer's own files");
+    let pictures = tempfile::tempdir().expect("a place for pictures");
+    let (shoot, screens) = (pictures.path().join("shoot"), pictures.path().join("screens"));
+    for folder in [&shoot, &screens] {
+        std::fs::create_dir_all(folder).unwrap();
+    }
+    let (kept, removed) = (screens.join("b.png"), shoot.join("a.png"));
+    picture(&kept, 120);
+    picture(&removed, 40);
+    let file = recent_file(data.path());
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, format!("1760000300\t{}\n1760000200\t{}\n", kept.display(), removed.display())).unwrap();
+    // What the shell answers with the next time the list is written.
+    let mut removals = common::jump_list_file(data.path()).into_os_string();
+    removals.push(".removed");
+    std::fs::write(&removals, format!("{}\n", removed.display())).unwrap();
+
+    let said = run(
+        common::keep_data_in(&mut Command::new(viewer()), data.path())
+            .env("NITID_NO_SINGLE_INSTANCE", "1")
+            .env("NITID_STARTUP_REPORT", "1")
+            .env("NITID_EXIT_AFTER_FIRST_FRAME", "interface"),
+        Duration::from_secs(30),
+    )
+    .expect("a bare start never drew its first screen");
+    if !said.contains("gpu ready") {
+        eprintln!("skipping: the viewer could not open a window here:\n{said}");
+        return;
+    }
+
+    let list = std::fs::read_to_string(&file).unwrap();
+    assert!(
+        !list.contains("shoot"),
+        "the folder taken off the Jump List is still on the start screen's list:\n{list}"
+    );
+    assert!(list.contains("screens"), "{list}");
+    let lines = jump_list(data.path());
+    assert_eq!(lines, vec![format!("screens\t\"{}\"", kept.display())], "the removed line went back on");
+}

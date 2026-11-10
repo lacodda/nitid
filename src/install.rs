@@ -243,6 +243,14 @@ pub fn update() -> Result<()> {
     })();
     crate::update::note_outcome(&outcome);
 
+    // Not a choice brought back: a shortcut taken away stays away, and one
+    // still there is only given the name the windows now go by.
+    if outcome.is_ok()
+        && let Err(error) = name_desktop_shortcut(&target_dir.join(WINDOWED_EXE))
+    {
+        eprintln!("nitid: could not name the desktop shortcut: {error:#}");
+    }
+
     if was_running && let Err(error) = crate::resident::start(&target_dir) {
         eprintln!("nitid: could not start nitid in the background: {error:#}");
     }
@@ -991,6 +999,9 @@ fn create_desktop_shortcut(target: &Path) -> Result<Option<PathBuf>> {
     }
     let link_path = desktop_dir()?.join(SHORTCUT_NAME);
     if link_path.exists() {
+        // Left where it is, but given the taskbar's name if it is ours and
+        // was made before it had one (v0.42 and earlier).
+        name_desktop_shortcut(target)?;
         return Ok(None);
     }
 
@@ -1009,6 +1020,9 @@ fn create_desktop_shortcut(target: &Path) -> Result<Option<PathBuf>> {
         // Index 0 of the executable's own resources, which is the mark the
         // rest of the shell already shows for it.
         unsafe { link.SetIconLocation(&HSTRING::from(target.as_os_str()), 0) }.context("setting the shortcut's icon")?;
+        // The name the viewer's windows go by, so the shortcut pinned to the
+        // taskbar is the same button as the window it opens (`taskbar`).
+        crate::taskbar::name_link(&link)?;
 
         let file: IPersistFile = link.cast().context("the shortcut cannot be saved")?;
         unsafe { file.Save(&HSTRING::from(link_path.as_os_str()), true) }.context("writing the shortcut")?;
@@ -1019,6 +1033,47 @@ fn create_desktop_shortcut(target: &Path) -> Result<Option<PathBuf>> {
         unsafe { CoUninitialize() };
     }
     result.map(|()| Some(link_path))
+}
+
+/// Give the desktop shortcut the taskbar's name, if it is there and points at
+/// `target`.
+///
+/// For a shortcut made before v0.43, when the viewer had no name of its own:
+/// pinned, it would be one button and the window it opens another. Nothing
+/// else about it is touched — where it is and what it is called are the
+/// person's — and one pointing somewhere else is not ours to change.
+fn name_desktop_shortcut(target: &Path) -> Result<()> {
+    use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, IPersistFile, STGM_READWRITE};
+    use windows::Win32::UI::Shell::{IShellLinkW, SLGP_RAWPATH, ShellLink};
+    use windows::core::{HSTRING, Interface};
+
+    if sandboxed() {
+        return Ok(());
+    }
+    let link_path = desktop_dir()?.join(SHORTCUT_NAME);
+    if !link_path.exists() {
+        return Ok(());
+    }
+    let _com = crate::com::Com::begin();
+    // SAFETY: COM calls on an object created here, on this thread.
+    unsafe {
+        let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).context("creating the shortcut object")?;
+        let file: IPersistFile = link.cast().context("the shortcut cannot be read")?;
+        file.Load(&HSTRING::from(link_path.as_os_str()), STGM_READWRITE)
+            .context("reading the desktop shortcut")?;
+        let mut path = [0u16; 1024];
+        link.GetPath(&mut path, std::ptr::null_mut(), SLGP_RAWPATH.0 as u32)
+            .context("reading where the shortcut points")?;
+        let length = path.iter().position(|unit| *unit == 0).unwrap_or(path.len());
+        let points_at = PathBuf::from(String::from_utf16_lossy(&path[..length]));
+        if !same_file(&points_at, target) {
+            return Ok(());
+        }
+        crate::taskbar::name_link(&link)?;
+        // Saved back to the file it was read from.
+        file.Save(windows::core::PCWSTR::null(), true).context("writing the desktop shortcut")?;
+    }
+    Ok(())
 }
 
 /// Take the shortcut away again.

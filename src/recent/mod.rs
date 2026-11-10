@@ -46,6 +46,20 @@ impl Entry {
     pub fn folder(&self) -> Option<&Path> {
         self.path.parent()
     }
+
+    /// What the folder is called: on its tile, and on its line of the Jump
+    /// List. Its own name, or the whole path for a drive's root, which has
+    /// no name of its own.
+    pub fn title(&self) -> String {
+        self.folder()
+            .map(|folder| {
+                folder
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| folder.display().to_string())
+            })
+            .unwrap_or_default()
+    }
 }
 
 /// The remembered folders, newest first.
@@ -224,7 +238,7 @@ pub fn newest(folders: &[PathBuf]) -> Option<PathBuf> {
 /// where the file system makes no distinction: `C:\Photos` reached from a
 /// shortcut and `c:\photos` typed into a dialog are one folder, and keeping
 /// both would put the same folder on the screen twice.
-fn same_path(a: &Path, b: &Path) -> bool {
+pub(crate) fn same_path(a: &Path, b: &Path) -> bool {
     if cfg!(windows) {
         let lower = |path: &Path| {
             path.components()

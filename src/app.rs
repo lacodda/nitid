@@ -69,6 +69,12 @@ const FOLDER_PATIENCE: Duration = Duration::from_secs(2);
 /// or not the folder says anything more about it.
 const FOLDER_RETRY: Duration = Duration::from_millis(400);
 
+/// How long a closing viewer waits for the Jump List to be written: well past
+/// what the shell takes, short enough that a shell that hangs does not keep a
+/// closed viewer alive.
+#[cfg(windows)]
+const JUMP_LIST_PATIENCE: Duration = Duration::from_secs(1);
+
 /// Run the viewer, optionally opening a file straight away.
 ///
 /// `peek` says the window is a look from Explorer's space bar, which the
@@ -96,6 +102,11 @@ fn start(
     #[cfg(windows)] listener: Option<crate::single::channel::Listener>,
     #[cfg(not(windows))] listener: Option<()>,
 ) -> Result<()> {
+    // The taskbar files a window under the name its process had when the
+    // window appeared, so the name comes before anything else.
+    #[cfg(windows)]
+    crate::taskbar::claim_name();
+
     // A user event carries a finished background decode, a change in the
     // display, or files handed over by another instance, back to this thread.
     let event_loop = EventLoop::<Event>::with_user_event().build().context("creating the event loop")?;
@@ -173,6 +184,10 @@ enum Event {
     /// What was picked in the open dialog — nothing, when it was cancelled —
     /// or why the dialog could not be shown.
     Chosen(Result<Vec<PathBuf>, String>),
+    /// A person removed lines from the Jump List: their folders are
+    /// forgotten here too (`taskbar`).
+    #[cfg(windows)]
+    Unlisted,
 }
 
 /// The start screen, while it is up.
@@ -592,6 +607,13 @@ struct App {
     /// handed a file another way.
     #[cfg(windows)]
     peek: Option<Peek>,
+    /// The taskbar's Jump List, which shows `recent` (see `taskbar`).
+    #[cfg(windows)]
+    jump_list: crate::taskbar::JumpList,
+    /// Whether the Jump List has been brought up to date this session: once,
+    /// after the first frame, so the shell's work is never in front of it.
+    #[cfg(windows)]
+    jump_list_offered: bool,
 }
 
 /// How a look from Explorer ends, which depends on how it began.
@@ -619,6 +641,13 @@ impl App {
         let config = Config::load();
         let hold_zoom = config.behaviour.hold_zoom;
         let interface = Interface::new(config.appearance);
+        #[cfg(windows)]
+        let jump_list = {
+            let proxy = proxy.clone();
+            crate::taskbar::JumpList::new(move || {
+                let _ = proxy.send_event(Event::Unlisted);
+            })
+        };
         let pictures = {
             let proxy = proxy.clone();
             crate::recent::pictures::Pictures::new(move |made| {
@@ -677,7 +706,38 @@ impl App {
             hotkey_for: None,
             #[cfg(windows)]
             peek: None,
+            #[cfg(windows)]
+            jump_list,
+            #[cfg(windows)]
+            jump_list_offered: false,
         }
+    }
+
+    /// Write the list of where the viewer has been, and bring the Jump List
+    /// in line with it.
+    fn remember(&mut self) {
+        self.recent.save();
+        #[cfg(windows)]
+        self.jump_list.show(self.recent.entries().to_vec());
+    }
+
+    /// Forget the folders `pictures` are in: off the list, off the start
+    /// screen if it is up, and off the Jump List.
+    fn forget_folders(&mut self, pictures: &[PathBuf]) {
+        for picture in pictures {
+            self.recent.forget(picture);
+        }
+        self.remember();
+        if let Some(start) = self.start.as_mut() {
+            start.tiles.retain(|tile| {
+                !pictures
+                    .iter()
+                    .any(|picture| matches!((picture.parent(), tile.path.parent()), (Some(a), Some(b)) if crate::recent::same_path(a, b)))
+            });
+            start.selected = start.selected.min(start.tiles.len().saturating_sub(1));
+        }
+        self.start_version += 1;
+        self.request_redraw();
     }
 
     fn into_result(self) -> Result<()> {
@@ -723,7 +783,7 @@ impl App {
         // when a folder comes to the front; a step inside one only moves which
         // picture its entry holds, and waits for the window to close.
         if self.recent.record(path, crate::recent::now()) {
-            self.recent.save();
+            self.remember();
         }
         // A picture going up is the end of the start screen, whichever way it
         // came: a tile, a drop, a hand-over, the open dialog, the hotkey.
@@ -3304,7 +3364,7 @@ impl App {
                     wanted.push(entry.path.clone());
                 }
                 crate::interface::Tile {
-                    folder: entry.folder().map(folder_name).unwrap_or_default(),
+                    folder: entry.title(),
                     name: name_of(&entry.path),
                     ago: crate::recent::ago(now, entry.when),
                     picture: made.and_then(|made| made.picture.clone()),
@@ -3428,16 +3488,7 @@ impl App {
             // Back to that picture, in its folder. A file deleted since is
             // not a dead end: the folder opens on its first picture instead.
             RecentAction::Open(path) => self.open(&[path]),
-            RecentAction::Forget(path) => {
-                self.recent.forget(&path);
-                self.recent.save();
-                if let Some(start) = self.start.as_mut() {
-                    start.tiles.retain(|tile| tile.path != path);
-                    start.selected = start.selected.min(start.tiles.len().saturating_sub(1));
-                }
-                self.start_version += 1;
-                self.request_redraw();
-            }
+            RecentAction::Forget(path) => self.forget_folders(&[path]),
             RecentAction::Browse => self.browse(),
         }
     }
@@ -5300,6 +5351,14 @@ impl App {
                 self.request_redraw();
             }
         }
+
+        // The first frame of either kind — a picture or the start screen — is
+        // on screen, so the shell's work on the Jump List is behind it.
+        #[cfg(windows)]
+        if !self.jump_list_offered && (carries_image || starting.is_some()) {
+            self.jump_list_offered = true;
+            self.jump_list.show(self.recent.entries().to_vec());
+        }
     }
 }
 
@@ -6075,6 +6134,13 @@ impl ApplicationHandler<Event> for App {
             Event::Hotkey => self.hotkey_pressed(),
             Event::Newest(found) => self.newest_found(found),
             Event::Chosen(chosen) => self.chosen(chosen),
+            #[cfg(windows)]
+            Event::Unlisted => {
+                let removed = self.jump_list.take_removed();
+                if !removed.is_empty() {
+                    self.forget_folders(&removed);
+                }
+            }
         }
     }
 
@@ -6169,6 +6235,21 @@ impl ApplicationHandler<Event> for App {
         // The picture last looked at in the folder that was open: a step
         // inside a folder is not written as it happens.
         self.recent.save();
+        // The Jump List learns it too, which may take the shell a moment:
+        // the window goes first, so closing does not wait on it.
+        #[cfg(windows)]
+        {
+            if let Some(window) = self.window.as_ref() {
+                window.set_visible(false);
+            }
+            let removed = self.jump_list.finish(self.recent.entries().to_vec(), JUMP_LIST_PATIENCE);
+            if !removed.is_empty() {
+                for picture in &removed {
+                    self.recent.forget(picture);
+                }
+                self.recent.save();
+            }
+        }
     }
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {

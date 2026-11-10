@@ -138,3 +138,4 @@ See [The desktop's picture](/nitid/guides/the-desktop-picture/).
 | `NITID_SECOND_SCREEN_HERE=1` | let `D` open the other display as a plain window on this one, so the second screen can be exercised on a machine with a single display |
 | `NITID_HANDOVER_REPORT=1` | print which process the foreground was offered to when a file is handed over; used by the one-window gate |
 | `NITID_DESKTOP_RECORD=<file>` | write what the desktop would have been told into the file instead of changing the desktop's picture, so the whole way there can be run on a desktop that is not the test's to change |
+| `NITID_JUMP_LIST_RECORD=<file>` | write the taskbar's Jump List into the file instead of giving it to the shell, a folder a line; lines named in `<file>.removed` are taken as removed by hand. Every gate that starts a viewer sets it, so none replaces your own list |

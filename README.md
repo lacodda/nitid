@@ -62,8 +62,9 @@ difference, not the function.
   again with their colour profile, their date and the right way up, replacing
   nothing.
 - **Where you left off.** Started from its icon, nitid opens on the folders
-  it has been to, each tile the picture you stopped at; `O` brings them up over
-  a picture. `Win+Alt+N`, pressed in any program, puts the newest picture from
+  it has been to, each tile the picture you stopped at; a right click on its
+  taskbar button lists the same folders, and `O` brings them up over a
+  picture. `Win+Alt+N`, pressed in any program, puts the newest picture from
   them on screen - the screenshot you just took.
 - **A glance from Explorer.** `Space` on a picture selected in Explorer or on
   the desktop puts it on screen, `Space` again puts it away - and
@@ -125,13 +126,13 @@ app*. Full instructions: [Getting Started](https://lacodda.github.io/nitid/getti
 
 ## Status
 
-v0.42.0, in daily use on Windows. Startup, colour and HDR hold end to end;
+v0.43.0, in daily use on Windows. Startup, colour and HDR hold end to end;
 every modern still format opens, the animated ones play, and pictures past a
 GPU texture's limit are drawn as tiles. Cropping, turning and stripping
 metadata run without an encoder; frames are culled two at a time; prints come
 out in the colour on screen. From a terminal it describes pictures and
-converts them; from Explorer it is a space bar away; and it keeps itself up to
-date. What landed in each
+converts them; from Explorer it is a space bar away, from the taskbar a right
+click; and it keeps itself up to date. What landed in each
 version: [CHANGELOG](https://github.com/lacodda/nitid/blob/main/CHANGELOG.md).
 
 ## Documentation

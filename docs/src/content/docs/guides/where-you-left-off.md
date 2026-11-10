@@ -1,6 +1,6 @@
 ---
 title: Where you left off
-description: Started from its icon, nitid opens on the folders it has been to; O brings them up over a picture, Ctrl+O opens any other, and a hotkey shows the newest picture from anywhere in Windows.
+description: Started from its icon, nitid opens on the folders it has been to; the taskbar button's Jump List has them too, O brings them up over a picture, Ctrl+O opens any other, and a hotkey shows the newest picture from anywhere in Windows.
 ---
 
 Most of the time nitid is opened on a file: you double-click a photograph and
@@ -26,6 +26,22 @@ A folder on a drive that is not plugged in is left off the screen but not
 forgotten: put the drive back and its tile returns. To take a folder off the
 list for good, point at its tile and click the cross in the corner, or press
 `Del` on it.
+
+## From the taskbar
+
+**Right-click nitid's taskbar button and the same folders are there**, under
+**Recent**, newest first: each opens on the picture you last looked at in it,
+as its tile does. It works on a button pinned to the taskbar with nitid
+closed, and on the button of a window already open — a minimised one comes
+back in front with the picture. The folders are the start screen's, not a
+list of their own: one taken off the start screen is gone from the taskbar
+too, and one removed from the taskbar with **Remove from this list** is
+forgotten by the start screen. A drive that is not plugged in is left off
+both.
+
+With **Show recently opened items** turned off in Windows (Settings →
+Personalisation → Start), the taskbar shows no folders, which is what that
+setting asks for. The start screen keeps them: they are nitid's own.
 
 ## Back to it from a picture
 
@@ -71,6 +87,10 @@ path with a tab between them, newest first, up to 24 folders. Local rather
 than roaming, because the paths are this machine's. A picture pasted from the
 clipboard is never written there — it has no file. The file is joined with
 what is already on disk when it is written, so two windows opened with
-`NITID_NO_SINGLE_INSTANCE` do not wipe out each other's folders. See
-[ADR 0037](https://github.com/lacodda/nitid/blob/main/docs/adr/0037-the-start-screen-is-a-folder-to-a-tile.md)
-and [ADR 0038](https://github.com/lacodda/nitid/blob/main/docs/adr/0038-a-global-key-is-held-by-a-thread-of-its-own.md).
+`NITID_NO_SINGLE_INSTANCE` do not wipe out each other's folders. The taskbar's
+copy is the shell's, written from this file after the first picture is on
+screen and again whenever a folder comes to the front, and filed under the
+name every nitid window goes by on the taskbar, `lacodda.nitid`. See
+[ADR 0037](https://github.com/lacodda/nitid/blob/main/docs/adr/0037-the-start-screen-is-a-folder-to-a-tile.md),
+[ADR 0038](https://github.com/lacodda/nitid/blob/main/docs/adr/0038-a-global-key-is-held-by-a-thread-of-its-own.md)
+and [ADR 0045](https://github.com/lacodda/nitid/blob/main/docs/adr/0045-the-jump-list-is-the-start-screens-list.md).
