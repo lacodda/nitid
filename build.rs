@@ -4,8 +4,8 @@
 //    the lacodda line mark at three levels — the filled tile at the smallest
 //    sizes, the plated mark above them — so Explorer, the taskbar and the
 //    titlebar each get the one that reads at their size. See `src/icon.rs`,
-//    which holds that rule with a test, and `docs/export-assets.mjs`, which
-//    builds the container.
+//    which holds that rule with a test; `lyrn assets` draws the container
+//    from the masters in `assets/`.
 //
 // 2. Turns the line's design tokens into Rust. `assets/dowel/palette.json` is
 //    every colour of the dowel theme resolved for nitid's accent, in both
