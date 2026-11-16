@@ -35,15 +35,15 @@ const PATIENCE: Duration = Duration::from_secs(60);
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Where cargo put a binary of this build. Asked of cargo rather than worked
+/// out from where the test itself is: that place moved between toolchains, and
+/// every test here stopped finding the program.
 fn binary(name: &str) -> PathBuf {
-    let mut dir = std::env::current_exe().expect("the test's own path");
-    dir.pop();
-    if dir.ends_with("deps") {
-        dir.pop();
-    }
-    let exe = dir.join(name);
-    assert!(exe.exists(), "{} is not built", exe.display());
-    exe
+    PathBuf::from(match name {
+        "nitid.exe" => env!("CARGO_BIN_EXE_nitid"),
+        "nitidw.exe" => env!("CARGO_BIN_EXE_nitidw"),
+        other => panic!("{other} is not a binary of this build"),
+    })
 }
 
 /// Both executables with `extra` on the end of each. A program does not read
@@ -233,7 +233,10 @@ impl Stand {
         common::keep_data_in(&mut command, self.dir.path())
             .env("NITID_INSTANCE_ID", &self.tag)
             .env("NITID_UPDATE_FEED", self.feed.address())
-            .env("NITID_UPDATE_CURRENT", "0.0.1");
+            .env("NITID_UPDATE_CURRENT", "0.0.1")
+            // Whatever the machine running the gate is really connected
+            // through: a test that passes only off a hotspot is no test.
+            .env("NITID_UPDATE_NETWORK", "open");
         command
     }
 
@@ -575,6 +578,75 @@ fn an_up_to_date_resident_downloads_nothing() {
     std::thread::sleep(Duration::from_secs(2));
     assert_eq!(stand.feed.archive_asks.load(Ordering::SeqCst), 0, "an up-to-date copy downloaded the release");
     assert_eq!(stand.on_disk(), before);
+}
+
+/// On a connection that counts its bytes the resident asks and stops there:
+/// the release is noted as held and nothing of it is fetched. At the next
+/// start on an open connection it goes at once, though the day has not come
+/// round - a laptop that is on a hotspot every morning would otherwise never
+/// be asked at the right hour.
+#[test]
+fn a_metered_connection_holds_the_release_until_an_open_one() {
+    let stand = Stand::new("metered");
+    let new = pair_with(b"");
+    stand.feed.offer(VERSION, zip_of(&new));
+    // Off while the old copy goes in, so the resident its install starts asks
+    // nothing before the connection is the one this test means.
+    stand.settings("updates = off\n");
+    stand.install_old();
+    let before = stand.on_disk();
+    stand.stop_resident();
+    stand.settings("");
+
+    let resident = |network: &str| {
+        Parked(
+            stand
+                .command(&stand.installed().join("nitidw.exe"))
+                .env("NITID_UPDATE_NETWORK", network)
+                .arg("--resident")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("starting the resident"),
+        )
+    };
+
+    let metered = resident("metered");
+    until("the resident did not ask", || stand.feed.manifest_asks.load(Ordering::SeqCst) >= 1);
+    until("the release was not noted as held", || stand.state().contains(&format!("held = {VERSION}")));
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        stand.feed.archive_asks.load(Ordering::SeqCst),
+        0,
+        "the release was downloaded on a metered connection"
+    );
+    assert_eq!(stand.on_disk(), before);
+    assert!(!stand.state().contains("failed"), "holding back was recorded as a failure: {}", stand.state());
+
+    stand.stop_resident();
+    drop(metered);
+    let _open = resident("open");
+    let wanted: Vec<Vec<u8>> = new.iter().map(|(_, bytes)| bytes.clone()).collect();
+    until("the held release was not installed on an open connection", || stand.on_disk() == wanted);
+    until("the release was still noted as held", || !stand.state().contains("held"));
+}
+
+/// A person who asks on a metered connection has said the bytes are worth it.
+#[test]
+fn asked_for_on_a_metered_connection_the_update_installs() {
+    let stand = Stand::new("meteredasked");
+    let new = pair_with(b"");
+    stand.feed.offer(VERSION, zip_of(&new));
+    stand.settings("updates = off\n");
+    stand.install_old();
+
+    let mut command = stand.command(&stand.installed().join("nitid.exe"));
+    command.env("NITID_UPDATE_NETWORK", "metered").arg("update");
+    let output = finished(command);
+    assert!(output.status.success(), "{}", said(&output));
+    let wanted: Vec<Vec<u8>> = new.iter().map(|(_, bytes)| bytes.clone()).collect();
+    assert_eq!(stand.on_disk(), wanted);
 }
 
 /// A resident run from a build asks nobody anything: it has nothing to replace,

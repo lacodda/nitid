@@ -14,6 +14,10 @@
 //! over the one before with the one before's own updater, so a break here is
 //! found before it can strand anybody.
 //!
+//! On a connection that counts its bytes the question is still asked, and the
+//! download waits for one that does not ([`network`]) - unless a person asked,
+//! which is them saying the bytes are worth it.
+//!
 //! What is fetched is believed in a fixed order: the digest and the size the
 //! manifest gave, then the zip's own checksums, then the program itself saying
 //! which version it is. Nothing is run or put in place before the digest
@@ -24,6 +28,7 @@
 
 mod feed;
 mod http;
+mod network;
 mod state;
 mod unzip;
 
@@ -37,6 +42,7 @@ use windows::Win32::Security::Cryptography::{BCRYPT_SHA256_ALG_HANDLE, BCryptHas
 use crate::APPLY_UPDATE_ARGUMENT;
 use crate::config::{Config, Updates};
 use feed::{Feed, Release, Version};
+use network::Network;
 use state::State;
 
 /// How far apart GitHub is asked.
@@ -248,6 +254,9 @@ pub enum Said {
     Latest(Version),
     /// A newer one is installing itself, and will say so when it has.
     Installing,
+    /// A newer one is out, and its download waits for a connection that does
+    /// not count the bytes.
+    Held(Version),
     /// GitHub could not be reached.
     NoAnswer,
     /// Something answered and it went wrong.
@@ -261,17 +270,39 @@ impl Said {
         match self {
             Self::Latest(version) => Some(("nitid is up to date".to_string(), format!("v{version} is the latest release."))),
             Self::Installing => None,
+            Self::Held(version) => Some((
+                format!("nitid v{version} is out"),
+                "It will be fetched on a connection that is not metered.".to_string(),
+            )),
             Self::NoAnswer => Some(("nitid could not ask".to_string(), "No answer from GitHub. It will ask again later.".to_string())),
             Self::Failed(why) => Some(("nitid did not update".to_string(), why.clone())),
         }
     }
 }
 
-/// One go: ask, and if there is something newer, set it installing.
+/// On whose word the network is being used.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Who {
+    /// Someone pressed Check for updates.
+    Person,
+    /// The day came round.
+    Clock,
+}
+
+/// Whether a release that is known to be newer is fetched now.
+///
+/// A person asking has decided what their connection is for. The clock has
+/// not, and puts the download off where the bytes are counted.
+fn fetches(who: Who, network: Network) -> bool {
+    who == Who::Person || network == Network::Open
+}
+
+/// One go: ask, and if there is something newer, set it installing - or hold
+/// it for a better connection.
 ///
 /// Returns once the new version is running on its own. That process stops the
 /// resident this runs in, so nothing after it here matters.
-fn attempt(current: Version) -> Said {
+fn attempt(current: Version, who: Who) -> Said {
     let feed = match Feed::new() {
         Ok(feed) => feed,
         Err(error) => return Said::Failed(format!("{error:#}")),
@@ -288,8 +319,20 @@ fn attempt(current: Version) -> Said {
         // The trouble it was reporting is behind it, or has stopped mattering.
         let mut state = State::load();
         state.failed = None;
+        state.held = None;
         state.save();
         return Said::Latest(current);
+    }
+    // Asked here rather than before the question: the question is cheap on
+    // any connection, and this is the moment the answer matters.
+    let fetching = fetches(who, network::now());
+    let mut state = State::load();
+    // Let go of before the download rather than after it: a release that
+    // fails to install is tried again tomorrow, not at every wake.
+    state.held = (!fetching).then_some(release.version);
+    state.save();
+    if !fetching {
+        return Said::Held(release.version);
     }
     match fetch(&feed, &release).and_then(|stage| start_installing(&stage)) {
         Ok(()) => Said::Installing,
@@ -313,6 +356,15 @@ fn start_installing(stage: &Path) -> Result<()> {
 /// round.
 fn due(updates: Updates, checked: Option<u64>, now: u64) -> bool {
     updates == Updates::Automatic && checked.is_none_or(|at| at > now || now - at >= DAY)
+}
+
+/// Whether a release held back on a metered connection can be gone for now.
+///
+/// Without this it would wait for the next daily question, and a laptop that
+/// spends its mornings on a hotspot would ask there every day and never be on
+/// the right connection at the right hour.
+fn held_can_go(updates: Updates, held: Option<Version>, current: Version, network: Network) -> bool {
+    updates == Updates::Automatic && held.is_some_and(|held| held > current) && network == Network::Open
 }
 
 fn now() -> u64 {
@@ -343,9 +395,16 @@ pub fn watch(tell: impl Fn(Said) + Send + 'static) -> Sender<()> {
             // Read each time, so the switch in the settings needs no message
             // to reach here and no restart to take effect.
             if person_asked {
-                tell(attempt(Version::current()));
-            } else if due(Config::load().updates, State::load().checked, now()) {
-                let _ = attempt(Version::current());
+                tell(attempt(Version::current(), Who::Person));
+                continue;
+            }
+            let updates = Config::load().updates;
+            let state = State::load();
+            let current = Version::current();
+            // The network is asked about only when something is held: on
+            // every other wake its answer would change nothing.
+            if due(updates, state.checked, now()) || (state.held.is_some() && held_can_go(updates, state.held, current, network::now())) {
+                let _ = attempt(current, Who::Clock);
             }
         }
     });
@@ -373,6 +432,11 @@ pub fn status() -> String {
 fn describe(state: &State, current: Version, now: u64) -> String {
     if let Some(failed) = &state.failed {
         return format!("This is v{current}. The last update did not go through: {failed}");
+    }
+    if let Some(held) = state.held.filter(|held| *held > current) {
+        return format!(
+            "This is v{current}; v{held} is out and will be fetched on a connection that is not metered. Check for updates on the icon's menu fetches it now."
+        );
     }
     if let Some(latest) = state.latest.filter(|latest| *latest > current) {
         return format!("This is v{current}; v{latest} is out.");
@@ -455,6 +519,30 @@ mod tests {
         assert!(due(Updates::Automatic, Some(at + 1_000_000), at));
     }
 
+    /// The whole rule of the metered connection: the clock waits, a person
+    /// does not.
+    #[test]
+    fn only_the_clock_waits_for_an_open_connection() {
+        assert!(fetches(Who::Clock, Network::Open));
+        assert!(!fetches(Who::Clock, Network::Metered), "the daily update downloaded on a metered connection");
+        assert!(fetches(Who::Person, Network::Metered), "someone asked for the update and was made to wait");
+        assert!(fetches(Who::Person, Network::Open));
+    }
+
+    /// What was held goes as soon as the connection allows, without waiting
+    /// for the day to come round - and only then.
+    #[test]
+    fn a_held_release_goes_when_the_connection_opens() {
+        let current = version("0.43.0");
+        let held = Some(version("0.44.0"));
+        assert!(held_can_go(Updates::Automatic, held, current, Network::Open));
+        assert!(!held_can_go(Updates::Automatic, held, current, Network::Metered));
+        assert!(!held_can_go(Updates::Automatic, None, current, Network::Open), "nothing was held");
+        assert!(!held_can_go(Updates::Off, held, current, Network::Open), "switched off, it still went");
+        // Installed some other way in the meantime: there is nothing to fetch.
+        assert!(!held_can_go(Updates::Automatic, Some(current), current, Network::Open));
+    }
+
     #[test]
     fn the_command_takes_check_and_nothing_else() {
         assert_eq!(Asked::parse(&[]).expect("no arguments"), Asked::Install);
@@ -510,6 +598,18 @@ mod tests {
         };
         assert_eq!(describe(&ahead, current, now), "This is v0.42.0, the latest 2 hours ago.");
 
+        // Held back is said with what would end the wait.
+        let held = State {
+            held: Some(version("0.43.0")),
+            ..behind.clone()
+        };
+        assert_eq!(
+            describe(&held, current, now),
+            "This is v0.42.0; v0.43.0 is out and will be fetched on a connection that is not metered. Check for updates on the icon's menu fetches it now."
+        );
+        // Installed since by some other way: nothing is waiting any more.
+        assert_eq!(describe(&held, version("0.43.0"), now), "This is v0.43.0, the latest 2 hours ago.");
+
         // The reason outranks everything: it is what someone opened this for.
         let failed = State {
             failed: Some("the disk is full".to_string()),
@@ -529,5 +629,6 @@ mod tests {
         assert!(Said::NoAnswer.words().is_some());
         assert!(Said::Failed("why".to_string()).words().is_some_and(|(_, text)| text == "why"));
         assert_eq!(Said::Installing.words(), None);
+        assert!(Said::Held(version("0.43.0")).words().is_some_and(|(title, _)| title.contains("v0.43.0")));
     }
 }

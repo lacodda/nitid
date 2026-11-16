@@ -23,6 +23,8 @@ pub struct State {
     pub news: Option<Version>,
     /// Why the last attempt to update did not go through.
     pub failed: Option<String>,
+    /// A newer release whose download was put off on a metered connection.
+    pub held: Option<Version>,
 }
 
 impl State {
@@ -59,6 +61,7 @@ impl State {
                 "checked" => state.checked = value.parse().ok(),
                 "latest" => state.latest = Version::parse(value),
                 "news" => state.news = Version::parse(value),
+                "held" => state.held = Version::parse(value),
                 "failed" => state.failed = (!value.is_empty()).then(|| value.to_string()),
                 _ => {}
             }
@@ -76,6 +79,9 @@ impl State {
         }
         if let Some(news) = self.news {
             out.push_str(&format!("news = {news}\n"));
+        }
+        if let Some(held) = self.held {
+            out.push_str(&format!("held = {held}\n"));
         }
         if let Some(failed) = &self.failed {
             // One line: an error from the system can run to several, and the
@@ -107,6 +113,7 @@ mod tests {
             latest: Version::parse("0.43.0"),
             news: Version::parse("0.42.0"),
             failed: Some("the disk is full".to_string()),
+            held: Version::parse("0.44.0"),
         };
         assert_eq!(State::parse(&state.render()), state);
         assert_eq!(State::parse(&State::default().render()), State::default());

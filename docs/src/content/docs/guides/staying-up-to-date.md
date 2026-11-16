@@ -11,10 +11,25 @@ press and nothing to restart.
 A window already open keeps the version it started as until you close it; the
 next one is the new version.
 
+## On a metered connection
+
+On a connection Windows knows as metered - a phone's hotspot, a plan with a
+data limit, roaming - nitid still asks, which takes a few hundred bytes, and
+puts the download off. It fetches the release within an hour of the machine
+being on a connection that is not metered. *Settings → Updates* says when a
+release is waiting like this.
+
+**Check for updates** on the icon's menu and `nitid update` do not wait: when
+you ask, the release is fetched on whatever connection there is. Windows calls a
+network metered when you mark it so in *Settings → Network & internet*, or when
+the carrier's plan says it is. See
+[ADR 0047](https://github.com/lacodda/nitid/blob/main/docs/adr/0047-a-metered-connection-is-asked-on-and-not-downloaded-on.md).
+
 ## What leaves the machine
 
 One request a day, for one small file: the newest release's description. When
-that names something newer, a second request fetches its zip. GitHub sees that
+that names something newer, a second request fetches its zip - on a metered
+connection, later. GitHub sees that
 someone asked and from what address. The requests carry no version number and no
 identifier, nothing says which pictures you look at, and no picture or file name
 ever leaves the machine.

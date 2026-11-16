@@ -132,5 +132,5 @@ The first release with an updater cannot be reached this way; it arrives by the
 script. Its own update path was rehearsed against its real release on the development
 machine, with `NITID_UPDATE_CURRENT` standing in for an older version.
 
-A metered connection is not treated differently. The daily question is a few hundred
-bytes, but the download is not.
+A metered connection was not treated differently at first: the daily question is a
+few hundred bytes, but the download is not. ADR 0047 changed that in v0.44.

@@ -3156,7 +3156,7 @@ fn updates_section(ui: &mut egui::Ui, updates: &mut Updates, status: Option<&str
     }
     ui.label(
         egui::RichText::new(
-            "Once a day nitid asks GitHub whether there is a newer release, and installs it in the background. GitHub sees that someone asked, and from what address. \
+            "Once a day nitid asks GitHub whether there is a newer release, and installs it in the background - on a metered connection the download waits for one that is not. GitHub sees that someone asked, and from what address. \
              Nothing else is sent, and no picture or file name ever leaves this machine.",
         )
         .weak()
