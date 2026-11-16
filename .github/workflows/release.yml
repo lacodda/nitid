@@ -13,15 +13,25 @@ name: Release
 #
 # `furca release run` pushes the tag and waits for this workflow; `release.toml`
 # names the files the page has to carry.
+#
+# Started by hand with a tag, it does all of it again for that tag: the way a
+# release whose rehearsal failed for a reason outside the program is taken
+# through it without a new number.
 on:
   push:
     tags: ['v[0-9]+.[0-9]+.[0-9]+']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The tag to build, rehearse and publish, spelt as the tag is (vX.Y.Z)
+        required: true
 
 permissions:
   contents: write
 
 env:
   CARGO_TERM_COLOR: always
+  TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   release:
@@ -30,6 +40,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          ref: refs/tags/${{ env.TAG }}
           # git-cliff reads the whole history to write the changelog section.
           fetch-depth: 0
 
@@ -43,7 +54,7 @@ jobs:
       - name: Verify the tag matches the manifest
         shell: bash
         run: |
-          tag="${GITHUB_REF_NAME#v}"
+          tag="${TAG#v}"
           manifest=$(cargo metadata --no-deps --format-version 1 \
             | jq -r '.packages[0].version')
           if [ "$tag" != "$manifest" ]; then
@@ -63,7 +74,7 @@ jobs:
           # association pointing at nothing (ADR 0004).
           cp target/release/nitid.exe target/release/nitidw.exe dist/
           cp README.md LICENSE dist/
-          7z a "nitid-${GITHUB_REF_NAME}-x86_64-pc-windows-msvc.zip" ./dist/*
+          7z a "nitid-${TAG}-x86_64-pc-windows-msvc.zip" ./dist/*
 
       # What every installed copy reads to learn there is something newer
       # (`src/update/feed.rs`). Copies already out there go on reading this
@@ -72,9 +83,9 @@ jobs:
       - name: Write the update manifest
         shell: bash
         run: |
-          archive="nitid-${GITHUB_REF_NAME}-x86_64-pc-windows-msvc.zip"
+          archive="nitid-${TAG}-x86_64-pc-windows-msvc.zip"
           {
-            echo "version = ${GITHUB_REF_NAME#v}"
+            echo "version = ${TAG#v}"
             echo "archive = $archive"
             echo "sha256 = $(sha256sum "$archive" | cut -d' ' -f1)"
             echo "size = $(stat -c %s "$archive")"
@@ -105,6 +116,7 @@ jobs:
           # Drafted rather than published: the jobs below install it on clean
           # machines before anyone can download it.
           draft: true
+          tag_name: ${{ env.TAG }}
           body_path: RELEASE_NOTES.md
           files: |
             nitid-*.zip
@@ -122,7 +134,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release download $env:GITHUB_REF_NAME --repo $env:GITHUB_REPOSITORY --pattern "nitid-*.zip" --dir fetched
+          gh release download $env:TAG --repo $env:GITHUB_REPOSITORY --pattern "nitid-*.zip" --dir fetched
           if ($LASTEXITCODE -ne 0) { throw "the draft's archive could not be fetched" }
           Expand-Archive (Get-ChildItem fetched -Filter "nitid-*.zip").FullName -DestinationPath unpacked
       - name: Install
@@ -139,7 +151,7 @@ jobs:
             $built = (Get-FileHash (Join-Path unpacked $program) -Algorithm SHA256).Hash
             if ($installed -ne $built) { throw "$program in $dir is not the one in the archive" }
           }
-          $version = $env:GITHUB_REF_NAME.TrimStart("v")
+          $version = $env:TAG.TrimStart("v")
           $said = & (Join-Path $dir "nitid.exe") --version
           if ($said -ne "nitid $version") { throw "the installed copy says '$said'" }
           if (-not (Test-Path "HKCU:\Software\Classes\lacodda.nitid.image")) { throw "nitid is not registered for pictures" }
@@ -158,23 +170,27 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ env.TAG }}
       - name: Lay the draft out as the releases are
         shell: powershell
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = $env:GITHUB_REF_NAME
-          New-Item -ItemType Directory -Force "feed\latest\download", "feed\download\$tag" | Out-Null
-          gh release download $tag --repo $env:GITHUB_REPOSITORY --pattern "update.txt" --dir "feed\latest\download"
+          $release = $env:TAG
+          New-Item -ItemType Directory -Force "feed\latest\download", "feed\download\$release" | Out-Null
+          gh release download $release --repo $env:GITHUB_REPOSITORY --pattern "update.txt" --dir "feed\latest\download"
           if ($LASTEXITCODE -ne 0) { throw "the draft's manifest could not be fetched" }
-          gh release download $tag --repo $env:GITHUB_REPOSITORY --pattern "nitid-*.zip" --dir "feed\download\$tag"
+          gh release download $release --repo $env:GITHUB_REPOSITORY --pattern "nitid-*.zip" --dir "feed\download\$release"
           if ($LASTEXITCODE -ne 0) { throw "the draft's archive could not be fetched" }
       - name: Update from the release before this one
         shell: powershell
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = $env:GITHUB_REF_NAME
+          # Not $tag: the installer piped in below sets a variable of that
+          # name, to the release it was told to install.
+          $release = $env:TAG
           $previous = gh release list --repo $env:GITHUB_REPOSITORY --exclude-drafts --limit 1 --json tagName --jq ".[0].tagName"
           if (-not $previous) { throw "no published release to come from" }
 
@@ -187,14 +203,14 @@ jobs:
           try {
             $env:NITID_UPDATE_FEED = "http://127.0.0.1:8471"
             & $exe update
-            if ($LASTEXITCODE -ne 0) { throw "$previous could not update itself to $tag" }
+            if ($LASTEXITCODE -ne 0) { throw "$previous could not update itself to $release" }
           } finally {
             Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
           }
 
           $said = & $exe --version
-          if ($said -ne "nitid $($tag.TrimStart('v'))") { throw "after updating from $previous it says '$said'" }
-          $archive = (Get-ChildItem "feed\download\$tag" -Filter "nitid-*.zip").FullName
+          if ($said -ne "nitid $($release.TrimStart('v'))") { throw "after updating from $previous it says '$said'" }
+          $archive = (Get-ChildItem "feed\download\$release" -Filter "nitid-*.zip").FullName
           Expand-Archive $archive -DestinationPath unpacked
           $installed = (Get-FileHash $exe -Algorithm SHA256).Hash
           if ($installed -ne (Get-FileHash unpacked\nitid.exe -Algorithm SHA256).Hash) { throw "what the update left is not the draft's nitid.exe" }
@@ -208,7 +224,7 @@ jobs:
       - name: Publish the release page
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+        run: gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
 
   # And once more the way a person meets it: the script from the README and the
   # updater, through the real address. Called from here because a release
@@ -218,4 +234,4 @@ jobs:
     needs: publish
     uses: ./.github/workflows/install.yml
     with:
-      tag: ${{ github.ref_name }}
+      tag: ${{ inputs.tag || github.ref_name }}

@@ -214,7 +214,7 @@ fn nitid_is_installed_by_the_script_and_only_by_it() {
 fn the_release_carries_what_the_script_downloads() {
     let workflow = page(".github/workflows/release.yml");
     assert!(
-        workflow.contains(r#"7z a "nitid-${GITHUB_REF_NAME}-x86_64-pc-windows-msvc.zip""#),
+        workflow.contains(r#"7z a "nitid-${TAG}-x86_64-pc-windows-msvc.zip""#),
         "the release no longer packs the zip the installer downloads"
     );
     assert!(
@@ -226,11 +226,11 @@ fn the_release_carries_what_the_script_downloads() {
     // keys it requires. A key renamed here strands every copy out there.
     for line in [
         "update.txt",
-        r#"echo "version = ${GITHUB_REF_NAME#v}""#,
+        r#"echo "version = ${TAG#v}""#,
         r#"echo "archive = $archive""#,
         r#"echo "sha256 = $(sha256sum "$archive" | cut -d' ' -f1)""#,
         r#"echo "size = $(stat -c %s "$archive")""#,
-        r#"archive="nitid-${GITHUB_REF_NAME}-x86_64-pc-windows-msvc.zip""#,
+        r#"archive="nitid-${TAG}-x86_64-pc-windows-msvc.zip""#,
     ] {
         assert!(workflow.contains(line), "the release no longer writes `{line}` for the updater");
     }
