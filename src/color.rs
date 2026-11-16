@@ -1323,8 +1323,8 @@ mod tests {
         };
 
         // Grey through the matrix: each output row sums its weights.
-        for row in 0..3 {
-            let out: f32 = (0..3).map(|column| transform.matrix[row][column] * linear(column)).sum();
+        for (row, weights) in transform.matrix.iter().enumerate() {
+            let out: f32 = (0..3).map(|column| weights[column] * linear(column)).sum();
             assert!((out - 1.0).abs() < 0.05, "PQ reference white came out at {out} on row {row}");
         }
     }
@@ -1335,8 +1335,8 @@ mod tests {
         let transform = ColorTransform::new(&ColorProfile::new_display_p3(), &ColorProfile::new_srgb());
         // The matrix rows of a P3-to-sRGB transform sum to about 1.0 —
         // white maps to white. A stray PQ scale would blow this up 49-fold.
-        for row in 0..3 {
-            let sum: f32 = transform.matrix[row].iter().sum();
+        for (row, weights) in transform.matrix.iter().enumerate() {
+            let sum: f32 = weights.iter().sum();
             assert!((sum - 1.0).abs() < 0.02, "row {row} of an SDR transform sums to {sum}");
         }
     }
