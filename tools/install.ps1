@@ -116,8 +116,12 @@ try {
     if (-not (Test-Path $target)) {
         throw "nitid install finished, but $target is not there"
     }
-    $installed = (Get-FileHash $target -Algorithm SHA256).Hash
-    $fetched = (Get-FileHash $exe.FullName -Algorithm SHA256).Hash
+    # Hashed by .NET for the reason the zip is unpacked by it: Get-FileHash
+    # is a script in a module, and the module that loads may not be this
+    # PowerShell's.
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    $installed = [BitConverter]::ToString($sha256.ComputeHash([IO.File]::ReadAllBytes($target)))
+    $fetched = [BitConverter]::ToString($sha256.ComputeHash([IO.File]::ReadAllBytes($exe.FullName)))
     if ($installed -ne $fetched) {
         throw "nitid install finished, but $target is not the nitid.exe of $tag"
     }
