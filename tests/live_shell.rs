@@ -31,15 +31,15 @@ use windows::core::BOOL;
 /// How long the window is given to show a change, on a slow test machine.
 const PATIENCE: Duration = Duration::from_secs(20);
 
+/// Where cargo put a binary of this build. Asked of cargo rather than worked
+/// out from where the test itself is: that place moved between toolchains, and
+/// every test here stopped finding the program.
 fn binary(name: &str) -> PathBuf {
-    let mut dir = std::env::current_exe().expect("the test's own path");
-    dir.pop();
-    if dir.ends_with("deps") {
-        dir.pop();
-    }
-    let exe = dir.join(name);
-    assert!(exe.exists(), "{} is not built", exe.display());
-    exe
+    PathBuf::from(match name {
+        "nitid.exe" => env!("CARGO_BIN_EXE_nitid"),
+        "nitidw.exe" => env!("CARGO_BIN_EXE_nitidw"),
+        other => panic!("{other} is not a binary of this build"),
+    })
 }
 
 /// A picture written by a third-party encoder, a shade of its own.

@@ -24,12 +24,7 @@ use nitid::testing::{Orientation, prepare_wallpaper, save_orientation};
 fn with_decoder() {
     static POINTED: Once = Once::new();
     POINTED.call_once(|| {
-        let mut dir = std::env::current_exe().expect("the test's own path");
-        dir.pop();
-        if dir.ends_with("deps") {
-            dir.pop();
-        }
-        let exe = dir.join(if cfg!(windows) { "nitid.exe" } else { "nitid" });
+        let exe = env!("CARGO_BIN_EXE_nitid");
         // SAFETY: set once, before any decode in this process reads it.
         unsafe { std::env::set_var("NITID_DECODER", exe) };
     });

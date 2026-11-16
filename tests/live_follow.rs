@@ -32,14 +32,7 @@ use windows::core::BOOL;
 const PATIENCE: Duration = Duration::from_secs(20);
 
 fn viewer() -> PathBuf {
-    let mut dir = std::env::current_exe().expect("the test's own path");
-    dir.pop();
-    if dir.ends_with("deps") {
-        dir.pop();
-    }
-    let exe = dir.join("nitid.exe");
-    assert!(exe.exists(), "{} is not built", exe.display());
-    exe
+    PathBuf::from(env!("CARGO_BIN_EXE_nitid"))
 }
 
 /// A picture written by a third-party encoder, a shade of its own so no two

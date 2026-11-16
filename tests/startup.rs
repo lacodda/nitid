@@ -45,10 +45,7 @@ const RUNS: usize = 3;
 
 #[test]
 fn a_picture_reaches_the_screen_quickly() {
-    let Some(exe) = viewer_binary() else {
-        eprintln!("skipping: the viewer binary was not found next to the test");
-        return;
-    };
+    let exe = viewer_binary();
 
     let dir = tempfile::tempdir().expect("creating a temporary folder");
     let image = photo_sized_image(dir.path());
@@ -104,10 +101,7 @@ fn a_picture_reaches_the_screen_quickly() {
 /// all, so this also waits for the frame that carries it.
 #[test]
 fn the_interface_arrives_after_the_picture_and_never_before_it() {
-    let Some(exe) = viewer_binary() else {
-        eprintln!("skipping: the viewer binary was not found next to the test");
-        return;
-    };
+    let exe = viewer_binary();
 
     let dir = tempfile::tempdir().expect("creating a temporary folder");
     let image = photo_sized_image(dir.path());
@@ -173,10 +167,7 @@ fn reported(stderr: &str, prefix: &str) -> Option<f64> {
 /// number should fall to the JPEG gate and this comment should go.
 #[test]
 fn a_heic_reaches_the_screen_from_its_thumbnail() {
-    let Some(exe) = viewer_binary() else {
-        eprintln!("skipping: the viewer binary was not found next to the test");
-        return;
-    };
+    let exe = viewer_binary();
 
     let dir = tempfile::tempdir().expect("creating a temporary folder");
     let image = dir.path().join("photo.heic");
@@ -350,14 +341,11 @@ fn with_exif_thumbnail(jpeg: &[u8], thumbnail: &[u8]) -> Vec<u8> {
     out
 }
 
-/// The viewer binary sitting beside this test executable.
-fn viewer_binary() -> Option<PathBuf> {
-    let mut dir = std::env::current_exe().ok()?;
-    dir.pop(); // the test executable's own name
-    if dir.ends_with("deps") {
-        dir.pop();
-    }
-
-    let exe = dir.join(if cfg!(windows) { "nitid.exe" } else { "nitid" });
-    exe.exists().then_some(exe)
+/// The viewer binary of this build, where cargo says it is.
+///
+/// It used to be looked for beside the test executable, and a test that did
+/// not find it there skipped itself. Then a toolchain moved the test
+/// executable, and the gate on the first pixel passed for measuring nothing.
+fn viewer_binary() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_nitid"))
 }
