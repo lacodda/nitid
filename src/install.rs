@@ -178,10 +178,14 @@ pub fn install() -> Result<PathBuf> {
 
     // Reported, never fatal: a viewer the shell can open pictures with is
     // installed even if its directory could not reach the PATH.
-    match add_to_path(&target_dir) {
-        Ok(true) => crate::console::say!("Added {} to your PATH", target_dir.display()),
-        Ok(false) => {}
-        Err(error) => eprintln!("nitid: could not add {} to your PATH: {error:#}", target_dir.display()),
+    if leaves_path_alone(env::var_os("NITID_NO_PATH").as_deref()) {
+        crate::console::say!("Left your PATH as it is, as NITID_NO_PATH asks");
+    } else {
+        match add_to_path(&target_dir) {
+            Ok(true) => crate::console::say!("Added {} to your PATH", target_dir.display()),
+            Ok(false) => {}
+            Err(error) => eprintln!("nitid: could not add {} to your PATH: {error:#}", target_dir.display()),
+        }
     }
 
     // Likewise: a desktop without a shortcut is an inconvenience, not a
@@ -209,6 +213,16 @@ pub fn install() -> Result<PathBuf> {
     crate::console::say!("\"Always use this app\". Settings > Apps > Default apps works too.");
 
     Ok(target_dir)
+}
+
+/// Whether `NITID_NO_PATH` asks for the `PATH` to be left as it is.
+///
+/// The line's installers all hear `{APP}_NO_PATH`: whoever installs for a
+/// check, or keeps their `PATH` by hand, says so once for every product. Set to
+/// anything but nothing it means yes - the same reading `tools/install.ps1`
+/// gives it, so the script and the program cannot disagree.
+fn leaves_path_alone(asked: Option<&std::ffi::OsStr>) -> bool {
+    asked.is_some_and(|value| !value.is_empty())
 }
 
 /// Replace the installed copy with this one, as an update.
@@ -1149,6 +1163,17 @@ mod tests {
                 "{spelling} was not recognised as the install directory",
             );
         }
+    }
+
+    /// Set means yes, whatever it is set to; unset or empty means the install
+    /// a person expects.
+    #[test]
+    fn the_path_is_left_alone_only_when_asked() {
+        use std::ffi::OsStr;
+        assert!(!leaves_path_alone(None));
+        assert!(!leaves_path_alone(Some(OsStr::new(""))));
+        assert!(leaves_path_alone(Some(OsStr::new("1"))));
+        assert!(leaves_path_alone(Some(OsStr::new("true"))));
     }
 
     /// A PATH is the user's, and most of it belongs to other programs. The

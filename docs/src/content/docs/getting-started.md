@@ -20,7 +20,10 @@ that the copy installed is byte for byte the one it downloaded. Running it
 again repairs or upgrades, even while the viewer is open, and does not add the
 directory to the `PATH` a second time or put a second shortcut beside the first.
 Setting `$env:NITID_VERSION` to a release's tag first installs that release
-instead of the latest.
+instead of the latest, and `$env:NITID_NO_PATH = "1"` leaves your `PATH` as it
+is. With `$env:NITID_INSTALL_DIR` naming a directory, the script only puts the
+two programs there and registers nothing - a copy to try, which `nitid install`
+run from it turns into the real thing.
 
 From then on nitid keeps itself up to date, and says when it has - see
 [Staying up to date](/nitid/guides/staying-up-to-date/), which also says exactly

@@ -9,14 +9,24 @@ name: Install
 # And the updater, the same way: the release before this one, installed and
 # asked to update, over the real network from the real address. A copy out
 # there cannot be corrected, so this is the check that a release can still be
-# reached from the last.
+# reached from the last. `release.yml` rehearses both against the draft before
+# it publishes, and calls this once the release is out.
 on:
-  release:
-    types: [published]
+  workflow_call:
+    inputs:
+      tag:
+        description: The release just published (vX.Y.Z)
+        type: string
+        required: true
   push:
     branches: [main]
     paths: ['tools/install.ps1', '.github/workflows/install.yml']
   workflow_dispatch:
+    inputs:
+      tag:
+        description: A published release to hold to all of it (vX.Y.Z); empty installs the latest
+        type: string
+        required: false
 
 permissions:
   contents: read
@@ -30,27 +40,79 @@ jobs:
       # forgive what iex does not.
       - name: Install
         shell: powershell
+        env:
+          TAG: ${{ inputs.tag }}
         run: |
-          if ("${{ github.event_name }}" -eq "release") { $env:NITID_VERSION = "${{ github.event.release.tag_name }}" }
+          if ($env:TAG) { $env:NITID_VERSION = $env:TAG }
           Get-Content -Raw tools/install.ps1 | Invoke-Expression
       - name: Check what is installed
         shell: powershell
+        env:
+          TAG: ${{ inputs.tag }}
         run: |
           $exe = Join-Path $env:LOCALAPPDATA "Programs\nitid\nitid.exe"
           & $exe --version
           if (-not (Test-Path "HKCU:\Software\Classes\lacodda.nitid.image")) { throw "nitid is not registered for pictures" }
-          # What v0.41 added to the registration. Asked of the release just
-          # published only: a change to the script alone installs whichever
-          # release is latest, which may predate it.
-          if ("${{ github.event_name }}" -eq "release") {
-            if (-not (Test-Path "HKCU:\Software\Classes\Directory\shell\nitid\command")) { throw "folders have no 'Open with nitid'" }
-            $run = (Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run").nitid
-            if ($run -notlike "*nitidw.exe*--resident") { throw "the sign-in entry is '$run'" }
+          if (-not (Test-Path "HKCU:\Software\Classes\Directory\shell\nitid\command")) { throw "folders have no 'Open with nitid'" }
+          $run = (Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run").nitid
+          if ($run -notlike "*nitidw.exe*--resident") { throw "the sign-in entry is '$run'" }
+          $path = [string](Get-Item "HKCU:\Environment").GetValue("Path", "", "DoNotExpandEnvironmentNames")
+          if ($path -notlike "*Programs\nitid*") { throw "the install left nitid off the PATH" }
+
+  # The two ways of installing that register less. Held to the script as it is
+  # on this commit, against whichever release it fetches: a copy into a
+  # directory of its own touches nothing else, and NITID_NO_PATH is heard by
+  # the script. That `nitid install` hears it too is held by its own test, and
+  # here once a release carrying it is the one fetched.
+  quiet:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: A copy in a directory of its own registers nothing
+        shell: powershell
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          if ($env:TAG) { $env:NITID_VERSION = $env:TAG }
+          $env:NITID_INSTALL_DIR = Join-Path $env:RUNNER_TEMP "nitid-copy"
+          $env:NITID_NO_PATH = "1"
+          Get-Content -Raw tools/install.ps1 | Invoke-Expression
+          foreach ($program in "nitid.exe", "nitidw.exe") {
+            if (-not (Test-Path (Join-Path $env:NITID_INSTALL_DIR $program))) { throw "the copy has no $program" }
           }
+          & (Join-Path $env:NITID_INSTALL_DIR "nitid.exe") --version
+          if (Test-Path "HKCU:\Software\Classes\lacodda.nitid.image") { throw "a copy registered itself for pictures" }
+          if (Test-Path (Join-Path $env:LOCALAPPDATA "Programs\nitid")) { throw "a copy installed itself as well" }
+          $path = [string](Get-Item "HKCU:\Environment").GetValue("Path", "", "DoNotExpandEnvironmentNames")
+          if ($path -like "*nitid*") { throw "a copy reached the PATH: $path" }
+          # Twice, the second over the first: what was there steps aside and
+          # is swept, rather than stopping the copy.
+          Get-Content -Raw tools/install.ps1 | Invoke-Expression
+          $left = Get-ChildItem $env:NITID_INSTALL_DIR | ForEach-Object Name | Sort-Object
+          if (($left -join ",") -ne "nitid.exe,nitidw.exe") { throw "the second copy left $($left -join ', ')" }
+      - name: An install told to leave the PATH alone does
+        # Only a release that hears it: `nitid install` reads the variable
+        # itself, and one published before it was taught to cannot.
+        # historical versions
+        # v0.44.0 is the first that does.
+        # /historical versions
+        if: inputs.tag != ''
+        shell: powershell
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          if ([version]$env:TAG.TrimStart("v") -lt [version]"0.44.0") { Write-Host "$env:TAG does not hear NITID_NO_PATH"; exit 0 }
+          Remove-Item Env:NITID_INSTALL_DIR -ErrorAction SilentlyContinue
+          $env:NITID_VERSION = $env:TAG
+          $env:NITID_NO_PATH = "1"
+          Get-Content -Raw tools/install.ps1 | Invoke-Expression
+          if (-not (Test-Path "HKCU:\Software\Classes\lacodda.nitid.image")) { throw "nitid is not registered for pictures" }
+          $path = [string](Get-Item "HKCU:\Environment").GetValue("Path", "", "DoNotExpandEnvironmentNames")
+          if ($path -like "*Programs\nitid*") { throw "NITID_NO_PATH was set and the PATH has nitid on it: $path" }
 
   update:
     # Only a release has one before it to come from.
-    if: github.event_name == 'release'
+    if: inputs.tag != ''
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
@@ -58,7 +120,7 @@ jobs:
         shell: powershell
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.event.release.tag_name }}
+          TAG: ${{ inputs.tag }}
         run: |
           $tags = gh release list --repo $env:GITHUB_REPOSITORY --exclude-drafts --limit 20 --json tagName --jq ".[].tagName"
           $previous = $tags | Where-Object { $_ -ne $env:TAG } | Select-Object -First 1

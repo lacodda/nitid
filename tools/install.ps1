@@ -8,6 +8,14 @@
 # puts nitid on your PATH and starts it in the background for Explorer's space
 # bar. A viewer that is open while it runs keeps going; the next picture opened
 # is the new version.
+#
+# Three variables, the same three every installer of the line hears:
+#   NITID_VERSION      a release's tag (vX.Y.Z) instead of the latest
+#   NITID_NO_PATH      set, your PATH is left as it is
+#   NITID_INSTALL_DIR  a directory to put the two programs in and do nothing
+#                      else: no file types, no PATH, nothing started. A copy to
+#                      look at or to check, not an install - `nitid install`
+#                      has one place, which everything it registers names.
 $ErrorActionPreference = "Stop"
 
 $repo = "lacodda/nitid"
@@ -41,8 +49,10 @@ New-Item -ItemType Directory -Force $tmp | Out-Null
 
 # Where `nitid install` puts it. Not a choice: the registration, the PATH entry
 # and the sign-in entry all name this directory, and `nitid uninstall` finds
-# it there.
-$target = Join-Path $env:LOCALAPPDATA "Programs\nitid\nitid.exe"
+# it there. NITID_INSTALL_DIR names another only for a copy nothing registers.
+$scratch = $env:NITID_INSTALL_DIR
+$dir = if ($scratch) { $scratch } else { Join-Path $env:LOCALAPPDATA "Programs\nitid" }
+$target = Join-Path $dir "nitid.exe"
 
 try {
     $zip = Join-Path $tmp $name
@@ -66,9 +76,34 @@ try {
         throw "$name has no nitid.exe in it"
     }
 
-    & $exe.FullName install
-    if ($LASTEXITCODE -ne 0) {
-        throw "nitid install stopped with code $LASTEXITCODE"
+    if ($scratch) {
+        New-Item -ItemType Directory -Force $dir | Out-Null
+        foreach ($program in "nitid.exe", "nitidw.exe") {
+            $from = Join-Path $exe.DirectoryName $program
+            if (-not (Test-Path $from)) {
+                throw "$name has no $program in it"
+            }
+            $to = Join-Path $dir $program
+            # A running program cannot be overwritten, but it can be renamed:
+            # the old one steps aside and is deleted below, or by the next
+            # run once nothing is running it.
+            if (Test-Path $to) {
+                Move-Item $to "$to.old-$([guid]::NewGuid())" -Force
+            }
+            Copy-Item $from $to -Force
+        }
+        Get-ChildItem $dir -Filter "*.exe.old-*" -ErrorAction SilentlyContinue |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+    } else {
+        # `nitid install` does the rest, and reads NITID_NO_PATH itself before
+        # it would touch the PATH. A nitid.exe that is running - the one that
+        # listens for Explorer's space bar always is - it moves aside and
+        # sweeps up at the next install or update (`install::retire`), so
+        # nothing here has to stop anything first.
+        & $exe.FullName install
+        if ($LASTEXITCODE -ne 0) {
+            throw "nitid install stopped with code $LASTEXITCODE"
+        }
     }
 
     # The file, not the exit code, says what is installed: an install can
@@ -91,4 +126,6 @@ try {
 }
 
 Write-Host "Installed nitid $tag to $target"
-Write-Host "Open a terminal again for 'nitid' to be a command there."
+if (-not $scratch -and -not $env:NITID_NO_PATH) {
+    Write-Host "Open a terminal again for 'nitid' to be a command there."
+}
