@@ -127,7 +127,7 @@ app*. Full instructions: [Getting Started](https://lacodda.github.io/nitid/getti
 
 ## Status
 
-v0.43.0, in daily use on Windows. Startup, colour and HDR hold end to end, and
+v0.44.0, in daily use on Windows. Startup, colour and HDR hold end to end, and
 every modern still format opens. It is before 1.0: keys and settings can still
 move between versions, and it keeps itself up to date as they do. What landed
 in each version: [CHANGELOG](https://github.com/lacodda/nitid/blob/main/CHANGELOG.md).

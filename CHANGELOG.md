@@ -2,6 +2,27 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.44.0] - 2026-11-16
+
+### Build
+- Pin pnpm and update astro past two advisories
+- Draw the mark's rasters with lyrn assets
+
+### CI
+- Rehearse the draft on clean machines, then publish
+
+### Documentation
+- Say the status in four lines
+
+### Features
+- Put the download off on a metered connection
+- Leave the PATH alone or only copy, when asked
+
+### Testing
+- Find the built viewer where cargo says it is
+- Walk the matrix by its rows, as clippy 1.100 asks
+- Find the decoder from a test cargo put elsewhere
+
 ## [0.43.0] - 2026-11-10
 
 ### Bug Fixes
