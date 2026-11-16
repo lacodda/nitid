@@ -68,7 +68,11 @@ try {
     }
 
     $unpacked = Join-Path $tmp "unpacked"
-    Expand-Archive $zip -DestinationPath $unpacked -Force
+    # .NET's own unzip rather than Expand-Archive: Windows PowerShell started
+    # from PowerShell 7 inherits its module path, loads the wrong Archive
+    # module and fails before it has read a byte.
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [IO.Compression.ZipFile]::ExtractToDirectory($zip, $unpacked)
     # Found in the unpacked tree rather than at a guessed path: the zip's
     # layout is the release workflow's to choose.
     $exe = Get-ChildItem $unpacked -Recurse -Filter "nitid.exe" | Select-Object -First 1
