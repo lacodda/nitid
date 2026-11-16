@@ -73,7 +73,8 @@ separator is refused rather than quietly moving the file somewhere else.
 `Ctrl+Shift+1`-`9` copy it there instead of moving it. The folders are set in
 the Files section of the settings; a key with nothing set says so rather than
 doing something surprising. The digits carry `Ctrl` because bare `0` and `1`
-have fitted the picture to the window and shown it at 100% since v0.1.0, and a
+have fitted the picture to the window and shown it at 100% since the first
+release, and a
 sorting key added later does not get to take a viewing gesture that has been
 there from the beginning.
 

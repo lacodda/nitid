@@ -58,7 +58,7 @@ pollster = "1"
 
 # Decoders, all pure Rust: a malformed file costs a panic, never code
 # execution. HEIC included — see `docs/adr/0007-heic-decodes-in-rust.md`, which
-# records why the sandbox built in v0.6.0 stays empty for it.
+# records why the sandbox built for it stays empty of it.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "tiff"] }
 zune-jpeg = "0.5"
 # `moxcms` so jxl-oxide manages colour with the same engine as the rest of the
