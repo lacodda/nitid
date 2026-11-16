@@ -101,6 +101,7 @@ a second.
 From there, arrow keys walk the folder, `?` shows every key, `I` says what the
 file says about itself, `H` draws a histogram of its own values, and `C` reads
 the pixel under the pointer in both the file's terms and the display's.
+
 `P` and `X` mark a picture as kept or rejected while you go through a shoot,
 and `M` then walks only the ones you marked. When two frames of a burst are
 too close to call, `V` puts them side by side and `Enter` keeps the better one
@@ -126,14 +127,10 @@ app*. Full instructions: [Getting Started](https://lacodda.github.io/nitid/getti
 
 ## Status
 
-v0.43.0, in daily use on Windows. Startup, colour and HDR hold end to end;
-every modern still format opens, the animated ones play, and pictures past a
-GPU texture's limit are drawn as tiles. Cropping, turning and stripping
-metadata run without an encoder; frames are culled two at a time; prints come
-out in the colour on screen. From a terminal it describes pictures and
-converts them; from Explorer it is a space bar away, from the taskbar a right
-click; and it keeps itself up to date. What landed in each
-version: [CHANGELOG](https://github.com/lacodda/nitid/blob/main/CHANGELOG.md).
+v0.43.0, in daily use on Windows. Startup, colour and HDR hold end to end, and
+every modern still format opens. It is before 1.0: keys and settings can still
+move between versions, and it keeps itself up to date as they do. What landed
+in each version: [CHANGELOG](https://github.com/lacodda/nitid/blob/main/CHANGELOG.md).
 
 ## Documentation
 
