@@ -1,0 +1,38 @@
+# How nitid is released, read by furca's release engine: `furca release plan`
+# says what the next release is and what stands in its way, `furca release run`
+# carries it out - bump, changelog, gate, commit, push, green CI, tag - then
+# checks what went out and installs it here. `lyrn check` reads it too.
+# Reference: https://lacodda.github.io/furca/reference/release/
+
+[project]
+name = "nitid"
+changelog = "CHANGELOG.md"
+manifests = ["Cargo.toml"]
+# ADRs record what happened: the versions they name are history.
+as_written = ["docs/adr/"]
+
+[gate]
+# Formatting only: it takes seconds and compiles nothing. The rest of the gate
+# is CI, which the run waits for before the tag.
+commands = [
+    "cargo fmt --check",
+]
+
+[ci]
+provider = "github"
+workflow = "ci.yml"
+# What the tag starts: the build, the draft, its rehearsal on two clean
+# machines, and the publish. Nothing goes to a registry before v1.0.0.
+publish = "release.yml"
+
+# The files the tag's release page has to carry: the zip the installer
+# fetches, and the manifest every installed copy reads to find it.
+[page]
+assets = [
+    "nitid-{tag}-x86_64-pc-windows-msvc.zip",
+    "update.txt",
+]
+
+# nitid is installed for the owner from the release by tools/install.ps1, and
+# proven to be the release's own build.
+[post.install]

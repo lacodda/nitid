@@ -32,6 +32,15 @@ lints for the Linux target from Windows - it needs
 `rustup component add llvm-tools`, and says so if either is missing. With both
 green, a green terminal here means a green pull request.
 
+## Releasing
+
+`furca release run` does all of it from [`release.toml`](https://github.com/lacodda/nitid/blob/main/release.toml):
+the bump, the changelog's section, the commit, the wait for CI, the tag. The tag
+starts `release.yml`, which drafts the release, installs it on two clean
+machines - from nothing, and over the release before by that release's own
+updater - and only then publishes it. See
+[ADR 0048](https://github.com/lacodda/nitid/blob/main/docs/adr/0048-a-release-is-rehearsed-by-its-workflow-and-then-published.md).
+
 ## Architecture decisions
 
 Anything that would be asked about again later is written down in

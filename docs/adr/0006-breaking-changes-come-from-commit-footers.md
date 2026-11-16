@@ -63,7 +63,8 @@ it writes to the very top of the file, so with the header it duplicates the
 title block, and with `--strip header` the new section lands *above* the title.
 Both were tried and both were wrong. `tools/changelog.py vX.Y.Z` generates the
 section and inserts it after the header, which is the actual intent — run that
-at release time.
+at release time. (Since v0.44 the release engine does exactly this as its
+`changelog` step, and the script is gone: ADR 0048.)
 
 The release workflow is unaffected: it runs `--latest --strip header` into
 `RELEASE_NOTES.md`, which never touches `CHANGELOG.md`.

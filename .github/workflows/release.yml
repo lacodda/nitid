@@ -1,8 +1,18 @@
 name: Release
 
-# A tag is the only trigger: pushing `vX.Y.Z` builds the binary and drafts a
-# release. Publishing to the registries waits for v1.0.0, when the surface
-# and the configuration are stable enough to be depended on.
+# A tag is the only trigger: pushing `vX.Y.Z` builds the binaries, drafts the
+# release, rehearses it and only then publishes it. Publishing to the
+# registries waits for v1.0.0, when the surface and the configuration are
+# stable enough to be depended on.
+#
+# The rehearsal is what the draft is for. Every installed copy fetches a
+# published release within a day and none of them can be corrected afterwards
+# (ADR 0043), so before anyone is offered this one, two clean machines have
+# installed it: one from nothing, and one over the release before it, with
+# that release's own updater. A release that fails either stays a draft.
+#
+# `furca release run` pushes the tag and waits for this workflow; `release.toml`
+# names the files the page has to carry.
 on:
   push:
     tags: ['v[0-9]+.[0-9]+.[0-9]+']
@@ -71,21 +81,141 @@ jobs:
           } > update.txt
           cat update.txt
 
-      - name: Write the release notes
+      - name: Generate the changelog section
         uses: orhun/git-cliff-action@v4
         with:
           config: cliff.toml
           args: --latest --strip header
         env:
-          OUTPUT: RELEASE_NOTES.md
+          OUTPUT: CHANGES.md
+
+      # The changelog's section, then the checklist the release is taken
+      # through: `furca release run` ticks its first box once the install is
+      # proven, and `lyrn check --release` says which are still open.
+      - name: Write the release notes
+        shell: bash
+        run: |
+          cat CHANGES.md > RELEASE_NOTES.md
+          printf '\n\n' >> RELEASE_NOTES.md
+          cat .github/release-notes.md >> RELEASE_NOTES.md
 
       - name: Draft the release
         uses: softprops/action-gh-release@v3
         with:
-          # Drafted rather than published: the binary is checked on a real
-          # machine before anyone can download it.
+          # Drafted rather than published: the jobs below install it on clean
+          # machines before anyone can download it.
           draft: true
           body_path: RELEASE_NOTES.md
           files: |
             nitid-*.zip
             update.txt
+
+  # From nothing, the way `tools/install.ps1` does it once the release is out:
+  # the zip unpacked and `nitid install` run from it.
+  installs:
+    name: Installs on a clean machine
+    needs: release
+    runs-on: windows-latest
+    steps:
+      - name: Fetch the draft's archive
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download $env:GITHUB_REF_NAME --repo $env:GITHUB_REPOSITORY --pattern "nitid-*.zip" --dir fetched
+          if ($LASTEXITCODE -ne 0) { throw "the draft's archive could not be fetched" }
+          Expand-Archive (Get-ChildItem fetched -Filter "nitid-*.zip").FullName -DestinationPath unpacked
+      - name: Install
+        shell: powershell
+        run: |
+          & unpacked\nitid.exe install
+          if ($LASTEXITCODE -ne 0) { throw "nitid install stopped with code $LASTEXITCODE" }
+      - name: Check what is installed
+        shell: powershell
+        run: |
+          $dir = Join-Path $env:LOCALAPPDATA "Programs\nitid"
+          foreach ($program in "nitid.exe", "nitidw.exe") {
+            $installed = (Get-FileHash (Join-Path $dir $program) -Algorithm SHA256).Hash
+            $built = (Get-FileHash (Join-Path unpacked $program) -Algorithm SHA256).Hash
+            if ($installed -ne $built) { throw "$program in $dir is not the one in the archive" }
+          }
+          $version = $env:GITHUB_REF_NAME.TrimStart("v")
+          $said = & (Join-Path $dir "nitid.exe") --version
+          if ($said -ne "nitid $version") { throw "the installed copy says '$said'" }
+          if (-not (Test-Path "HKCU:\Software\Classes\lacodda.nitid.image")) { throw "nitid is not registered for pictures" }
+          if (-not (Test-Path "HKCU:\Software\Classes\Directory\shell\nitid\command")) { throw "folders have no 'Open with nitid'" }
+          $run = (Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run").nitid
+          if ($run -notlike "*nitidw.exe*--resident") { throw "the sign-in entry is '$run'" }
+
+  # Over the release before it, by that release's own updater. The updater
+  # reads the published address, which a draft is not at, so this machine
+  # stands in for it: `NITID_UPDATE_FEED` accepts 127.0.0.1 and nothing else,
+  # and the files served there are the draft's own, laid out as GitHub lays
+  # them out. The same run through the real address follows the publish.
+  updates:
+    name: Updates from the release before
+    needs: release
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Lay the draft out as the releases are
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          New-Item -ItemType Directory -Force "feed\latest\download", "feed\download\$tag" | Out-Null
+          gh release download $tag --repo $env:GITHUB_REPOSITORY --pattern "update.txt" --dir "feed\latest\download"
+          if ($LASTEXITCODE -ne 0) { throw "the draft's manifest could not be fetched" }
+          gh release download $tag --repo $env:GITHUB_REPOSITORY --pattern "nitid-*.zip" --dir "feed\download\$tag"
+          if ($LASTEXITCODE -ne 0) { throw "the draft's archive could not be fetched" }
+      - name: Update from the release before this one
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $previous = gh release list --repo $env:GITHUB_REPOSITORY --exclude-drafts --limit 1 --json tagName --jq ".[0].tagName"
+          if (-not $previous) { throw "no published release to come from" }
+
+          $env:NITID_VERSION = $previous
+          Get-Content -Raw tools/install.ps1 | Invoke-Expression
+          $exe = Join-Path $env:LOCALAPPDATA "Programs\nitid\nitid.exe"
+          & $exe --version
+
+          $server = Start-Process python -ArgumentList "-m", "http.server", "8471", "--bind", "127.0.0.1", "--directory", "feed" -PassThru -WindowStyle Hidden
+          try {
+            $env:NITID_UPDATE_FEED = "http://127.0.0.1:8471"
+            & $exe update
+            if ($LASTEXITCODE -ne 0) { throw "$previous could not update itself to $tag" }
+          } finally {
+            Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
+          }
+
+          $said = & $exe --version
+          if ($said -ne "nitid $($tag.TrimStart('v'))") { throw "after updating from $previous it says '$said'" }
+          $archive = (Get-ChildItem "feed\download\$tag" -Filter "nitid-*.zip").FullName
+          Expand-Archive $archive -DestinationPath unpacked
+          $installed = (Get-FileHash $exe -Algorithm SHA256).Hash
+          if ($installed -ne (Get-FileHash unpacked\nitid.exe -Algorithm SHA256).Hash) { throw "what the update left is not the draft's nitid.exe" }
+          if (-not (Test-Path "HKCU:\Software\Classes\lacodda.nitid.image")) { throw "the update lost the registration" }
+
+  publish:
+    name: Publish
+    needs: [installs, updates]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish the release page
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+
+  # And once more the way a person meets it: the script from the README and the
+  # updater, through the real address. Called from here because a release
+  # published by a workflow's own token starts no workflow of its own.
+  out:
+    name: Out
+    needs: publish
+    uses: ./.github/workflows/install.yml
+    with:
+      tag: ${{ github.ref_name }}
