@@ -173,7 +173,33 @@ fn decoder_executable() -> Result<std::path::PathBuf> {
 
     let mut exe = std::env::current_exe().context("finding this executable")?;
     exe.set_file_name(if cfg!(windows) { "nitid.exe" } else { "nitid" });
+    #[cfg(debug_assertions)]
+    if !exe.is_file()
+        && let Some(built) = built_above(&exe)
+    {
+        return Ok(built);
+    }
     Ok(exe)
+}
+
+/// The decoder of this build, for a test executable that cargo did not put
+/// beside it.
+///
+/// A test is not `nitidw.exe`: where cargo keeps it relative to the binaries
+/// is cargo's business, and 1.100 moved it four directories down from where
+/// every test here had been finding the decoder by accident. So a development
+/// build that has no sibling looks up through the directories above it. Not
+/// compiled into a release: what ships has its sibling or says it has not,
+/// and never goes looking for a program to run.
+#[cfg(all(windows, debug_assertions))]
+fn built_above(sibling: &std::path::Path) -> Option<std::path::PathBuf> {
+    let name = sibling.file_name()?;
+    sibling
+        .ancestors()
+        .skip(2)
+        .take(5)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
 }
 
 /// Run as the decoder: read a file on stdin, write pixels on stdout.
