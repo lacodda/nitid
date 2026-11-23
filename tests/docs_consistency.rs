@@ -14,8 +14,7 @@
 //! followed them: pointing it at the README after the move would have left it
 //! passing on text that is no longer there to be wrong.
 //!
-//! This is a slice of the `release_consistency` test v0.40.0 is for, brought
-//! forward because the seam is open now.
+//! What has to agree before a release goes out is `release_consistency`'s.
 
 use std::collections::BTreeSet;
 
@@ -40,10 +39,6 @@ fn keys_page() -> String {
 
 fn formats_page() -> String {
     page("docs/src/content/docs/reference/formats.md")
-}
-
-fn readme() -> String {
-    page("README.md")
 }
 
 /// Strip the markdown a table cell wraps a key in.
@@ -114,17 +109,6 @@ fn the_reference_lists_the_formats_the_viewer_opens() {
     );
 }
 
-/// The version in the manifest is the one the README's status line names.
-///
-/// The status paragraph opens with the version, which is the first thing a
-/// visitor checks and the easiest thing to leave behind at release time.
-#[test]
-fn the_readme_names_the_version_in_the_manifest() {
-    let version = env!("CARGO_PKG_VERSION");
-    let readme = readme();
-    assert!(readme.contains(&format!("v{version}")), "the README's status line does not name v{version}",);
-}
-
 fn command_line_page() -> String {
     page("docs/src/content/docs/reference/command-line.md")
 }
@@ -178,67 +162,22 @@ fn the_command_line_page_shows_what_help_says() {
     assert!(undocumented.is_empty(), "--help names these options and the page does not: {undocumented:?}");
 }
 
-/// The command the installer says it is run with, from its own header.
-fn install_command() -> String {
-    let script = page("tools/install.ps1");
-    let mut lines = script.lines();
-    lines
-        .find(|line| line.starts_with("# nitid installer for Windows:"))
-        .and_then(|_| lines.next())
-        .map(|line| line.trim_start_matches('#').trim().to_string())
-        .expect("tools/install.ps1 has no `installer for Windows:` header naming its command")
-}
-
-/// Installing is one command (owner's decision, 2026-10-07): the README and the
-/// getting-started page are where a person copies it from, so both carry
-/// exactly the command the script says it is run with, and neither offers a
-/// second way in that the script knows nothing about.
+/// The page about Explorer names every extension nitid draws thumbnails for
+/// and no other, so a format that joins them cannot arrive undocumented and one
+/// the page promises is one that comes.
 #[test]
-fn nitid_is_installed_by_the_script_and_only_by_it() {
-    let command = install_command();
-    assert_eq!(command, "irm https://raw.githubusercontent.com/lacodda/nitid/main/tools/install.ps1 | iex");
-
-    for relative in ["README.md", "docs/src/content/docs/getting-started.md"] {
-        let text = page(relative);
-        assert!(text.contains(&command), "{relative} does not show `{command}`");
-        for other in ["Download the zip", "releases page", ".msi", "cargo install", "winget", "scoop install"] {
-            assert!(!text.contains(other), "{relative} mentions `{other}`, a way to install that the script is not");
-        }
-    }
-}
-
-/// The release is packed with exactly what the script fetches and runs: an
-/// asset renamed in one place is an installer that answers 404, and a zip
-/// without both binaries is one `nitid install` refuses to install.
-#[test]
-fn the_release_carries_what_the_script_downloads() {
-    let workflow = page(".github/workflows/release.yml");
-    assert!(
-        workflow.contains(r#"7z a "nitid-${TAG}-x86_64-pc-windows-msvc.zip""#),
-        "the release no longer packs the zip the installer downloads"
-    );
-    assert!(
-        workflow.contains("cp target/release/nitid.exe target/release/nitidw.exe dist/"),
-        "the release no longer packs both binaries"
-    );
-
-    // What every installed copy reads, by the name it asks for and with the
-    // keys it requires. A key renamed here strands every copy out there.
-    for line in [
-        "update.txt",
-        r#"echo "version = ${TAG#v}""#,
-        r#"echo "archive = $archive""#,
-        r#"echo "sha256 = $(sha256sum "$archive" | cut -d' ' -f1)""#,
-        r#"echo "size = $(stat -c %s "$archive")""#,
-        r#"archive="nitid-${TAG}-x86_64-pc-windows-msvc.zip""#,
-    ] {
-        assert!(workflow.contains(line), "the release no longer writes `{line}` for the updater");
-    }
-
-    let script = page("tools/install.ps1");
-    assert!(script.contains(r#"$name = "nitid-$tag-x86_64-pc-windows-msvc.zip""#));
-    assert!(
-        script.contains("& $exe.FullName install"),
-        "the script no longer runs `nitid install` from the release"
-    );
+fn the_explorer_page_lists_what_gets_a_thumbnail() {
+    let page = page("docs/src/content/docs/guides/working-from-explorer.md");
+    let section = page
+        .split("## Thumbnails")
+        .nth(1)
+        .and_then(|rest| rest.split("\n## ").next())
+        .expect("the page has no section about thumbnails");
+    let promised: BTreeSet<&str> = section
+        .split('`')
+        .filter(|code| code.len() > 1 && code.starts_with('.') && code[1..].chars().all(char::is_alphanumeric))
+        .map(|code| &code[1..])
+        .collect();
+    let drawn: BTreeSet<&str> = nitid::testing::thumbnail_extensions().into_iter().collect();
+    assert_eq!(promised, drawn);
 }
