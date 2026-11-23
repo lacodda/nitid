@@ -298,6 +298,16 @@ impl Stand {
             .to_vec()
     }
 
+    /// Whether the installed pair is `wanted`, asked while an update may be
+    /// landing: between its two renames a file is under neither name, which is
+    /// not there yet rather than something wrong.
+    fn has_become(&self, wanted: &[Vec<u8>]) -> bool {
+        ["nitid.exe", "nitidw.exe"]
+            .iter()
+            .zip(wanted)
+            .all(|(name, wanted)| fs::read(self.installed().join(name)).is_ok_and(|there| there == *wanted))
+    }
+
     fn state(&self) -> String {
         fs::read_to_string(self.dir.path().join("lacodda").join("nitid").join("update").join("state")).unwrap_or_default()
     }
@@ -519,7 +529,7 @@ fn the_resident_keeps_the_copy_current_on_its_own() {
     stand.install_old();
 
     let wanted: Vec<Vec<u8>> = new.iter().map(|(_, bytes)| bytes.clone()).collect();
-    until("the resident did not install the release", || stand.on_disk() == wanted);
+    until("the resident did not install the release", || stand.has_become(&wanted));
     until("the new resident did not start", || stand.resident_running());
     // The new resident takes the news once it is up. Its window comes first,
     // so this waits: the point is that it is taken and not left to be told
@@ -659,7 +669,7 @@ fn a_metered_connection_holds_the_release_until_an_open_one() {
     drop(metered);
     let _open = resident("open");
     let wanted: Vec<Vec<u8>> = new.iter().map(|(_, bytes)| bytes.clone()).collect();
-    until("the held release was not installed on an open connection", || stand.on_disk() == wanted);
+    until("the held release was not installed on an open connection", || stand.has_become(&wanted));
     until("the release was still noted as held", || !stand.state().contains("held"));
 }
 
