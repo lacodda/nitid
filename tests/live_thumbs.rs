@@ -292,10 +292,7 @@ fn a_decoder_that_hangs_is_ended() {
 #[test]
 fn without_the_program_there_is_no_thumbnail() {
     let dll = Dll::alone();
-    let error = dll
-        .thumbnail(&png(30, 30, |_, _| [1, 2, 3, 255]), 256)
-        .err()
-        .expect("a thumbnail out of nothing");
+    let error = dll.thumbnail(&png(30, 30, |_, _| [1, 2, 3, 255]), 256).expect_err("a thumbnail out of nothing");
     assert_eq!(error.code(), E_FAIL);
     assert!(dll.can_unload());
 }
