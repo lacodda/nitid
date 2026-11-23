@@ -4,9 +4,9 @@
 # Installs - or updates - nitid for the current user, from the latest release:
 # no administrator, nothing outside your own account. It downloads the
 # release's zip and runs `nitid install` from it, which is what copies nitid to
-# %LOCALAPPDATA%\Programs\nitid, registers the file types and the folder menu,
-# puts nitid on your PATH and starts it in the background for Explorer's space
-# bar. A viewer that is open while it runs keeps going; the next picture opened
+# %LOCALAPPDATA%\Programs\nitid, registers the file types, the folder menu and
+# thumbnails for what Windows cannot draw, puts nitid on your PATH and starts it
+# in the background for Explorer's space bar. A viewer that is open while it runs keeps going; the next picture opened
 # is the new version.
 #
 # Three variables, the same three every installer of the line hears:

@@ -14,8 +14,9 @@ The script downloads the latest release and runs `nitid install` from it,
 which copies nitid to `%LOCALAPPDATA%\Programs\nitid`, registers the file
 types it can open and *Open with nitid* on folders, puts that directory on
 your `PATH` so `nitid` works as a command, starts nitid in the background for
-Explorer's space bar, and leaves a shortcut on your desktop - no
-administrator, nothing outside your own user account. The script then checks
+Explorer's space bar, draws Explorer's thumbnails for the formats Windows
+cannot, and leaves a shortcut on your desktop - no administrator, nothing
+outside your own user account. The script then checks
 that the copy installed is byte for byte the one it downloaded. Running it
 again repairs or upgrades, even while the viewer is open, and does not add the
 directory to the `PATH` a second time or put a second shortcut beside the first.
@@ -36,6 +37,8 @@ The zip carries two executables and both are installed: `nitid.exe` is the one
 to run from a terminal, and `nitidw.exe` is what the shell opens files with.
 The second exists so that double-clicking an image never flashes a console
 window — see [ADR 0004](https://github.com/lacodda/nitid/blob/main/docs/adr/0004-two-binaries-console-and-windowed.md).
+Installing writes a third file beside them, `nitid_thumbs.dll`, which is what
+Windows asks for [thumbnails](/nitid/guides/working-from-explorer/#thumbnails).
 
 Windows keeps the choice of default application to itself: no program is
 allowed to seize a file type. After installing, nitid appears under **Open
@@ -44,8 +47,8 @@ nitid and tick *Always use this app*. It also shows up in *Settings → Apps →
 Default apps*.
 
 `nitid uninstall` stops nitid in the background and removes the files, the
-registration, the folder menu, the sign-in entry, the `PATH` entry, the
-desktop shortcut, what the updater keeps, and the desktop picture's schedule if
+registration, the folder menu, the thumbnails, the sign-in entry, the `PATH`
+entry, the desktop shortcut, what the updater keeps, and the desktop picture's schedule if
 one is running.
 
 ## The first minute

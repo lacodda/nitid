@@ -79,6 +79,9 @@ mod startup;
 #[cfg(windows)]
 mod taskbar;
 mod theme;
+// Explorer's thumbnails: the part that makes one is everywhere a decoder is,
+// the part that is registered with Windows is Windows'.
+mod thumbs;
 mod tiles;
 // Asking GitHub for a newer release and installing it: the resident's and
 // `nitid update`'s, and through WinHTTP and the shell all Windows' own.
@@ -217,6 +220,37 @@ pub mod testing {
         crate::image_source::supported_extensions()
     }
 
+    /// The programs an install puts in place.
+    #[cfg(windows)]
+    pub fn executables() -> [&'static str; 2] {
+        crate::install::EXECUTABLES
+    }
+
+    /// The extensions nitid draws Explorer's thumbnails for where Windows
+    /// does not, for the test that holds the page about it to them.
+    pub fn thumbnail_extensions() -> Vec<&'static str> {
+        Format::ALL
+            .iter()
+            .filter(|format| format.explorer_may_not_draw())
+            .flat_map(|format| format.extensions().iter().copied())
+            .collect()
+    }
+
+    /// The thumbnail DLL this build carries, the name it is installed under
+    /// and its class, for the gate that loads it the way Explorer's host does.
+    #[cfg(windows)]
+    pub fn thumbnail_provider() -> (&'static str, &'static [u8], u128) {
+        (crate::thumbs::shell::FILE, crate::thumbs::shell::PROVIDER, crate::thumbs::wire::CLASS)
+    }
+
+    /// The pictures Windows is asked to decode to learn whether it can, which
+    /// are also the smallest real file of each of those formats a gate can
+    /// have.
+    #[cfg(windows)]
+    pub fn thumbnail_samples() -> Vec<(&'static str, Vec<u8>)> {
+        crate::thumbs::samples::all()
+    }
+
     /// Whether a resident is running under the instance `id` names, and
     /// telling it to go: for the test that starts two and expects one.
     #[cfg(windows)]
@@ -284,7 +318,12 @@ enum Command {
     /// Not a command anyone types. The viewer launches its own executable this
     /// way so a C decoder runs somewhere it can do no harm — see
     /// `docs/adr/0002-sandbox-c-decoders.md`.
-    Decode,
+    ///
+    /// Whole, or made small for a thumbnail.
+    Decode(sandbox::Wanted),
+    /// Make a thumbnail of the picture on stdin, no longer than this on its
+    /// long side. The thumbnail DLL's way in, and nobody else's. See `thumbs`.
+    Thumb(u32),
     /// The desktop's picture: from a folder on a schedule, the next one now,
     /// or no longer changing. See `wallpaper`.
     Wallpaper(wallpaper::Asked),
@@ -327,7 +366,7 @@ pub fn run(windowed: bool) -> ExitCode {
     if windowed
         && !matches!(
             command,
-            Command::View(_) | Command::Peek(_) | Command::Resident | Command::Decode | Command::ApplyUpdate | Command::Wallpaper(wallpaper::Asked::Next)
+            Command::View(_) | Command::Peek(_) | Command::Resident | Command::Decode(_) | Command::ApplyUpdate | Command::Wallpaper(wallpaper::Asked::Next)
         )
     {
         return delegate_to_console_binary();
@@ -360,7 +399,8 @@ pub fn run(windowed: bool) -> ExitCode {
             crate::console::say!("nitid {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        Command::Decode => sandbox::run_as_decoder(),
+        Command::Decode(wanted) => sandbox::run_as_decoder(wanted),
+        Command::Thumb(side) => thumbs::command(side),
         Command::Wallpaper(asked) => wallpaper::command(asked),
         Command::Info(asked) => info::command(asked),
         Command::Convert(asked) => convert::command(asked),
@@ -504,7 +544,19 @@ fn parse(args: impl Iterator<Item = OsString>) -> Command {
         },
         // Leading dashes, so it cannot be mistaken for a file: every other
         // unrecognised argument is treated as a path.
-        Some(sandbox::DECODE_ARGUMENT) => Command::Decode,
+        Some(sandbox::DECODE_ARGUMENT) => match args.next() {
+            // The thumbnail DLL's spelling, which an older version answers
+            // rather than opening a window on: see `thumbs::wire`.
+            Some(next) if next == thumbs::wire::THUMB => match thumbs::side(args.next()) {
+                Some(side) => Command::Thumb(side),
+                None => Command::Mistake(format!("{} needs the longest side of the thumbnail", thumbs::wire::THUMB)),
+            },
+            _ => Command::Decode(sandbox::Wanted::Whole),
+        },
+        Some(sandbox::DECODE_THUMB_ARGUMENT) => match thumbs::side(args.next()) {
+            Some(side) => Command::Decode(sandbox::Wanted::Small(side)),
+            None => Command::Mistake(format!("{} needs the longest side of the thumbnail", sandbox::DECODE_THUMB_ARGUMENT)),
+        },
         Some(RESIDENT_ARGUMENT) => Command::Resident,
         Some(PEEK_ARGUMENT) => Command::Peek(args.map(PathBuf::from).collect()),
         Some(APPLY_UPDATE_ARGUMENT) => Command::ApplyUpdate,
@@ -647,8 +699,26 @@ mod tests {
     /// take its place: an unrecognised bare word is opened as a path.
     #[test]
     fn the_decoder_argument_is_not_a_path() {
-        assert!(matches!(parse_args(&[sandbox::DECODE_ARGUMENT]), Command::Decode));
+        assert!(matches!(parse_args(&[sandbox::DECODE_ARGUMENT]), Command::Decode(sandbox::Wanted::Whole)));
         assert!(matches!(parse_args(&["decode-stdin"]), Command::View(paths) if paths.len() == 1));
+    }
+
+    /// The thumbnail DLL's command line is a request for a thumbnail, and the
+    /// first of it is the argument every earlier version answers without
+    /// opening a window - which is what it is spelt that way for.
+    #[test]
+    fn the_thumbnail_dlls_command_line_opens_no_window() {
+        use thumbs::wire::{ASKED_FIRST, LONGEST, THUMB};
+        assert_eq!(ASKED_FIRST, sandbox::DECODE_ARGUMENT);
+        assert!(matches!(parse_args(&[ASKED_FIRST, THUMB, "256"]), Command::Thumb(256)));
+        assert!(matches!(parse_args(&[ASKED_FIRST, THUMB, "99999"]), Command::Thumb(LONGEST)));
+        assert!(matches!(parse_args(&[ASKED_FIRST, THUMB]), Command::Mistake(_)));
+        assert!(matches!(parse_args(&[ASKED_FIRST, THUMB, "0"]), Command::Mistake(_)));
+        assert!(matches!(
+            parse_args(&[sandbox::DECODE_THUMB_ARGUMENT, "96"]),
+            Command::Decode(sandbox::Wanted::Small(96))
+        ));
+        assert!(matches!(parse_args(&[sandbox::DECODE_THUMB_ARGUMENT, "large"]), Command::Mistake(_)));
     }
 
     /// A file really can be called `install`; the shell passes a qualified

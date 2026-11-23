@@ -129,6 +129,9 @@ jobs:
     needs: release
     runs-on: windows-latest
     steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ env.TAG }}
       - name: Fetch the draft's archive
         shell: powershell
         env:
@@ -158,6 +161,11 @@ jobs:
           if (-not (Test-Path "HKCU:\Software\Classes\Directory\shell\nitid\command")) { throw "folders have no 'Open with nitid'" }
           $run = (Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run").nitid
           if ($run -notlike "*nitidw.exe*--resident") { throw "the sign-in entry is '$run'" }
+          if (-not (Test-Path (Join-Path $dir "nitid_thumbs.dll"))) { throw "the install wrote no nitid_thumbs.dll" }
+      # Windows itself, asked for the thumbnail of a picture in each format.
+      - name: Ask Windows for thumbnails
+        shell: powershell
+        run: tools/check-thumbnails.ps1
 
   # Over the release before it, by that release's own updater. The updater
   # reads the published address, which a draft is not at, so this machine
@@ -215,6 +223,14 @@ jobs:
           $installed = (Get-FileHash $exe -Algorithm SHA256).Hash
           if ($installed -ne (Get-FileHash unpacked\nitid.exe -Algorithm SHA256).Hash) { throw "what the update left is not the draft's nitid.exe" }
           if (-not (Test-Path "HKCU:\Software\Classes\lacodda.nitid.image")) { throw "the update lost the registration" }
+          # The release before may have had no thumbnails to keep: they come
+          # inside the two programs an update takes.
+          $dll = Join-Path $env:LOCALAPPDATA "Programs\nitid\nitid_thumbs.dll"
+          for ($i = 0; $i -lt 30 -and -not (Test-Path $dll); $i++) { Start-Sleep -Seconds 1 }
+          if (-not (Test-Path $dll)) { throw "the update brought no nitid_thumbs.dll" }
+      - name: Ask Windows for thumbnails
+        shell: powershell
+        run: tools/check-thumbnails.ps1
 
   publish:
     name: Publish

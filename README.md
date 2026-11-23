@@ -69,6 +69,9 @@ difference, not the function.
 - **A glance from Explorer.** `Space` on a picture selected in Explorer or on
   the desktop puts it on screen, `Space` again puts it away - and
   *Open with nitid* on a folder walks its pictures from the first.
+- **Thumbnails where Windows has none.** Explorer shows JPEG XL, HEIC, AVIF and
+  SVG as pictures instead of icons on a machine without their codecs, each read
+  in the sandbox and none of it inside Explorer.
 - **One window.** Opening a second image hands it to the viewer already
   running, so a multi-select does not scatter windows across the desktop.
 - **Nothing about you leaves the machine.** Once a day nitid asks GitHub whether
@@ -116,9 +119,9 @@ irm https://raw.githubusercontent.com/lacodda/nitid/main/tools/install.ps1 | iex
 ```
 
 This installs nitid to `%LOCALAPPDATA%\Programs\nitid` from the latest
-release, registers the file types it opens and *Open with nitid* on folders,
-puts it on your `PATH` and starts it in the background for Explorer's space
-bar - no administrator, nothing outside your own user account. From then on it
+release, registers the file types it opens, *Open with nitid* on folders and
+thumbnails for what Windows cannot draw, puts it on your `PATH` and starts it in
+the background for Explorer's space bar - no administrator, nothing outside your own user account. From then on it
 keeps itself up to date; `nitid uninstall` removes all of it.
 
 Windows keeps the choice of default application to itself, so after installing,

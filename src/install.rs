@@ -37,6 +37,10 @@ const APPLICATION_KEY: &str = r"Software\Classes\Applications\nitidw.exe";
 /// `nitid.exe` is the one to run from a terminal; `nitidw.exe` is what the
 /// shell opens files with. See
 /// `docs/adr/0004-two-binaries-console-and-windowed.md`.
+///
+/// Two, and it stays two: a copy out there takes these out of the release that
+/// replaces it and nothing else. Whatever more an install needs travels inside
+/// them, as the thumbnail DLL does.
 pub const EXECUTABLES: [&str; 2] = ["nitid.exe", "nitidw.exe"];
 
 /// The binary the shell launches for a file association.
@@ -120,7 +124,7 @@ fn sandboxed() -> bool {
 
 /// The registry everything here is written under: the user's, or a test's
 /// own corner of it.
-fn hive() -> Result<Key> {
+pub(crate) fn hive() -> Result<Key> {
     let tag = crate::single::instance_tag();
     let path = if tag.is_empty() {
         String::new()
@@ -204,6 +208,18 @@ pub fn install() -> Result<PathBuf> {
         Err(error) => eprintln!("nitid: could not start nitid in the background: {error:#}"),
     }
 
+    // Last, and not fatal. To learn what Windows draws by itself this has it
+    // decode a picture, which loads whatever codecs the machine has into this
+    // process; one of them going wrong must find everything else done.
+    match crate::thumbs::shell::install(&target_dir) {
+        Ok(drawn) if drawn.is_empty() => {}
+        Ok(drawn) => crate::console::say!(
+            "Explorer shows thumbnails through nitid for what Windows here cannot draw: {}",
+            drawn.join(", ")
+        ),
+        Err(error) => eprintln!("nitid: could not register thumbnails for Explorer: {error:#}"),
+    }
+
     crate::console::say!("Once a day nitid asks GitHub for a newer release and installs it; Settings > Updates switches that off");
 
     crate::console::say!();
@@ -267,6 +283,13 @@ pub fn update() -> Result<()> {
 
     if was_running && let Err(error) = crate::resident::start(&target_dir) {
         eprintln!("nitid: could not start nitid in the background: {error:#}");
+    }
+
+    // Last, for the reason it is in `install`.
+    if outcome.is_ok()
+        && let Err(error) = crate::thumbs::shell::install(&target_dir)
+    {
+        eprintln!("nitid: could not register thumbnails for Explorer: {error:#}");
     }
 
     outcome.map(|_| ())
@@ -495,7 +518,7 @@ impl Swap {
 /// A name already taken is passed over and never cleared: it may be the very
 /// copy an undo is about to bring back. `sweep_retired_in` is what clears them,
 /// before a swap begins.
-fn retire(target: &Path) -> Result<PathBuf> {
+pub(crate) fn retire(target: &Path) -> Result<PathBuf> {
     let name = target.file_name().context("an executable with no name")?.to_string_lossy().into_owned();
     for attempt in 0..1000 {
         let retired = target.with_file_name(if attempt == 0 {
@@ -520,7 +543,7 @@ fn sweep_retired_in(dir: &Path) {
     };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        let ours = EXECUTABLES.iter().any(|executable| name.starts_with(executable));
+        let ours = EXECUTABLES.iter().chain([&crate::thumbs::shell::FILE]).any(|file| name.starts_with(file));
         if ours && (name.ends_with(".old") || name.ends_with(".new")) {
             let _ = fs::remove_file(entry.path());
         }
@@ -562,6 +585,10 @@ pub fn uninstall() -> Result<()> {
     crate::console::say!("Removed the file type registration");
 
     let dir = install_dir()?;
+    match crate::thumbs::shell::uninstall(&dir) {
+        Ok(()) => crate::console::say!("Removed the thumbnails Explorer showed through nitid"),
+        Err(error) => eprintln!("nitid: could not remove the thumbnails' registration: {error:#}"),
+    }
     match remove_from_path(&dir) {
         Ok(true) => crate::console::say!("Removed {} from your PATH", dir.display()),
         Ok(false) => {}
@@ -811,13 +838,17 @@ fn remove_legacy_keys() -> Result<()> {
 /// that already says the same is left unwritten, and a registration with
 /// nothing new in it is not announced to the shell, which rereads its icons
 /// when told, flicker and all.
-struct Writer {
+pub(crate) struct Writer {
     hive: Key,
-    changed: bool,
+    pub(crate) changed: bool,
 }
 
 impl Writer {
-    fn set(&mut self, key: &str, name: &str, value: &str) -> Result<()> {
+    pub(crate) fn new() -> Result<Self> {
+        Ok(Self { hive: hive()?, changed: false })
+    }
+
+    pub(crate) fn set(&mut self, key: &str, name: &str, value: &str) -> Result<()> {
         let key = self.hive.create(key).with_context(|| format!("creating {key}"))?;
         if key.get_string(name).is_ok_and(|current| current == value) {
             return Ok(());
@@ -840,7 +871,7 @@ fn register(exe: &Path, asked: Asked) -> Result<()> {
     let exe = exe.to_string_lossy().to_string();
     let open_command = format!("\"{exe}\" \"%1\"");
     let icon = format!("\"{exe}\",0");
-    let mut writer = Writer { hive: hive()?, changed: false };
+    let mut writer = Writer::new()?;
 
     // The ProgID: what the shell shows and how it launches us.
     let progid = format!(r"Software\Classes\{PROGID}");
@@ -898,7 +929,7 @@ fn register(exe: &Path, asked: Asked) -> Result<()> {
 /// Without it a window already open keeps the menu and the icons it read
 /// before; with it they are read again at once. Best effort, like the PATH's
 /// announcement: the registry is right either way.
-fn announce_association_change() {
+pub(crate) fn announce_association_change() {
     use windows::Win32::UI::Shell::{SHCNE_ASSOCCHANGED, SHCNF_IDLIST, SHChangeNotify};
     if !sandboxed() {
         unsafe { SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None) };
@@ -1411,6 +1442,9 @@ mod tests {
             "nitid.exe.7.old",
             "nitidw.exe.old",
             "nitidw.exe.new",
+            "nitid_thumbs.dll",
+            "nitid_thumbs.dll.old",
+            "nitid_thumbs.dll.new",
             "nitid.exe",
             "nitidw.exe",
             "mine.old",
@@ -1430,7 +1464,10 @@ mod tests {
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .collect();
         left.sort();
-        assert_eq!(left, ["mine.old", "nitid.exe", "nitid.exe.2.old", "nitidw.exe", "notes.txt"]);
+        assert_eq!(
+            left,
+            ["mine.old", "nitid.exe", "nitid.exe.2.old", "nitid_thumbs.dll", "nitidw.exe", "notes.txt"]
+        );
         drop(holding);
     }
 

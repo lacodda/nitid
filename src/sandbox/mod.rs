@@ -40,7 +40,7 @@ use std::io::{self, Read, Write};
 use anyhow::{Context, Result};
 
 use crate::format::Format;
-use crate::image_source::LoadedImage;
+use crate::image_source::{DecodedImage, LoadedImage};
 
 /// The argument that turns this executable into a decoder.
 ///
@@ -49,12 +49,35 @@ use crate::image_source::LoadedImage;
 /// may legitimately be called `install`.
 pub const DECODE_ARGUMENT: &str = "--decode-stdin";
 
+/// The argument that turns it into one that answers with a thumbnail, the
+/// longest side of which follows. The request is the same request.
+pub const DECODE_THUMB_ARGUMENT: &str = "--decode-thumb";
+
+/// What a decoder is asked to send back.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Wanted {
+    /// The picture, and everything the viewer needs to show it.
+    Whole,
+    /// A copy no longer than this on its long side: upright, in sRGB, at
+    /// eight bits (`thumbs::make`).
+    ///
+    /// Made small in the child rather than here. The picture and the thumbnail
+    /// a camera put in it are both the file's, so both are read there - and
+    /// what crosses is a quarter of a megabyte instead of fifty.
+    Small(u32),
+}
+
 /// How long a decode may take before the child is killed.
 ///
 /// A decoder that has not answered in half a minute is either wedged on a
 /// crafted file or looping; either way the viewer must not wait for it.
 #[cfg(windows)]
 const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The same for a thumbnail, where somebody is waiting for a whole folder of
+/// them and a missing one costs an icon in its place.
+#[cfg(windows)]
+const THUMB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// The timeout, or a shorter one asked for through the environment.
 ///
@@ -63,12 +86,15 @@ const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// a wedged decoder would ship unexercised — which is the state it was in
 /// from v0.6.0 until now.
 #[cfg(windows)]
-fn timeout() -> std::time::Duration {
+fn timeout(wanted: Wanted) -> std::time::Duration {
     std::env::var("NITID_DECODE_TIMEOUT_MS")
         .ok()
         .and_then(|value| value.parse().ok())
         .map(std::time::Duration::from_millis)
-        .unwrap_or(TIMEOUT)
+        .unwrap_or(match wanted {
+            Wanted::Whole => TIMEOUT,
+            Wanted::Small(_) => THUMB_TIMEOUT,
+        })
 }
 
 /// Decode `bytes` in a sandboxed child process.
@@ -78,7 +104,41 @@ fn timeout() -> std::time::Duration {
 /// the entire point of the boundary.
 #[cfg(windows)]
 pub fn decode(bytes: &[u8], format: Format) -> Result<LoadedImage> {
-    windows::decode(bytes, format, timeout())
+    windows::decode(bytes, format, timeout(Wanted::Whole))
+}
+
+/// Make a thumbnail of `bytes` in a sandboxed child process: upright sRGB at
+/// eight bits, no longer than `side`.
+///
+/// Every format, not only the ones the viewer sandboxes. The viewer opens what
+/// a person chose to open; a thumbnail is made of whatever is in the folder,
+/// by nobody's choice, which is a file from a stranger more often than not.
+/// Not even the format is worked out on this side.
+#[cfg(windows)]
+pub fn thumbnail(bytes: &[u8], side: u32) -> Result<DecodedImage> {
+    let wanted = Wanted::Small(side);
+    let image = windows::ask(bytes, wanted, timeout(wanted))?;
+    // Read by the same rules as any reply, which hold the pixels to the size
+    // it claims; what is left is whether that is the size it was asked for.
+    anyhow::ensure!(
+        image.depth == 8 && (1..=side).contains(&image.width) && (1..=side).contains(&image.height),
+        "the decoder returned {}x{} at {} bits for a thumbnail of {side}",
+        image.width,
+        image.height,
+        image.depth
+    );
+    Ok(DecodedImage {
+        width: image.width,
+        height: image.height,
+        pixels: image.pixels,
+        depth: crate::image_source::Depth::Eight,
+    })
+}
+
+/// Off Windows there is no sandbox, as for a decode.
+#[cfg(not(windows))]
+pub fn thumbnail(bytes: &[u8], side: u32) -> Result<DecodedImage> {
+    crate::thumbs::make(bytes, side)
 }
 
 /// Bind `port` on loopback and report whether any connection arrives within
@@ -202,12 +262,13 @@ fn built_above(sibling: &std::path::Path) -> Option<std::path::PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-/// Run as the decoder: read a file on stdin, write pixels on stdout.
+/// Run as the decoder: read a file on stdin, write what is `wanted` of it on
+/// stdout.
 ///
 /// This is the whole of the child process. It never returns an error to the
 /// caller — a file that will not decode is reported down the pipe, because the
 /// viewer needs the reason and an exit code cannot carry one.
-pub fn run_as_decoder() -> Result<()> {
+pub fn run_as_decoder(wanted: Wanted) -> Result<()> {
     let mut input = Vec::new();
     io::stdin().read_to_end(&mut input).context("reading the request")?;
 
@@ -262,30 +323,47 @@ pub fn run_as_decoder() -> Result<()> {
         return Ok(());
     }
 
-    match decode_in_this_process(&request) {
-        Ok(loaded) => {
-            let image = protocol::RawImage {
-                width: loaded.image.width,
-                height: loaded.image.height,
-                depth: match loaded.image.depth {
-                    crate::image_source::Depth::Eight => 8,
-                    crate::image_source::Depth::Sixteen => 16,
-                },
-                pixels: loaded.image.pixels,
-                orientation: loaded.orientation.to_exif(),
-                // A profile that will not re-encode is sent as none rather
-                // than failing the decode: the picture is worth more than the
-                // colour management on it.
-                profile: loaded.profile.and_then(|profile| profile.encode().ok()).unwrap_or_default(),
-            };
-            answer_with_image(&mut out, &image, section_handle)
-        }
+    match answer_to(&request, wanted) {
+        Ok(image) => answer_with_image(&mut out, &image, section_handle),
         Err(error) => protocol::write_failure(&mut out, &format!("{error:#}")),
     }
     .context("answering the request")?;
 
     out.flush().context("flushing the reply")?;
     Ok(())
+}
+
+/// What is wanted of the file the decoder was handed, in the shape a reply
+/// carries.
+fn answer_to(request: &[u8], wanted: Wanted) -> Result<protocol::RawImage> {
+    if let Wanted::Small(side) = wanted {
+        let image = crate::thumbs::make(request, side)?;
+        return Ok(protocol::RawImage {
+            width: image.width,
+            height: image.height,
+            depth: 8,
+            pixels: image.pixels,
+            // Upright and in sRGB already, which leaves nothing to say.
+            orientation: 1,
+            profile: Vec::new(),
+        });
+    }
+
+    let loaded = decode_in_this_process(request)?;
+    Ok(protocol::RawImage {
+        width: loaded.image.width,
+        height: loaded.image.height,
+        depth: match loaded.image.depth {
+            crate::image_source::Depth::Eight => 8,
+            crate::image_source::Depth::Sixteen => 16,
+        },
+        pixels: loaded.image.pixels,
+        orientation: loaded.orientation.to_exif(),
+        // A profile that will not re-encode is sent as none rather
+        // than failing the decode: the picture is worth more than the
+        // colour management on it.
+        profile: loaded.profile.and_then(|profile| profile.encode().ok()).unwrap_or_default(),
+    })
 }
 
 /// Send the image back — through the shared section when the viewer offered

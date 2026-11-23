@@ -38,9 +38,9 @@ use windows::Win32::System::JobObjects::{
 use windows::Win32::System::Threading::{OpenProcessToken, ResumeThread, TerminateProcess, WaitForSingleObject};
 use windows::core::{PCWSTR, w};
 
-use super::protocol;
 use super::section::Section;
 use super::spawn::{AppContainer, SpawnedChild};
+use super::{Wanted, protocol};
 use crate::format::Format;
 use crate::image_source::{DecodedImage, Depth, Fidelity, LoadedImage, Orientation};
 
@@ -83,7 +83,7 @@ fn container() -> Option<&'static AppContainer> {
 /// bug, which it also recorded.) The fallback exists for a machine where the
 /// profile cannot be registered at all, and is reported once: silently
 /// weakening a boundary is how gaps become surprises.
-fn launch(exe: &std::path::Path) -> Result<SpawnedChild> {
+fn launch(exe: &std::path::Path, arguments: &str) -> Result<SpawnedChild> {
     // The lever the fallback tests pull: without a way to refuse the
     // container on purpose, the restricted-token path would only ever run on
     // the machine where something already went wrong. Nothing in normal use
@@ -91,7 +91,7 @@ fn launch(exe: &std::path::Path) -> Result<SpawnedChild> {
     let refused = std::env::var_os("NITID_NO_CONTAINER").is_some();
 
     if !refused && let Some(container) = container() {
-        match super::spawn::spawn(exe, super::DECODE_ARGUMENT, Some(container)) {
+        match super::spawn::spawn(exe, arguments, Some(container)) {
             Ok(child) => return Ok(child),
             Err(error) => {
                 static REPORTED: OnceLock<()> = OnceLock::new();
@@ -102,19 +102,24 @@ fn launch(exe: &std::path::Path) -> Result<SpawnedChild> {
         }
     }
 
-    let child = super::spawn::spawn(exe, super::DECODE_ARGUMENT, None)?;
+    let child = super::spawn::spawn(exe, arguments, None)?;
     if let Err(error) = restrict_token(child.process) {
         eprintln!("nitid: the decoder could not be restricted: {error:#}");
     }
     Ok(child)
 }
 
-/// Decode `bytes` in a confined child process.
-pub fn decode(bytes: &[u8], format: Format, timeout: Duration) -> Result<LoadedImage> {
+/// Hand `bytes` to a confined child process and take what it makes of them.
+pub fn ask(bytes: &[u8], wanted: Wanted, timeout: Duration) -> Result<protocol::RawImage> {
+    let arguments = match wanted {
+        Wanted::Whole => super::DECODE_ARGUMENT.to_string(),
+        Wanted::Small(side) => format!("{} {side}", super::DECODE_THUMB_ARGUMENT),
+    };
+
     // Created suspended, so the confinement is in place before the child runs
     // a single instruction; no window, so a decode does not flash a console
     // over the picture.
-    let mut child = launch(&super::decoder_executable()?)?;
+    let mut child = launch(&super::decoder_executable()?, &arguments)?;
 
     // From here on the child must not be left suspended and running loose: a
     // guard kills it on every path out, including a panic.
@@ -146,26 +151,31 @@ pub fn decode(bytes: &[u8], format: Format, timeout: Duration) -> Result<LoadedI
     // The child has answered or been killed; either way it is finished with.
     drop(guard);
 
-    let image = match reply? {
-        Ok(protocol::Reply::Inline(image)) => image,
+    match reply? {
+        Ok(protocol::Reply::Inline(image)) => Ok(image),
         Ok(protocol::Reply::Shared(shared)) => {
             // A decoder that answers "the pixels are in the section" when it
             // was never handed one is lying, not confused.
             let section = section.as_ref().context("the decoder answered through a section it was never given")?;
             let pixels = section.read(shared.pixel_bytes)?;
-            protocol::RawImage {
+            Ok(protocol::RawImage {
                 width: shared.width,
                 height: shared.height,
                 depth: shared.depth,
                 pixels,
                 orientation: shared.orientation,
                 profile: shared.profile,
-            }
+            })
         }
         // A file the decoder could not read is an ordinary failure carrying
         // the decoder's own words, not a sandbox event.
         Err(message) => bail!("{message}"),
-    };
+    }
+}
+
+/// Decode `bytes` in a confined child process.
+pub fn decode(bytes: &[u8], format: Format, timeout: Duration) -> Result<LoadedImage> {
+    let image = ask(bytes, Wanted::Whole, timeout)?;
 
     Ok(LoadedImage {
         orientation: Orientation::from_exif(u16::from(image.orientation)),

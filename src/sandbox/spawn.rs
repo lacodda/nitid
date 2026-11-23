@@ -127,9 +127,12 @@ impl Drop for SpawnedChild {
     }
 }
 
-/// Launch `exe --decode-stdin`, suspended, with pipes for stdin and stdout —
+/// Launch `exe` with `arguments`, suspended, with pipes for stdin and stdout —
 /// inside `container` when one is given.
-pub fn spawn(exe: &Path, argument: &str, container: Option<&AppContainer>) -> Result<SpawnedChild> {
+///
+/// The arguments go on the command line as they are: this program's own words
+/// and a number, with nothing in them to quote.
+pub fn spawn(exe: &Path, arguments: &str, container: Option<&AppContainer>) -> Result<SpawnedChild> {
     // Both pipes are born inheritable and the parent ends are then taken back
     // out of inheritance: only the child ends may cross.
     let (child_stdin, parent_stdin) = pipe().context("creating the decoder's input pipe")?;
@@ -137,14 +140,14 @@ pub fn spawn(exe: &Path, argument: &str, container: Option<&AppContainer>) -> Re
     uninherit(parent_stdin.0)?;
     uninherit(parent_stdout.0)?;
 
-    // The command line: "exe" --decode-stdin. CreateProcessW may write into
+    // The command line: "exe" and then the arguments. CreateProcessW may write into
     // the buffer, so it is a mutable Vec rather than a borrowed string.
     let mut command_line: Vec<u16> = Vec::new();
     command_line.push(b'"' as u16);
     command_line.extend(exe.as_os_str().encode_wide());
     command_line.push(b'"' as u16);
     command_line.push(b' ' as u16);
-    command_line.extend(argument.encode_utf16());
+    command_line.extend(arguments.encode_utf16());
     command_line.push(0);
 
     let exe_wide = HSTRING::from(exe.as_os_str());

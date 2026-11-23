@@ -236,7 +236,9 @@ impl Stand {
             .env("NITID_UPDATE_CURRENT", "0.0.1")
             // Whatever the machine running the gate is really connected
             // through: a test that passes only off a hotspot is no test.
-            .env("NITID_UPDATE_NETWORK", "open");
+            .env("NITID_UPDATE_NETWORK", "open")
+            // Likewise whatever codecs it has.
+            .env("NITID_WINDOWS_DRAWS", "avif");
         command
     }
 
@@ -439,6 +441,35 @@ fn an_update_replaces_the_program_and_nothing_else() {
     assert_eq!(stand.feed.archive_asks.load(Ordering::SeqCst), asks, "an up-to-date copy downloaded something");
 }
 
+/// A copy from before there were thumbnails takes two files out of the release
+/// and gets everything: the DLL is in them, and the new version writes it out
+/// and registers it.
+#[test]
+fn an_update_brings_the_thumbnails_to_a_copy_without_them() {
+    let stand = Stand::new("thumbs");
+    stand.settings("updates = off\n");
+    stand.install_old();
+    let (name, bytes, class) = nitid::testing::thumbnail_provider();
+    let class = format!(r"Software\Classes\CLSID\{{{:?}}}", windows::core::GUID::from_u128(class));
+    let handler = r"Software\Classes\.jxl\ShellEx";
+    let dll = stand.installed().join(name);
+
+    // As an earlier version left it.
+    fs::remove_file(&dll).expect("the install wrote no DLL");
+    let hive = CURRENT_USER.create(stand.hive()).expect("the stand's registry");
+    hive.remove_tree(&class).expect("the install registered no class");
+    hive.remove_tree(handler).expect("the install registered no thumbnails for JPEG XL");
+
+    stand.feed.offer(VERSION, zip_of(&pair_with(b"")));
+    let output = stand.update();
+    assert!(output.status.success(), "update failed: {}", said(&output));
+
+    until("the update brought no DLL", || fs::read(&dll).is_ok_and(|there| there == bytes));
+    until("the update registered no thumbnails", || {
+        hive.open(&class).is_ok() && hive.open(handler).is_ok()
+    });
+}
+
 /// What a person took away stays away. An install puts these back because
 /// someone ran it; an update runs with nobody asking. Quitting the resident is
 /// one of them: someone who quit it and then asked for an update asked for an
@@ -519,7 +550,7 @@ fn the_resident_keeps_the_copy_current_on_its_own() {
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .collect();
         names.sort();
-        names == ["nitid.exe", "nitidw.exe"]
+        names == ["nitid.exe", "nitid_thumbs.dll", "nitidw.exe"]
     });
     until("what was unpacked was not taken away", || {
         let update = stand.dir.path().join("lacodda").join("nitid").join("update");
@@ -889,6 +920,6 @@ fn uninstalling_leaves_nothing_of_the_updater() {
     assert!(output.status.success(), "{}", said(&output));
 
     assert!(!state.exists(), "the updater's directory survived uninstalling");
-    assert!(!stand.installed().join("nitid.exe").exists());
+    assert!(!stand.installed().exists(), "something of the install was left behind");
     until("the resident outlived the uninstall", || !stand.resident_running());
 }

@@ -1,11 +1,12 @@
 ---
 title: Working from Explorer
-description: Space on a picture in Explorer puts it on screen and Space again puts it away; "Open with nitid" on a folder walks its pictures.
+description: Space on a picture in Explorer puts it on screen and Space again puts it away; "Open with nitid" on a folder walks its pictures; and the formats Windows cannot draw have thumbnails.
 ---
 
 Most pictures are found in Explorer before they are looked at, so nitid meets
-them there: a glance with the space bar, and a folder opened from its menu.
-Both come with `nitid install`.
+them there: a glance with the space bar, a folder opened from its menu, and
+thumbnails for the pictures Windows has none for. All of it comes with
+`nitid install`.
 
 ## A look with the space bar
 
@@ -74,3 +75,35 @@ a folder takes it over:
 ```
 nitid D:\Photos\2026-10-28
 ```
+
+## Thumbnails
+
+Explorer draws a thumbnail only for a format Windows has a codec for, and shows
+an icon for the rest. nitid draws what is missing on your machine, among:
+
+- **JPEG XL** - `.jxl`
+- **HEIC** - `.heic` `.heif` `.hif`, what a phone photographs in
+- **AVIF** - `.avif`
+- **SVG** - `.svg`
+
+Which of them that is depends on what you have installed from the Store, so
+`nitid install` asks Windows to decode a small picture in each, takes over the
+ones it cannot, and says which those were. An update asks again. A type another
+program already draws is left to that program, and everything else - JPEG, PNG,
+WebP and the rest - stays with Windows, which draws it well.
+
+A thumbnail is the picture the right way up and in sRGB, converted from the
+colours the file states: Explorer manages no colour itself. An SVG is drawn at
+the size Explorer asks for rather than enlarged from a small one.
+
+A file in a folder is one nobody has chosen to open, so the part Windows loads
+reads none of it. It passes the file's bytes to nitid, which hands them to the
+same sandbox [the heavy formats decode in](/nitid/reference/formats/) - no
+network, no files, a limit on memory and time - and what comes back is the
+thumbnail. None of nitid is loaded into Explorer itself; Windows keeps such
+handlers in a process of their own. See
+[ADR 0049](https://github.com/lacodda/nitid/blob/main/docs/adr/0049-explorers-thumbnails-come-from-a-thin-dll.md).
+
+Explorer remembers the thumbnails it has drawn. If a folder goes on showing
+icons it showed before nitid was installed, **Disk Cleanup → Thumbnails** makes
+it forget them.

@@ -168,6 +168,21 @@ impl Format {
         matches!(self, Format::Heic | Format::Avif)
     }
 
+    /// Whether a machine running Windows may have nothing to draw this
+    /// format's thumbnails with.
+    ///
+    /// JPEG XL, HEIC and AVIF are drawn by codecs that come from the Store,
+    /// one of them for money, and SVG by nothing Windows ships. Which of them
+    /// a given machine lacks is asked of that machine (`thumbs::shell`); the
+    /// rest every Windows this runs on draws itself, and taking them over
+    /// would be taking something away.
+    pub fn explorer_may_not_draw(self) -> bool {
+        match self {
+            Format::JpegXl | Format::Heic | Format::Avif | Format::Svg => true,
+            Format::Jpeg | Format::Png | Format::WebP | Format::Gif | Format::Bmp | Format::Tiff => false,
+        }
+    }
+
     /// Whether the file describes shapes rather than a grid of pixels.
     ///
     /// A vector image has no resolution of its own: it is rasterised for the

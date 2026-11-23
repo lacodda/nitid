@@ -1,4 +1,4 @@
-// Two jobs, both done before the crate compiles.
+// Three jobs, all done before the crate compiles.
 //
 // 1. Embeds the Windows executable icon and version metadata. The icon carries
 //    the lacodda line mark at three levels — the filled tile at the smallest
@@ -15,6 +15,13 @@
 //    for byte), and this script writes them out as constants. A colour in the
 //    interface is a name from here, never a number typed by hand: the file is
 //    where the colour lives, so the next dowel release moves nitid with it.
+//
+// 3. Compiles the thumbnail DLL, `src/thumbs/provider.rs`, for the program to
+//    carry inside itself and put beside itself when it installs. Inside,
+//    because an installed copy takes exactly two files out of the release that
+//    replaces it, whatever else the release's zip holds (ADR 0043, ADR 0049);
+//    and from here, because a stable cargo has no way to hand a package the
+//    `cdylib` of another.
 use std::fmt::Write as _;
 use std::path::Path;
 
@@ -40,6 +47,57 @@ fn main() {
 
     let out = std::env::var("OUT_DIR").expect("cargo sets OUT_DIR for a build script");
     std::fs::write(Path::new(&out).join("dowel.rs"), dowel()).expect("failed to write the dowel tokens");
+
+    // Asked of the target rather than of the host, for the reason the icon is.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        thumbnail_provider(&Path::new(&out).join("nitid_thumbs.dll"));
+    }
+}
+
+/// Compile the thumbnail DLL to `out`.
+///
+/// With `rustc` itself: the source has no dependencies, so there is nothing
+/// for a cargo inside this one to resolve, and no second build directory for
+/// it to lock.
+fn thumbnail_provider(out: &Path) {
+    const SOURCE: &str = "src/thumbs/provider.rs";
+    println!("cargo:rerun-if-changed={SOURCE}");
+    println!("cargo:rerun-if-changed=src/thumbs/wire.rs");
+
+    let rustc = std::env::var_os("RUSTC").expect("cargo says which rustc it uses");
+    let target = std::env::var("TARGET").expect("cargo says what it builds for");
+    let mut command = std::process::Command::new(rustc);
+    command.args([
+        "--crate-name",
+        "nitid_thumbs",
+        "--crate-type",
+        "cdylib",
+        "--edition",
+        "2024",
+        "--target",
+        &target,
+    ]);
+    // Always small and optimised, whatever the program's own profile: it is
+    // loaded into a host other handlers share. Aborting on a panic rather than
+    // unwinding into COM.
+    command.args(["-C", "opt-level=s", "-C", "panic=abort", "-C", "codegen-units=1", "-C", "lto=fat"]);
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        // No runtime library to find on somebody else's machine, and the same
+        // bytes from the same source: an install leaves the DLL alone when it
+        // is already the one it would write.
+        command.args(["-C", "target-feature=+crt-static", "-C", "link-arg=/Brepro", "-C", "link-arg=/DEBUG:NONE"]);
+    }
+    if let Some(linker) = std::env::var_os("RUSTC_LINKER") {
+        let mut flag = std::ffi::OsString::from("-Clinker=");
+        flag.push(linker);
+        command.arg(flag);
+    }
+    // The linker asks for a COM server's exports to be marked private, which
+    // is about import libraries and nobody links against this one.
+    command.args(["-A", "linker-messages", "-o"]).arg(out).arg(SOURCE);
+
+    let status = command.status().unwrap_or_else(|error| panic!("rustc could not be run for {SOURCE}: {error}"));
+    assert!(status.success(), "{SOURCE} did not compile: {status}");
 }
 
 const PALETTE: &str = "assets/dowel/palette.json";

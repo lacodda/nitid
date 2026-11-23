@@ -22,6 +22,9 @@ code execution.
 The format is decided by the bytes, not the extension: a `.png` that is really
 a JPEG opens rather than erroring.
 
+Where Windows has no codec for JPEG XL, HEIC, AVIF or SVG, nitid draws their
+[thumbnails in Explorer](/nitid/guides/working-from-explorer/#thumbnails) too.
+
 GIF, APNG and animated WebP **play**: every frame is decoded up front, the
 space bar pauses and resumes, and the title carries the frame counter. Frame
 delays of 10 ms and under are read as 100 ms — the convention browsers apply,
