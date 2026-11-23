@@ -82,11 +82,10 @@ else an install or an update does is done by then.
 
 ## Consequences
 
-Three processes a thumbnail: Explorer's host, `nitid.exe` and the decoder. On the
-development machine that is a fifth of a second for a photograph, against a tenth
-for Windows' own; Explorer keeps what it is given, so it is paid once a file. The
-chain runs below normal priority, so a folder being drawn gives way to a picture
-being opened.
+Three processes a thumbnail: Explorer's host, `nitid.exe` and the decoder, two of
+them started for it. Explorer keeps what it is given, so that is paid once a file,
+and the chain runs below normal priority, so a folder being drawn gives way to a
+picture being opened.
 
 A thumbnail has fifteen seconds in the decoder and twenty-five in all, after
 which it is an icon. A file above 512 MB has none, which is the decoder's own
