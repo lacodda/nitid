@@ -144,6 +144,7 @@ fn stream_of(bytes: &[u8]) -> IStream {
 }
 
 /// What a host is handed back.
+#[derive(Debug)]
 struct Bitmap {
     width: i32,
     height: i32,
@@ -264,7 +265,7 @@ fn a_file_that_will_not_decode_has_no_thumbnail() {
     let whole = png(300, 300, |x, y| [x as u8, y as u8, 7, 255]);
     for broken in [b"not a picture at all".to_vec(), Vec::new(), whole[..whole.len() / 3].to_vec()] {
         let started = Instant::now();
-        let error = dll.thumbnail(&broken, 256).err().expect("a thumbnail was made of it");
+        let error = dll.thumbnail(&broken, 256).expect_err("a thumbnail was made of it");
         assert_eq!(error.code(), E_FAIL);
         assert!(started.elapsed() < Duration::from_secs(20), "it took {:?}", started.elapsed());
     }
@@ -281,7 +282,7 @@ fn a_decoder_that_hangs_is_ended() {
     let outcome = told(&[("NITID_DECODER_HANGS", "1"), ("NITID_DECODE_TIMEOUT_MS", "700")], || {
         dll.thumbnail(&picture, 256)
     });
-    assert_eq!(outcome.err().expect("a hung decoder answered").code(), E_FAIL);
+    assert_eq!(outcome.expect_err("a hung decoder answered").code(), E_FAIL);
     assert!(started.elapsed() < Duration::from_secs(20), "it took {:?}", started.elapsed());
     assert!(dll.can_unload());
 }
@@ -320,7 +321,7 @@ fn the_dll_keeps_coms_rules() {
         assert!(!dll.can_unload(), "the factory is out and the DLL would be unloaded");
 
         let aggregated = factory.CreateInstance::<_, IUnknown>(&factory);
-        assert_eq!(aggregated.err().expect("it was aggregated").code(), CLASS_E_NOAGGREGATION);
+        assert_eq!(aggregated.expect_err("it was aggregated").code(), CLASS_E_NOAGGREGATION);
 
         let provider: IThumbnailProvider = factory.CreateInstance(None).expect("a provider");
         let initialize: IInitializeWithStream = provider.cast().expect("its other interface");
@@ -329,13 +330,13 @@ fn the_dll_keeps_coms_rules() {
             initialize.cast::<IUnknown>().expect("its identity").as_raw(),
             "the two interfaces are two objects"
         );
-        assert_eq!(provider.cast::<IClassFactory>().err().expect("a factory").code(), E_NOINTERFACE);
+        assert_eq!(provider.cast::<IClassFactory>().expect_err("a factory").code(), E_NOINTERFACE);
 
-        assert_eq!(ask(&provider, 256).err().expect("it had no picture").code(), E_UNEXPECTED);
+        assert_eq!(ask(&provider, 256).expect_err("it had no picture").code(), E_UNEXPECTED);
         let stream = stream_of(&png(40, 20, |_, _| [9, 8, 7, 255]));
         initialize.Initialize(&stream, 0).expect("a stream");
         let again = initialize.Initialize(&stream, 0);
-        assert_eq!(again.err().expect("it took a second one").code(), ERROR_ALREADY_INITIALIZED.to_hresult());
+        assert_eq!(again.expect_err("it took a second one").code(), ERROR_ALREADY_INITIALIZED.to_hresult());
 
         // Asked twice it answers twice, whoever moved the stream meanwhile.
         for _ in 0..2 {
