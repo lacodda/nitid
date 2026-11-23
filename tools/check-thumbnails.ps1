@@ -9,9 +9,15 @@
 # release workflow runs it on a clean one before a release is published.
 #
 # What answers is the shell, with whatever is registered: this script starts no
-# nitid and loads none of it.
+# nitid and loads none of it. Not from an elevated terminal, where the shell is
+# not let to see what a person registered for themselves.
 param([string[]]$Files)
 $ErrorActionPreference = "Stop"
+
+$whoever = New-Object Security.Principal.WindowsPrincipal ([Security.Principal.WindowsIdentity]::GetCurrent())
+if ($whoever.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    throw "Ask from a terminal that is not elevated: an elevated one is not shown what is registered for one person"
+}
 
 Add-Type -ReferencedAssemblies System.Drawing -TypeDefinition @'
 using System;

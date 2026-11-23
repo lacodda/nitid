@@ -62,16 +62,7 @@ jobs:
       - name: Windows shows the thumbnails it could not
         if: runner.os == 'Windows'
         shell: powershell
-        run: |
-          & target\release\nitid.exe install
-          if ($LASTEXITCODE -ne 0) { throw "nitid install stopped with code $LASTEXITCODE" }
-          $dll = Join-Path $env:LOCALAPPDATA "Programs\nitid\nitid_thumbs.dll"
-          if (-not (Test-Path $dll)) { throw "the install wrote no $dll" }
-          & tools/check-thumbnails.ps1
-          & target\release\nitid.exe uninstall
-          if ($LASTEXITCODE -ne 0) { throw "nitid uninstall stopped with code $LASTEXITCODE" }
-          if (Test-Path $dll) { throw "uninstalling left $dll" }
-          if (Test-Path "HKCU:\Software\Classes\.jxl\ShellEx") { throw "uninstalling left the thumbnails registered" }
+        run: .github/scripts/thumbnails-as-a-person.ps1 -Programs target/release
 
   # rust-version is a promise to anyone building from source. Without a job
   # that actually builds on it, the number silently rots the first time a new

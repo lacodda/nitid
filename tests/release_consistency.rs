@@ -260,9 +260,25 @@ fn the_rehearsal_asks_for_what_an_install_writes() {
 fn the_rehearsal_asks_windows_for_a_thumbnail() {
     for name in ["release.yml", "ci.yml"] {
         let workflow = read(&format!(".github/workflows/{name}"));
-        assert!(workflow.contains("tools/check-thumbnails.ps1"), "{name} asks Windows for no thumbnail");
-        assert!(workflow.contains("nitid_thumbs.dll"), "{name} does not look for the DLL");
+        assert!(
+            workflow.contains("run: .github/scripts/thumbnails-as-a-person.ps1 -Programs"),
+            "{name} asks Windows for no thumbnail"
+        );
     }
+    let as_a_person = read(".github/scripts/thumbnails-as-a-person.ps1");
+    for needed in [r"tools\check-thumbnails.ps1", r"src\thumbs\samples.rs", "nitid_thumbs.dll"] {
+        assert!(as_a_person.contains(needed), "the person asks without `{needed}`");
+    }
+    let release = read(".github/workflows/release.yml");
+    assert!(release.contains("nitid_thumbs.dll"), "an update's DLL is not looked for");
+    assert!(
+        release.contains(r"HKCU:\Software\Classes\CLSID\{E36F4421-0F9A-496E-993D-C6C773CBD261}\InprocServer32"),
+        "an update's registration is not looked for"
+    );
+    assert!(
+        read("src/thumbs/wire.rs").contains("0xe36f4421_0f9a_496e_993d_c6c773cbd261"),
+        "the class has another number than the rehearsal looks for"
+    );
     let script = read("tools/check-thumbnails.ps1");
     for sample in ["JXL", "AVIF", "HEIC"] {
         assert!(script.contains(&format!(r#"(Get-Sample "{sample}")"#)), "the script asks for no {sample}");

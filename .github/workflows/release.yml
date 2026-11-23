@@ -165,7 +165,7 @@ jobs:
       # Windows itself, asked for the thumbnail of a picture in each format.
       - name: Ask Windows for thumbnails
         shell: powershell
-        run: tools/check-thumbnails.ps1
+        run: .github/scripts/thumbnails-as-a-person.ps1 -Programs unpacked
 
   # Over the release before it, by that release's own updater. The updater
   # reads the published address, which a draft is not at, so this machine
@@ -228,9 +228,7 @@ jobs:
           $dll = Join-Path $env:LOCALAPPDATA "Programs\nitid\nitid_thumbs.dll"
           for ($i = 0; $i -lt 30 -and -not (Test-Path $dll); $i++) { Start-Sleep -Seconds 1 }
           if (-not (Test-Path $dll)) { throw "the update brought no nitid_thumbs.dll" }
-      - name: Ask Windows for thumbnails
-        shell: powershell
-        run: tools/check-thumbnails.ps1
+          if (-not (Test-Path "HKCU:\Software\Classes\CLSID\{E36F4421-0F9A-496E-993D-C6C773CBD261}\InprocServer32")) { throw "the update registered no thumbnails" }
 
   publish:
     name: Publish

@@ -100,3 +100,11 @@ rules, to a bitmap of the right picture for each format, to a decoder that hangs
 and to the sandbox being the only reader; and it holds the registration in a
 corner of the registry of its own. `tools/check-thumbnails.ps1` asks Windows
 itself, on every push in CI and on the clean machine a release is rehearsed on.
+
+Both run it as an ordinary account made for it
+(`.github/scripts/thumbnails-as-a-person.ps1`). The registration is one person's,
+in their own hive, and COM does not read that in an elevated process: on a runner,
+which is elevated, the shell finds the handler listed and answers that its class
+is not registered. The same is true of any program run as administrator - its
+*Open* box shows icons where Explorer shows pictures. Registering for the whole
+machine would need an administrator at every install, which nitid does not ask for.
