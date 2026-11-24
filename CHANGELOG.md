@@ -2,6 +2,28 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.45.0] - 2026-11-24
+
+### Build
+- Unzip with .NET rather than Expand-Archive
+- Hash with .NET for the same reason
+
+### CI
+- Run the release again for a tag, by hand
+- Ask for thumbnails as an ordinary person
+
+### Documentation
+- Leave out a time nobody measured
+
+### Features
+- Draw thumbnails for the formats Windows cannot
+
+### Testing
+- Wait out the moment between an update's two renames
+- Hold what has to agree before a release goes out
+- Say expect_err, as clippy asks
+- Say expect_err on the last of them
+
 ## [0.44.0] - 2026-11-16
 
 ### Build
