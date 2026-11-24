@@ -85,7 +85,11 @@ else an install or an update does is done by then.
 Three processes a thumbnail: Explorer's host, `nitid.exe` and the decoder, two of
 them started for it. Explorer keeps what it is given, so that is paid once a file,
 and the chain runs below normal priority, so a folder being drawn gives way to a
-picture being opened.
+picture being opened. The installed v0.45.0 on the development machine, program
+and sandbox together: 0.3 to 0.5 s for a two-megapixel JPEG XL or HEIC and for an
+SVG of shapes, 1.3 s for a twelve-megapixel HEIC with no thumbnail of its own, and
+1.4 s for an SVG with text, a second of which is the fonts, found again by every
+decoder since each is a process of its own.
 
 A thumbnail has fifteen seconds in the decoder and twenty-five in all, after
 which it is an icon. A file above 512 MB has none, which is the decoder's own

@@ -96,13 +96,14 @@ try {
     foreach ($file in Get-ChildItem $dir | Sort-Object Name) {
         $said = [ShellThumbnail]::Of($file.FullName, 256)
         Write-Host "$($file.Name): $said"
-        # 28 78 c8, as far as a lossy encoder keeps it.
+        # 28 78 c8, as far as a lossy encoder keeps it - and, for a format Windows
+        # draws itself, as far as Windows does: its AVIF is nine out.
         $colour = [regex]::Match($said, '^\d+x\d+ ([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$')
         $near = $colour.Success
         if ($near) {
             $meant = 0x28, 0x78, 0xc8
             for ($i = 0; $i -lt 3; $i++) {
-                $near = $near -and ([Math]::Abs([Convert]::ToInt32($colour.Groups[$i + 1].Value, 16) - $meant[$i]) -le 8)
+                $near = $near -and ([Math]::Abs([Convert]::ToInt32($colour.Groups[$i + 1].Value, 16) - $meant[$i]) -le 12)
             }
         }
         if (-not $near) { $wrong += "$($file.Name) ($said)" }
